@@ -1,0 +1,37 @@
+# 敏感信息
+config/cookie.txt
+
+# 输出和日志
+output/
+logs/
+
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 测试和临时文件
+test_*.py
+check_*.py
+find_*.py
+analyze_*.py
+git_*.py
+create_*.py
+!create_config_xlsx.py  # 但保留配置文件生成脚本
+
+# 临时HTML
+test_*.html
+*.html
+!docs/*.html
+
+# 抓包JS文件（太大且敏感）
+*.js
+!jd_api/*.py
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
