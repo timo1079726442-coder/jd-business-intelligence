@@ -16,11 +16,17 @@ main.py - 京东商智数据导出工具（重构版 v2.0）
 【整改记录 2026-08-04】
     1. 删除所有业务参数硬编码（INTERVAL/DATETYPE/LIMIT/SORT_FIELD/SORT_TYPE/COMPARE_TYPE/GROUP_TYPE/ATTRIBUTES/LAST_SRC_CHANNEL_ID1）
        全部改为从 config.xlsx 读取
-    2. 业务名重命名：商品购物车效果 → 商品自主访问效果（CHANNEL_MAP key 改为"自主访问"）
-    3. 新增业务注册中心 BUSINESS_REGISTRY，支持按业务key动态调度
-    4. 支持批量调用：run_business(biz_key_list) 一次跑多个业务
-    5. 支持命令行调用：python main.py --biz_key "商品流量来源_搜索" --date "2026-07-29"
-    6. 程序启动打印：全局配置 + 已注册业务清单，方便核对
+    2. 新增业务注册中心 BUSINESS_REGISTRY，支持按业务key动态调度
+    3. 支持批量调用：run_business(biz_key_list) 一次跑多个业务
+    4. 支持命令行调用：python main.py --biz_key "商品流量来源_搜索" --date "2026-07-29"
+    5. 程序启动打印：全局配置 + 已注册业务清单，方便核对
+
+【整改记录 2026-08-05】
+    1. config项目名统一为"商品流量来源"；9项业务参数补齐【说明】列中文注释
+    2. 业务名调整：3001渠道执行名改为"商品流量来源_购物车"
+       （自主访问流量与购物车数据口径重叠，统一以"购物车"命名执行）
+    3. 自主访问保留注册配置但标记 enabled=False，调度层过滤不执行，后续需要可随时开启
+    4. 默认批量执行：搜索/推荐/购物车 3个启用渠道
 """
 
 import os
@@ -388,19 +394,20 @@ class JDBaseRequest:
 
 
 # ============================================================
-#  业务接口 1：商品流量来源 - SKU维度（搜索/推荐/自主访问）
+#  业务接口 1：商品流量来源 - SKU维度（搜索/推荐/购物车）
 # ------------------------------------------------------------
 #  业务名称：
-#      - 商品流量来源_搜索（lastSrcChannelId2=2008，搜索子来源）
-#      - 商品流量来源_推荐（lastSrcChannelId2=2009，推荐子来源）
-#      - 商品流量来源_自主访问（lastSrcChannelId2=3001，购物车/我的订单回流）
+#      - 商品流量来源_搜索（lastSrcChannelId2=2008，搜索子来源）【执行】
+#      - 商品流量来源_推荐（lastSrcChannelId2=2009，推荐子来源）【执行】
+#      - 商品流量来源_购物车（lastSrcChannelId2=3001，购物车/我的订单回流）【执行】
+#      - 商品流量来源_自主访问（lastSrcChannelId2=3001，与购物车口径重叠）【已停用，仅保留配置】
 #  接口地址：https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downSkuTable.ajax
-#  数据维度：店铺来源 → 搜索/推荐/自主访问渠道 → SKU维度（按入店浏览量降序，最多5000条）
+#  数据维度：店铺来源 → 搜索/推荐/购物车渠道 → SKU维度（按入店浏览量降序，最多5000条）
 #  返回格式：Excel 二进制流
 #  参数说明（所有参数都从config读取，无硬编码）：
 #      业务参数（来自config）：
 #          interval=DAY, dateType=day
-#          lastSrcChannelId1=2（一级渠道：搜索/推荐/自主访问都是2）
+#          lastSrcChannelId1=2（一级渠道：搜索/推荐/购物车都是2）
 #          lastSrcChannelId2: 2008/2009/3001 二级渠道
 #          groupType=skuId, attributes=skuId
 #          sortField=jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src, sortType=desc
@@ -409,25 +416,27 @@ class JDBaseRequest:
 #          date / startDate / endDate → 优先用入参，其次从 config.xlsx 读取
 # ============================================================
 class ProductFlowAPI(JDBaseRequest):
-    """商品流量来源 - SKU维度 - 数据导出（搜索/推荐/自主访问3个子渠道）"""
+    """商品流量来源 - SKU维度 - 数据导出（搜索/推荐/购物车执行，自主访问已停用）"""
 
     # 接口URL（域名固定，业务参数走配置）
     API_URL = "https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downSkuTable.ajax"
 
-    # ⚠️ CHANNEL_MAP：3个商品流量子渠道配置（业务核心配置）
+    # ⚠️ CHANNEL_MAP：商品流量子渠道配置（业务核心配置）
     # 中文说明（小白必读）：
-    #   这是商品流量来源的3个子渠道定义。每个子渠道对应一个业务key：
-    #     "商品流量来源_搜索"     → 搜索子来源（2008）
-    #     "商品流量来源_推荐"     → 推荐子来源（2009）
-    #     "商品流量来源_自主访问" → 购物车/我的订单回流（3001）
+    #   商品流量来源的子渠道定义。每个子渠道对应一个业务key：
+    #     "商品流量来源_搜索"     → 搜索子来源（2008）【执行】
+    #     "商品流量来源_推荐"     → 推荐子来源（2009）【执行】
+    #     "商品流量来源_购物车"   → 购物车/我的订单回流（3001）【执行】
+    #     "商品流量来源_自主访问" → 与购物车数据口径重叠（同3001），仅保留配置，调度层停用
     #   uuid前缀：京东风控校验用的随机ID前缀
     #     搜索/推荐：ca412182e5668a106054
-    #     自主访问：5f9cc2ca20cad3d11642
+    #     购物车/自主访问：5f9cc2ca20cad3d11642
     #   ⚠️ 警告：新增/修改子渠道，必须修改此字典（业务参数专属配置）。
     CHANNEL_MAP = {
         "商品流量来源_搜索":     ("2008", "ca412182e5668a106054"),
         "商品流量来源_推荐":     ("2009", "ca412182e5668a106054"),
-        "商品流量来源_自主访问": ("3001", "5f9cc2ca20cad3d11642"),
+        "商品流量来源_购物车":   ("3001", "5f9cc2ca20cad3d11642"),
+        "商品流量来源_自主访问": ("3001", "5f9cc2ca20cad3d11642"),  # 与购物车口径重叠，仅保留配置
     }
 
     # 反向索引（从CHANNEL_MAP自动生成，用于支持直接传channel_id2）
@@ -585,8 +594,12 @@ class ProductFlowAPI(JDBaseRequest):
         """便捷方法：导出推荐流量"""
         return self.download_sku(biz_key="商品流量来源_推荐", date=date, start_date=start_date, end_date=end_date)
 
+    def download_cart_sku(self, date=None, start_date=None, end_date=None):
+        """便捷方法：导出购物车流量（购物车/我的订单回流，3001，正式执行渠道）"""
+        return self.download_sku(biz_key="商品流量来源_购物车", date=date, start_date=start_date, end_date=end_date)
+
     def download_selfvisit_sku(self, date=None, start_date=None, end_date=None):
-        """便捷方法：导出自主访问流量（购物车/我的订单回流）"""
+        """便捷方法：导出自主访问流量（与购物车口径重叠，已停用，仅供保留存档）"""
         return self.download_sku(biz_key="商品流量来源_自主访问", date=date, start_date=start_date, end_date=end_date)
 
 
@@ -648,10 +661,23 @@ BUSINESS_REGISTRY = {
             "endDate": "结束日期",
         },
     },
+    "商品流量来源_购物车": {
+        "api_class": ProductFlowAPI,
+        "method": "download_cart_sku",
+        "desc": "商品购物车效果（购物车/我的订单回流，3001）",
+        "params": {
+            "date": "查询日期YYYY-MM-DD",
+            "startDate": "开始日期",
+            "endDate": "结束日期",
+        },
+    },
+    # ⚠️ 自主访问：与购物车数据口径重叠（同3001），enabled=False 停用不执行。
+    #    仅保留注册配置供存档/回溯，后续需要可把 enabled 改回 True 即可开启。
     "商品流量来源_自主访问": {
         "api_class": ProductFlowAPI,
         "method": "download_selfvisit_sku",
-        "desc": "商品自主访问效果（购物车/我的订单回流，3001）",
+        "desc": "商品自主访问效果（与购物车数据口径重叠，已停用，3001）",
+        "enabled": False,
         "params": {
             "date": "查询日期YYYY-MM-DD",
             "startDate": "开始日期",
@@ -675,7 +701,9 @@ def list_businesses():
     print(f"已注册业务清单（共 {len(BUSINESS_REGISTRY)} 个）：")
     print("=" * 70)
     for idx, (key, info) in enumerate(BUSINESS_REGISTRY.items(), 1):
-        print(f"  [{idx}] {key}")
+        enabled = info.get("enabled", True)
+        status_tag = "" if enabled else "  [已停用]"
+        print(f"  [{idx}] {key}{status_tag}")
         print(f"      描述: {info['desc']}")
         print(f"      API类: {info['api_class'].__name__}.{info['method']}()")
         if info.get("params"):
@@ -731,11 +759,18 @@ def run_business(biz_key_or_keys, **kwargs):
 
 
 def _run_single_business(biz_key, **kwargs):
-    """执行单个业务。"""
+    """执行单个业务（调度层过滤：已停用业务不执行）。"""
+    info = BUSINESS_REGISTRY[biz_key]
+
+    # ⚠️ 调度层过滤：enabled=False 的业务（如自主访问）直接跳过，不触发导出
+    if info.get("enabled", True) is False:
+        print(f"[SKIP] 业务已停用，跳过: {biz_key}（{info['desc']}）")
+        print(f"       如需开启，请将 BUSINESS_REGISTRY 中该业务的 enabled 改为 True。")
+        return None
+
     handler = get_business_handler(biz_key)
 
     # 业务级打印（让日志可追踪）
-    info = BUSINESS_REGISTRY[biz_key]
     print()
     print("=" * 70)
     print(f"执行业务: {biz_key}  -  {info['desc']}")
@@ -756,7 +791,24 @@ def _run_single_business(biz_key, **kwargs):
 
 
 def _run_business_batch(biz_key_list, **kwargs):
-    """批量执行多个业务（自动读取config里的请求间隔，循环调用）。"""
+    """批量执行多个业务（自动读取config里的请求间隔，循环调用）。
+
+    调度层过滤：列表中已停用的业务（enabled=False）会自动剔除，
+    仅执行启用状态正常的业务（如搜索/推荐/购物车）。
+    """
+    # ⚠️ 调度层过滤：剔除已停用业务，保留可执行业务
+    enabled_list = []
+    for k in biz_key_list:
+        info = BUSINESS_REGISTRY.get(k, {})
+        if info.get("enabled", True) is False:
+            print(f"[SKIP] 业务已停用，从批量列表剔除: {k}（{info.get('desc', '')}）")
+        else:
+            enabled_list.append(k)
+    if not enabled_list:
+        print("[WARN] 批量列表中所有业务均已停用，无可执行任务。")
+        return {}
+    biz_key_list = enabled_list
+
     print()
     print("=" * 70)
     print(f"批量执行业务（{len(biz_key_list)}个）：")
@@ -927,8 +979,8 @@ def config_consistency_check():
         print(f"[✅] 业务参数：9项业务参数已全部在config.xlsx中配置")
 
     # 3.3 CHANNEL_MAP（业务专属注册表，按用户要求集中维护）
-    print(f"[✅] 渠道配置：CHANNEL_MAP 集中维护3个子渠道（搜索2008/推荐2009/自主访问3001），"
-          f"uuid前缀按渠道区分")
+    print(f"[✅] 渠道配置：CHANNEL_MAP 集中维护渠道（搜索2008/推荐2009/购物车3001执行；"
+          f"自主访问3001与购物车口径重叠已停用），uuid前缀按渠道区分")
 
     print("=" * 70)
     print("核对完成。若存在 ❌ 项，请先修复再运行；⚠️ 项请尽快补齐config。")
@@ -1032,13 +1084,13 @@ def main():
         # 支持逗号分隔的批量
         biz_keys = [k.strip() for k in args.biz_key.split(",") if k.strip()]
     else:
-        # 默认跑商品流量来源全部3个渠道
+        # 默认跑商品流量来源3个启用渠道（自主访问与购物车口径重叠，调度层已停用）
         biz_keys = [
             "商品流量来源_搜索",
             "商品流量来源_推荐",
-            "商品流量来源_自主访问",
+            "商品流量来源_购物车",
         ]
-        print("[INFO] 未指定 --biz_key，默认批量执行商品流量来源全部3个子渠道")
+        print("[INFO] 未指定 --biz_key，默认批量执行商品流量来源3个启用渠道：搜索/推荐/购物车")
 
     # 决定日期参数
     kwargs = {}
