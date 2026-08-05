@@ -25,15 +25,23 @@
 2. ❌ 禁止再写入根目录 `agents.md`。
 3. ❌ 禁止堆砌项目日志、字段映射、长业务SOP、接口文档到本文件。
 
-### Skill设计原则（防止技能碎片化）
-1. **按业务领域划分 Skill，不按单个项目 / 单个接口拆分**：避免技能碎片化、调度混乱、AI 丢失历史经验。
-2. **京东商智全域所有接口、抓包分析、开发迭代、踩坑记录、业务规范，全部统一复用 `jd-api-analyze/SKILL.md`**：后续新增接口项目直接在该 Skill 内追加记录，无需新建 Skill。
-3. **仅切换完全陌生的新业务领域**（如天猫生意参谋、其他平台接口）时，才创建全新独立 Skill 文件夹。
-4. **Skill 内部按时间顺序迭代更新**，完整留存所有项目历史上下文，保障后续开发可复用全部沉淀经验。
+### Skill管理核心规则（防止技能碎片化）
+1. 按**业务领域**划分Skill，**不按域名、单个项目、单个接口拆分Skill**，避免技能碎片化、调度混乱、AI丢失历史经验。
+2. **京东全系业务**（商智 szgateway.jd.com、京麦 seller-v10.shop.jd.com 订单/售后报表、京准通 jzt.jd.com 广告报表），全部统一复用 `jd-api-analyze/SKILL.md`，**不新建独立skill**；后续新增京东系接口项目，直接在该Skill内追加记录。
+3. 只有切换完全陌生的外部业务领域（例如天猫生意参谋），才创建全新独立Skill文件夹。
+4. Skill内部必须使用大标题做子业务分区隔离，参考分区：
+   - 【通用基础规则】
+   - 【商智 szgateway.jd.com 模块】
+   - 【京麦 seller-v10.shop.jd.com 模块（订单/售后）】
+   - 【京准通 jzt.jd.com 模块（广告报表）】
+   - 不同业务记录分章节存放，防止内容混杂混乱。
+5. Skill.md只存放**精炼业务要点**：业务说明、关键接口域名、核心鉴权参数、踩坑要点、改动重点；禁止粘贴完整原始大段对话流水。原始完整对话历史保留在 `agents_old_backup.md`，仅用于人工查阅，不进入skill。
+6. 监控skill文件体量，若后续 `jd-api-analyze/SKILL.md` 膨胀超过2000行，再评估拆分子skill，现阶段维持单skill+内部分区模式。
 
 ### Skill调度规则（核心）
 当出现下面任务场景，**主动加载对应skill文件，不要在agents.md写业务细节**
-- 粘贴京东抓包HTTP报文、分析szgateway商智接口、查阅项目历史/踩坑经验/接口规范 → 加载 @.trae/skills/jd-api-analyze/SKILL.md
+- 粘贴京东抓包HTTP报文、分析 szgateway 商智接口、查阅项目历史/踩坑经验/接口规范 → 加载 @.trae/skills/jd-api-analyze/SKILL.md
+- 京麦订单/售后抓包、京准通广告报表抓包，同样加载 @.trae/skills/jd-api-analyze/SKILL.md
 - 处理git命令、shell命令、rm相关操作 → 加载 @.trae/skills/git-safe-operate/SKILL.md
 - 生成/重构本项目python业务代码 → 加载 @.trae/skills/python-code-gen/SKILL.md
 
