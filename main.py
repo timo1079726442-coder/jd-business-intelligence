@@ -739,17 +739,26 @@ class ProductFlowAPI(JDBaseRequest):
         return result
 
     def _get_date_params(self, date=None, start_date=None, end_date=None):
-        """从config读取日期参数（允许入参动态覆盖）。"""
-        # 优先用入参，其次从config读取
+        """解析本次查询的日期参数（支持动态覆盖）。
+
+        规则（2026-08-05 修复）：
+            date      : 优先用入参（如命令行 --date），其次从 config.xlsx 读取
+            startDate : 优先用入参；未传时默认=date（⚠️ 修复：此前回落config旧值，
+                        导致 --date 指定新日期时 start/end 仍是config里旧日期，
+                        接口按旧区间取数，07-29与07-30导出完全相同）
+            endDate   : 同 startDate
+        """
+        # date：入参优先，其次config
         if date is None:
             date = self.config.get("date")
         if date is None:
             raise ValueError("查询日期date未提供：请在config.xlsx配置或通过函数入参传入")
 
+        # start/end：入参优先；未传时默认与date一致（单日查询）
         if start_date is None:
-            start_date = self.config.get("startDate", date)
+            start_date = date
         if end_date is None:
-            end_date = self.config.get("endDate", date)
+            end_date = date
 
         return date, start_date, end_date
 
