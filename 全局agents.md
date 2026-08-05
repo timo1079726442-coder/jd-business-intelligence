@@ -40,16 +40,83 @@
 - 功能：导出店铺来源中"搜索"渠道的SKU维度流量数据
 - 输出：Excel文件（按入店浏览量降序，最多5000条SKU）
 
-### 当前实现文件
-- `jd_api/base.py` - 通用请求基类（风控签名、间隔、重试、UA切换、配置加载）
-- `jd_api/shop_source.py` - `商品搜索效果` API实现
-- `main.py` - 主程序入口
+### 当前实现文件（重构后）
+- `main.py` - **集中所有代码**（基类 + 商品搜索效果 + 商品推荐效果 + 业务分发器 + 主入口）
 - `config/config.xlsx` - 项目配置（全局+商品搜索效果参数）
 - `docs/API 实现逻辑说明.md` - 接口实现逻辑文档
 - `create_config_xlsx.py` - 配置文件生成脚本
 
+> 注：远程GitHub上有过一次重构（commit bc331c7），把 `jd_api/base.py` 和 `jd_api/shop_source.py` 合并到 `main.py`。本地 `git pull` 后已对齐。
+
 ### 项目经验沉淀
 见下文各次对话记录。
+
+---
+
+## 第二个项目：商品推荐效果（已完成 2026-08-04）
+
+### 项目业务说明
+- 业务名：`商品推荐效果`
+- 接口：**与商品搜索效果完全相同**：`https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downSkuTable.ajax`
+- 关键差异：只有 `lastSrcChannelId2=2009`（搜索是2008）
+- 功能：导出店铺来源中"推荐"渠道的SKU维度流量数据
+- 输出：Excel文件（按入店浏览量降序，最多5000条SKU）
+
+### 关键发现
+- `lastSrcChannelId1=2` 是一级渠道（搜索/推荐都是2）
+- `lastSrcChannelId2` 是二级渠道：
+  - `2008` = 搜索子来源 → 商品搜索效果
+  - `2009` = 推荐子来源 → 商品推荐效果
+- 两个业务用同一个接口 + 同一个URL，只有 `lastSrcChannelId2` 一个字段不同
+
+### 改动内容
+1. **main.py - ShopSourceAPI 类重构**：
+   - 新增 `CHANNEL_MAP = {"搜索": "2008", "推荐": "2009"}`
+   - 删除原来的 `LAST_SRC_CHANNEL_ID2` 类常量
+   - 新增 `_get_channel_id2(channel)` 方法
+   - `download_sku()` 中的 `lastSrcChannelId2` 改为从映射获取
+   - 新增 `download_recommend_sku()` 便捷方法
+   - `download_search_sku()` 标注业务为"商品搜索效果"
+
+2. **main.py - 业务分发器**：
+   - `run_business` 的 `factory` 中新增 `"商品推荐效果"` 映射
+
+3. **main.py - main() 函数**：
+   - 默认 `business_name = "商品推荐效果"`（用户本次要求）
+
+4. **配置文件**：未改动
+   - 商品推荐效果**复用**商品搜索效果的 date/startDate/endDate 配置（用户要求）
+   - 一份配置管两个业务，避免重复
+
+5. **docs/API 实现逻辑说明.md**：
+   - 接口标题改为"店铺来源-SKU维度（搜索流量 + 推荐流量）"
+   - 列出支持的2个业务
+   - 更新字段映射表（标注lastSrcChannelId2业务关键）
+   - 新增"踩坑经验"章节（混淆点说明）
+   - 新增"变更记录"
+
+### 踩坑经验
+1. **渠道ID混淆**：第一次看到2009以为是搜索的别称，容易和2008搞混
+   - 正确理解：2008=搜索、2009=推荐，是搜索流量的两个不同子来源
+   - 一级渠道都是2（搜索/推荐），二级渠道区分实际来源
+
+2. **复用配置的判断**：当时考虑过是否给商品推荐效果单独加日期配置
+   - 你的回答："配置文件复用商品搜索效果的date配置"
+   - 这是个很好的设计：两个业务常配合使用，复用避免分散
+
+3. **集成vs新建的判断**：当时考虑过新建独立的类
+   - 你的回答："只加渠道映射，复用现有代码（推荐）"
+   - 因为URL和所有参数都一样，强行新建类是过度设计
+   - 现在只需要 `CHANNEL_MAP` 一个dict就解决问题
+
+### 测试结果
+```
+[INFO] 下载店铺来源数据: 日期=2026-08-03, 渠道=推荐(id2=2009)
+[INFO] 发送请求 (第1/3次, UA=Edge): https://szgateway.jd.com/...
+[INFO] 请求成功: HTTP 200, 7661字节
+[INFO] Excel已保存: output/推荐流量_2026-08-03.xlsx (7661字节)
+✅ 导出成功！
+```
 
 ---
 

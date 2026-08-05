@@ -331,36 +331,55 @@ class JDBaseRequest:
 
 
 # ============================================================
-#  业务接口 1：商品搜索效果
+#  业务接口 1：商品搜索效果 / 商品推荐效果（共享同一接口）
 # ------------------------------------------------------------
-#  业务名称：商品搜索效果
+#  业务名称：
+#      - 商品搜索效果（lastSrcChannelId2=2008，搜索子来源）
+#      - 商品推荐效果（lastSrcChannelId2=2009，推荐子来源）
 #  接口地址：https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downSkuTable.ajax
-#  数据维度：店铺来源 → 搜索渠道 → SKU维度（按入店浏览量降序，最多5000条）
+#  数据维度：店铺来源 → 搜索/推荐渠道 → SKU维度（按入店浏览量降序，最多5000条）
 #  返回格式：Excel 二进制流（application/vnd.openxmlformats-officedocument.spreadsheetml.sheet）
 #  参数说明：
 #      业务参数（类常量，固定不变）：
 #          interval=DAY, dateType=day
-#          lastSrcChannelId1=2（搜索）, lastSrcChannelId2=2008（搜索子来源）
+#          lastSrcChannelId1=2（搜索/推荐都是一级渠道2）
+#          lastSrcChannelId2: 2008=搜索子来源, 2009=推荐子来源
 #          groupType=skuId, attributes=skuId
 #          sortField=jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src, sortType=desc
 #          limit=5000, compareType=hb
 #      日期参数（每次可变）：
 #          date / startDate / endDate → 优先用入参，其次从 config.xlsx 读取
+#      关键发现（2026-08-04 第二次新增）：
+#          商品搜索效果(2008)和商品推荐效果(2009)用同一个 downSkuTable.ajax 接口
+#          只有 lastSrcChannelId2 不同，所以本类同时支持两个业务
 # ============================================================
 class ShopSourceAPI(JDBaseRequest):
-    """店铺来源 - 搜索流量 - SKU维度 数据导出"""
+    """店铺来源 - 搜索流量/推荐流量 - SKU维度 数据导出"""
 
     API_URL = "https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downSkuTable.ajax"
     INTERVAL = "DAY"
     DATETYPE = "day"
-    LAST_SRC_CHANNEL_ID1 = "2"       # 一级渠道：搜索
-    LAST_SRC_CHANNEL_ID2 = "2008"     # 二级渠道：搜索子来源
+    LAST_SRC_CHANNEL_ID1 = "2"       # 一级渠道：搜索/推荐都是2
     GROUP_TYPE = "skuId"
     ATTRIBUTES = "skuId"
     SORT_FIELD = "jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src"
     SORT_TYPE = "desc"
     LIMIT = "5000"
     COMPARE_TYPE = "hb"
+
+    # 渠道ID映射（lastSrcChannelId2 二级渠道）
+    # 2008 = 搜索子来源（商品搜索效果）
+    # 2009 = 推荐子来源（商品推荐效果）
+    CHANNEL_MAP = {
+        "搜索": "2008",
+        "推荐": "2009",
+    }
+
+    def _get_channel_id2(self, channel):
+        if channel not in self.CHANNEL_MAP:
+            available = "、".join(self.CHANNEL_MAP.keys())
+            raise ValueError(f"不支持的渠道: {channel}\n当前可用渠道: {available}")
+        return self.CHANNEL_MAP[channel]
 
     def download_sku(self, date=None, start_date=None, end_date=None, channel="搜索"):
         if date is None:
@@ -370,6 +389,8 @@ class ShopSourceAPI(JDBaseRequest):
         if end_date is None:
             end_date = self.config.get("endDate", date)
 
+        channel_id2 = self._get_channel_id2(channel)
+
         data = {
             "date": date,
             "startDate": start_date,
@@ -377,7 +398,7 @@ class ShopSourceAPI(JDBaseRequest):
             "interval": self.INTERVAL,
             "dateType": self.DATETYPE,
             "lastSrcChannelId1": self.LAST_SRC_CHANNEL_ID1,
-            "lastSrcChannelId2": self.LAST_SRC_CHANNEL_ID2,
+            "lastSrcChannelId2": channel_id2,
             "groupType": self.GROUP_TYPE,
             "attributes": self.ATTRIBUTES,
             "sortField": self.SORT_FIELD,
@@ -386,14 +407,18 @@ class ShopSourceAPI(JDBaseRequest):
             "compareType": self.COMPARE_TYPE,
         }
 
-        self.logger.info(f"下载店铺来源数据: 日期={date}, 渠道={channel}")
+        self.logger.info(f"下载店铺来源数据: 日期={date}, 渠道={channel}(id2={channel_id2})")
         response = self.request(self.API_URL, data)
         filename = f"{channel}流量_{date}.xlsx"
         return self.save_excel(response, filename)
 
     def download_search_sku(self, date=None, start_date=None, end_date=None):
-        """便捷方法：导出搜索流量-SKU维度数据"""
+        """便捷方法：导出搜索流量-SKU维度数据（商品搜索效果业务）"""
         return self.download_sku(date=date, start_date=start_date, end_date=end_date, channel="搜索")
+
+    def download_recommend_sku(self, date=None, start_date=None, end_date=None):
+        """便捷方法：导出推荐流量-SKU维度数据（商品推荐效果业务）"""
+        return self.download_sku(date=date, start_date=start_date, end_date=end_date, channel="推荐")
 
 
 # ============================================================
@@ -454,6 +479,9 @@ def run_business(business_name, date=None, start_date=None, end_date=None, **kwa
         "商品搜索效果": lambda: ShopSourceAPI().download_search_sku(
             date=date, start_date=start_date, end_date=end_date
         ),
+        "商品推荐效果": lambda: ShopSourceAPI().download_recommend_sku(
+            date=date, start_date=start_date, end_date=end_date
+        ),
         # "首页流量":  lambda: HomePageSourceAPI().download_sku(date=date, start_date=start_date, end_date=end_date),
         # "类目流量":  lambda: CategorySourceAPI().download_sku(date=date, start_date=start_date, end_date=end_date),
     }
@@ -475,7 +503,7 @@ def main():
 
     # 查询日期（可按需修改，或改为 sys.argv 接收）
     date = "2026-08-03"
-    business_name = "商品搜索效果"
+    business_name = "商品推荐效果"  # 本次要跑的商品推荐效果业务（也可改为"商品搜索效果"）
 
     print(f"\n即将导出: 业务={business_name}, 日期={date}")
     print("-" * 60)
