@@ -5,34 +5,46 @@
 
 ---
 
-## 项目代码结构（2026-08-04 第二次更新）
+## 项目代码结构（2026-08-05 更新）
 
 按全局铁律第4条要求，所有代码集中在 `main.py`：
-- `class JDBaseRequest`（通用基类）
-- `class ShopSourceAPI(JDBaseRequest)`（店铺来源，支持搜索/推荐两个业务）
-- `def run_business(business_name, ...)`（业务分发器）
-- `def main()`（主入口）
+- `class JDBaseRequest`（通用基类：Cookie/风控签名/30秒间隔/重试/UA切换/日志/Excel保存）
+- `class ProductFlowAPI(JDBaseRequest)`（商品流量来源：搜索2008/推荐2009/购物车3001）
+- 公共工具函数（所有报表复用，禁止硬编码业务逻辑）：
+  - `convert_date_format(date_str)` —— 通用日期格式转换（8位纯数字/横杠/斜杠 → yyyy/m/d，时间保留）
+  - `safe_convert_numeric(df)` —— 全表数值安全转换（订单编号强制文本、SKU/SPU转数字、>15位保留文本）
+  - `apply_column_formats(...)` —— 按列名批量设置Excel单元格格式（订单编号@/SKU·SPU格式0/日期格式）
+- `BUSINESS_REGISTRY`（业务注册中心）+ `run_business(biz_key_or_list, **kwargs)`（统一调度，支持批量）
+- `config_consistency_check()`（启动自动跑，输出✅/❌/⚠️配置一致性核对报告）
+- `main()`（主入口，命令行：`--biz_key / --date / --start_date / --end_date / --list`）
 
 ---
 
-## 接口1：店铺来源-SKU维度（搜索流量 + 推荐流量）
+## 接口1：店铺来源-SKU维度（搜索流量 / 推荐流量 / 购物车流量）
 
 ### 一、接口基本信息
 
 | 项目 | 内容 |
 |------|------|
-| 接口名称 | 店铺来源-SKU维度（搜索流量 + 推荐流量） |
+| 接口名称 | 店铺来源-SKU维度（offlineFlowSource） |
 | 请求方式 | POST |
 | 接口URL | `https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downSkuTable.ajax` |
 | 域 | szgateway.jd.com |
 | 返回格式 | Excel (.xlsx) |
-| 单次返回上限 | 5000条SKU |
-| 请求间隔 | ≥30秒（防风控） |
-| 代码位置 | `main.py` → `class ShopSourceAPI` |
+| 单次返回上限 | 5000条SKU（limit） |
+| 请求间隔 | ≥30秒（防风控，config可调） |
+| 代码位置 | `main.py` → `class ProductFlowAPI` |
 
-**支持业务**：
-- `商品搜索效果`（lastSrcChannelId2=2008）→ `download_search_sku()`
-- `商品推荐效果`（lastSrcChannelId2=2009）→ `download_recommend_sku()`
+**支持业务（CHANNEL_MAP）**：
+
+| 业务key | lastSrcChannelId2 | uuid前缀 | 状态 |
+|---------|-------------------|----------|------|
+| 商品流量来源_搜索 | 2008 | ca412182e5668a106054 | 执行 |
+| 商品流量来源_推荐 | 2009 | ca412182e5668a106054 | 执行 |
+| 商品流量来源_购物车 | 3001 | 5f9cc2ca20cad3d11642 | 执行 |
+| 商品流量来源_自主访问 | 3001 | 5f9cc2ca20cad3d11642 | 已停用（enabled=False，与购物车数据口径重叠）|
+
+> ⚠️ uuid前缀为前端每次会话**动态生成**（与数据无关，无需跟随更新）；如3001最新抓包为 `d6f270911983d45006dd`。
 
 ---
 
@@ -72,28 +84,31 @@
 | __USE_NEW_PAGEFRAME__ / __USE_NEW_PAGEFRAME_VERSION__ | 静态 | 页面框架标识 |
 | 其他 | 静态 | 基本不变 |
 
-**Cookie使用方式**：从 `config/cookie.txt` 整体读取，**不解析**，作为字符串整体塞入Cookie头。
+**Cookie使用方式**：从 `config/cookie.txt` 整体读取，**不解析**，作为字符串整体塞入Cookie头。过期需手动抓包更新。
 
 #### 2.3 Body（表单参数）
 
 | 字段名 | 类型 | 值 | 说明 |
 |--------|------|-----|------|
-| date | ⚠️ **动态** | 用户输入 | 如 2026-08-03 |
-| startDate | ⚠️ **动态** | 用户输入 | 单日查询时=date |
-| endDate | ⚠️ **动态** | 用户输入 | 单日查询时=date |
-| interval | 静态 | DAY | |
-| dateType | 静态 | day | |
-| **lastSrcChannelId1** | 静态 | 2 | 一级渠道（搜索/推荐都是2）|
-| **lastSrcChannelId2** | ⚠️ **业务关键** | **2008=搜索, 2009=推荐** | 二级渠道ID |
+| date | ⚠️ **动态** | 用户输入 | 查询日期，如 2026-07-30 |
+| startDate | ⚠️ **动态** | = date | ⚠️ 与date一致（2026-08-05修复，见踩坑）|
+| endDate | ⚠️ **动态** | = date | ⚠️ 与date一致（2026-08-05修复，见踩坑）|
+| interval | 静态 | DAY | 时间粒度（config可变）|
+| dateType | 静态 | day | 日期类型（config可变）|
+| **lastSrcChannelId1** | 静态 | 2 | 一级渠道（搜索/推荐/购物车都是2）|
+| **lastSrcChannelId2** | ⚠️ **业务关键** | **2008=搜索, 2009=推荐, 3001=购物车** | 二级渠道ID |
 | groupType | 静态 | skuId | |
 | attributes | 静态 | skuId | |
-| sortField | 静态 | jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src | 入店浏览量 |
+| sortField | 静态 | jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src | 按入店浏览量 |
 | sortType | 静态 | desc | |
-| limit | 静态 | 5000 | |
+| limit | 静态 | 5000 | 条数上限（config可变）|
 | compareType | 静态 | hb | 环比 |
 | **User-mup** | ⚠️ **风控** | int(time.time()*1000) | 13位毫秒时间戳 |
 | **User-mnp** | ⚠️ **风控** | MD5(URL路径+uuid+时间戳+盐值) | MD5签名 |
-| **uuid** | ⚠️ **风控** | ca412182e5668a106054-{10位随机数} | 模拟前端SDK |
+| **uuid** | ⚠️ **风控** | {渠道uuid前缀}-{10位随机数} | 按渠道生成 |
+
+> 说明：interval/dateType/limit 为**可变参数**（从config.xlsx读取，缺省兜底+警告）；
+> lastSrcChannelId1/groupType/attributes/sortField/sortType/compareType 为**固定常量**（经用户确认写死代码 FIXED_BIZ_PARAMS）。
 
 ---
 
@@ -112,32 +127,29 @@
 - 原文：`/szpaas/szajax/shop/source/offlineFlowSource/downSkuTable.ajaxca412182e5668a106054-12345678901785857258121372ad2c2b6`
 - 签名：`MD5(...)` = `68bb84ea004652df1010bc4e5064c40e`
 
-盐值放在 `config.xlsx`（项目"商品搜索效果"分组），京东更新后可手动修改。
+盐值放在 `config.xlsx`（项目"商品流量来源"分组），京东更新后可手动修改。
 
 ---
 
 ### 四、业务调用
 
 ```python
-# 商品搜索效果
-api = ShopSourceAPI()
-api.download_search_sku(date="2026-08-03")  # 生成 推荐流量_2026-08-03.xlsx
+# 命令行调用（推荐）
+python main.py --date "2026-07-30"                                          # 默认批量：搜索/推荐/购物车
+python main.py --biz_key "商品流量来源_购物车" --date "2026-07-30"            # 单渠道
+python main.py --biz_key "商品流量来源_搜索,商品流量来源_推荐" --date "2026-07-30"  # 多渠道批量
 
-# 商品推荐效果
-api = ShopSourceAPI()
-api.download_recommend_sku(date="2026-08-03")  # 生成 推荐流量_2026-08-03.xlsx
-
-# 通过业务分发器
+# 代码内部调用
 from main import run_business
-run_business("商品搜索效果", date="2026-08-03")
-run_business("商品推荐效果", date="2026-08-03")
+run_business("商品流量来源_搜索", date="2026-07-30")
+run_business(["商品流量来源_搜索", "商品流量来源_推荐"], date="2026-07-30")
 ```
 
 ---
 
-### 五、配置项（config.xlsx）
+### 五、配置项（config.xlsx，2026-08-05 精简后）
 
-| 项目名 | 变量参数 | 默认值 | 说明 |
+| 项目名 | 变量参数 | 参数值 | 说明 |
 |--------|----------|--------|------|
 | 全局 | cookie文件路径 | config/cookie.txt | |
 | 全局 | 输出目录 | output/ | |
@@ -145,40 +157,67 @@ run_business("商品推荐效果", date="2026-08-03")
 | 全局 | 请求间隔(秒) | 30 | |
 | 全局 | 最大重试次数 | 3 | |
 | 全局 | 请求超时(秒) | 30 | |
-| 商品搜索效果 | 签名盐值 | 372ad2c2b6 | 京东更新时可改 |
-| 商品搜索效果 | date | 2026-08-03 | ⚠️ 商品推荐效果复用此配置 |
-| 商品搜索效果 | startDate | 2026-08-03 | |
-| 商品搜索效果 | endDate | 2026-08-03 | |
+| 商品流量来源 | 签名盐值 | 372ad2c2b6 | 京东更新时可改 |
+| 商品流量来源 | date | 2026-07-29 | 默认查询日期 |
+| 商品流量来源 | startDate / endDate | = date | 单日查询默认=date |
+| 商品流量来源 | interval | DAY | 可变参数 |
+| 商品流量来源 | dateType | day | 可变参数 |
+| 商品流量来源 | limit | 5000 | 可变参数 |
 
-**关键设计**：商品推荐效果复用商品搜索效果的日期配置（用户要求），不新增配置项。
+**可变参数**（interval/dateType/limit）从config读取；**固定常量**（lastSrcChannelId1/groupType/attributes/sortField/sortType/compareType）经用户确认固化在代码 `FIXED_BIZ_PARAMS`。
 
 ---
 
-### 六、踩坑经验
+### 六、Excel后置处理（2026-08-05 新增，全局生效）
+
+1. 接口返回Excel二进制 → `pd.read_excel(dtype=str, na_filter=False)`（先按文本读，防pandas自动转数值）
+2. `convert_date_format(date)` 把查询日期转成 `2026/7/30` 格式
+3. 首列A插入【日期】列
+4. `safe_convert_numeric(df)`：订单编号列强制文本；SKU/SPU转数字；>15位纯数字保留文本；其余可转则转
+5. `apply_column_formats()`：日期列真实datetime+`yyyy/m/d`；订单编号列`@`文本；SKU/SPU列数值`0`位小数
+6. 保存到 output/ 目录
+
+后续京麦订单明细/售后/京准通等报表可直接复用上述公共工具函数。
+
+---
+
+### 七、踩坑经验
 
 1. **lastSrcChannelId2 容易混淆**：
-   - 2008 = 搜索子来源 → 商品搜索效果
-   - 2009 = 推荐子来源 → 商品推荐效果
-   - 仅这一个字段差异，但属于两个独立业务项目
+   - 2008 = 搜索子来源、2009 = 推荐子来源、3001 = 购物车/我的订单回流
+   - 3001 与「自主访问」数据口径重叠，自主访问业务已停用（enabled=False）
 
-2. **风控盐值会更新**：
-   - 京东不定期更新 commons.js 中的盐值
-   - 配置文件中的盐值要可手动改（已实现）
+2. **⚠️ date/startDate/endDate 三值必须一致（2026-08-05 重大坑）**：
+   - 原逻辑 startDate/endDate 回落 config 旧值，`--date 2026-07-30` 实际发送
+     `date=07-30&startDate=07-29&endDate=07-29` → 接口按 **startDate~endDate 区间**取数，返回07-29数据
+   - 表现：07-29 与 07-30 导出完全相同、与网页对不上
+   - 修复：`_get_date_params()` 中 start/end 未显式传入时默认=date
 
-3. **30秒间隔必须遵守**：
-   - 不遵守立即触发风控拦截
-   - 间隔可在 config.xlsx 中调整
+3. **pandas 读取长数字精度丢失**：
+   - `pd.read_excel()` 默认把数字样式列自动转 int64 → >15位保护失效
+   - 必须 `read_excel(..., dtype=str, na_filter=False)`
 
-4. **UA切换是兜底方案**：
-   - 默认Edge，遇到风控自动切Chrome
-   - 不要禁用此功能
+4. **uuid前缀是动态的**：前端每次会话生成（3001出现过 5f9cc2ca... / d6f27091...），与数据无关，无需更新代码
+
+5. **风控盐值会更新**：京东不定期更新，盐值在config可手动改
+
+6. **30秒间隔必须遵守**：不遵守立即触发风控拦截；间隔在config可调
+
+7. **UA切换是兜底方案**：默认Edge，遇风控自动切Chrome，不要禁用
 
 ---
 
-### 七、变更记录
+### 八、变更记录
 
-| 日期 | 改动 | 作者 |
-|------|------|------|
-| 2026-08-04 | 初次实现商品搜索效果（2008） | 第一次对话 |
-| 2026-08-04 | 重构：所有代码合并到 main.py | GitHub commit bc331c7 |
-| 2026-08-04 | 新增商品推荐效果（2009），复用搜索的日期配置 | 本次更新 |
+| 日期 | 改动 |
+|------|------|
+| 2026-08-04 | 初次实现商品搜索效果（2008） |
+| 2026-08-04 | 重构：所有代码合并到 main.py（commit bc331c7） |
+| 2026-08-04 | 新增商品推荐效果（2009），复用搜索的日期配置 |
+| 2026-08-04 | 新增商品购物车效果（3001），CHANNEL_MAP改元组支持按渠道uuid前缀 |
+| 2026-08-05 | 业务注册中心v2.0：BUSINESS_REGISTRY + run_business批量 + argparse命令行 + 配置一致性检查 |
+| 2026-08-05 | 3001渠道执行名改回「购物车」；自主访问停用(enabled=False)；config项目名统一「商品流量来源」 |
+| 2026-08-05 | config精简：6项固定参数固化代码常量，仅留 interval/dateType/limit 可变 |
+| 2026-08-05 | Excel后置处理：日期列插入/数值安全转换/单元格格式 + 公共工具函数封装 |
+| 2026-08-05 | 对齐京东订单导出风险：订单编号强制文本黑名单 + SKU/SPU数值0位小数 |
+| 2026-08-05 | ⚠️ 修复日期参数同步Bug：--date 时 start/end 默认=date，数据与网页核对完全一致 |
