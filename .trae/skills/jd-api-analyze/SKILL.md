@@ -414,6 +414,9 @@ main.py
 | 2026-08-05 | **踩坑：pandas读取长数字精度丢失**：`pd.read_excel()` 默认会把"数字样式"列（如纯数字SKU）自动推断为int64，导致 `safe_convert_numeric()` 的">15位保留文本"保护失效；修复为 `read_excel(..., dtype=str, na_filter=False)` 先全部按文本读入再统一转换。**Mock验证**：临时脚本替换 `JDBaseRequest.request` 返回含渠道ID(2008/2009/3001)的模拟xlsx、跳过30秒间隔、输出隔离到output_mock，走真实 `run_business()` 批量调度，验证3渠道导出+日期列+16位SKU保留文本全部通过（验证完清理） |
 | 2026-08-05 | **对齐京东官方订单导出风险提示（列名黑/白名单规则）**：① `safe_convert_numeric` 新增强制文本黑名单 `TEXT_FORCE_COLUMNS={订单编号}`（命中列整列跳过数值转换保留文本，不依赖长度判断）和整数0位小数白名单 `INTEGER_ZERO_DECIMAL_COLUMNS={SKU,SPU}`；② 新增通用 `apply_column_formats()` 按列名批量设置单元格格式（订单编号=@文本，SKU/SPU=数值0无千分位，日期列沿用 yyyy/m/d，且SKU/SPU仅对数字单元格套用0格式）；③ 匹配用 `_col_matches()` 结尾匹配（"商品SKU"命中"SKU"，但"成交金额（SPU）"不命中，避免误伤（SPU）后缀指标列）；④ >15位兜底防护全局保留；⑤ Mock回归：订单编号长短全文本+@格式、SKU/SPU数字+格式0、普通字段/兜底不受影响，3渠道全部通过 |
 
+### 当前未完成事项（2026-08-05）
+- 【数据比对·进行中】商品流量来源 3渠道 2026-07-30 导出 vs 网页「商智-流量来源页」导出对不上（网页行数更少/SKU列表不同/数值不同）。用户会放网页导出文件到 output/网页_*.xlsx，**文件到位后**逐项比对并给出根因结论，结论回写本SKILL与project_memory。
+
 ---
 
 ## 九、归档规则（防止agents.md膨胀）
