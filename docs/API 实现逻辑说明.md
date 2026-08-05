@@ -188,10 +188,19 @@ run_business(["商品流量来源_搜索", "商品流量来源_推荐"], date="2
    - 3001 与「自主访问」数据口径重叠，自主访问业务已停用（enabled=False）
 
 2. **⚠️ date/startDate/endDate 三值必须一致（2026-08-05 重大坑）**：
-   - 原逻辑 startDate/endDate 回落 config 旧值，`--date 2026-07-30` 实际发送
+   - 现象：导出的 2026-07-30 与网页对不上；07-29 与 07-30 导出完全相同
+   - 根因：原逻辑 start/end 回落 config 旧值，`--date 2026-07-30` 实际发送
      `date=07-30&startDate=07-29&endDate=07-29` → 接口按 **startDate~endDate 区间**取数，返回07-29数据
-   - 表现：07-29 与 07-30 导出完全相同、与网页对不上
-   - 修复：`_get_date_params()` 中 start/end 未显式传入时默认=date
+   - ✅ **修复方案**（`_get_date_params()` 当前逻辑）：
+     ```
+     date      : 入参(--date)优先，其次 config.xlsx 的 date
+     startDate : 入参(--start_date)优先，未传时默认=date
+     endDate   : 入参(--end_date)优先，未传时默认=date
+     ```
+     即：只要用命令行 `--date` 指定新日期，三个日期自动同步为该日期，不再受 config 旧值影响。
+   - ✅ **验证结果**：修复后 3渠道（搜索43行/推荐4行/购物车4行）与网页导出行数、SKU集合、数值**完全一致**
+   - 使用方式：日常跑任意日期直接 `python main.py --date "YYYY-MM-DD"` 即可，无需改 config；
+     如需区间查询用 `--start_date/--end_date` 显式指定。
 
 3. **pandas 读取长数字精度丢失**：
    - `pd.read_excel()` 默认把数字样式列自动转 int64 → >15位保护失效
