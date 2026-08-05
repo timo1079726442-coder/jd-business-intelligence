@@ -383,29 +383,93 @@ class ShopSourceAPI(JDBaseRequest):
     LIMIT = "5000"
     COMPARE_TYPE = "hb"
 
-    # 渠道配置（lastSrcChannelId2 + uuid前缀）
-    # 2008 = 搜索子来源（商品搜索效果）→ uuid前缀 ca412182e5668a106054
-    # 2009 = 推荐子来源（商品推荐效果）→ uuid前缀 ca412182e5668a106054
-    # 3001 = 购物车子来源（商品购物车效果）→ uuid前缀 5f9cc2ca20cad3d11642
-    # ⚠️ 关键发现：uuid前缀在不同渠道/页面可能不一样，需可配置
+    # 渠道配置（lastSrcChannelId2 二级渠道ID + uuid前缀）
+    # ----------------------------------------------------------------------
+    # 中文说明（小白必读）：
+    #   CHANNEL_MAP 是一个字典，key 是业务名（中文友好），
+    #   value 是一个元组 (二级渠道ID, uuid前缀)。
+    #
+    #   二级渠道ID（lastSrcChannelId2）：京东商智后台给每个流量子来源分配的编号
+    #       2008 = 搜索子来源 → 商品搜索效果
+    #       2009 = 推荐子来源 → 商品推荐效果
+    #       3001 = 购物车子来源 → 商品购物车效果
+    #
+    #   uuid前缀：京东风控校验用的随机ID前缀
+    #       不同业务/页面前缀可能不一样！
+    #       搜索/推荐：ca412182e5668a106054
+    #       购物车  ：5f9cc2ca20cad3d11642
+    #
+    #   警告：uuid前缀一定要按渠道配置，不能写死成全局常量！
+    # ----------------------------------------------------------------------
     CHANNEL_MAP = {
-        "搜索": ("2008", "ca412182e5668a106054"),
-        "推荐": ("2009", "ca412182e5668a106054"),
+        "搜索":   ("2008", "ca412182e5668a106054"),
+        "推荐":   ("2009", "ca412182e5668a106054"),
         "购物车": ("3001", "5f9cc2ca20cad3d11642"),
     }
 
+    # 反向索引表：二级渠道ID → uuid前缀（用于向下兼容直接传channel_id2的场景）
+    # ----------------------------------------------------------------------
+    # 中文说明（小白必读）：
+    #   这个字典是从 CHANNEL_MAP 自动生成的"反向索引"。
+    #   作用：如果你直接传入二级渠道ID（比如 "3001"），也能找到对应的uuid前缀。
+    #   自动构建：调用 _build_channel_id_index() 时会从 CHANNEL_MAP 反向生成。
+    # ----------------------------------------------------------------------
+    _CHANNEL_ID_INDEX = None  # 延迟到首次调用时构建
+
+    @classmethod
+    def _build_channel_id_index(cls):
+        """从 CHANNEL_MAP 构建反向索引：{channel_id2: uuid_prefix}
+        用于支持直接传入 channel_id2 的向下兼容场景。
+        """
+        index = {}
+        for _channel_name, (channel_id2, uuid_prefix) in cls.CHANNEL_MAP.items():
+            index[channel_id2] = uuid_prefix
+        return index
+
     def _get_channel_config(self, channel):
-        """获取渠道配置 (channel_id2, uuid_prefix)，未注册渠道抛错"""
-        if channel not in self.CHANNEL_MAP:
-            available = "、".join(self.CHANNEL_MAP.keys())
-            raise ValueError(f"不支持的渠道: {channel}\n当前可用渠道: {available}")
-        return self.CHANNEL_MAP[channel]
+        """获取渠道配置 (channel_id2, uuid_prefix)。
+
+        支持两种调用方式（向下兼容）：
+          1. 传业务名（推荐）：channel="购物车"
+          2. 传二级渠道ID（兼容）：channel="3001"
+
+        未注册时会抛错，并列出所有可用值。
+        """
+        # 方式1：业务名直接查
+        if channel in self.CHANNEL_MAP:
+            return self.CHANNEL_MAP[channel]
+
+        # 方式2：二级渠道ID反向查（向下兼容老代码）
+        if self._CHANNEL_ID_INDEX is None:
+            self._CHANNEL_ID_INDEX = self._build_channel_id_index()
+        if channel in self._CHANNEL_ID_INDEX:
+            uuid_prefix = self._CHANNEL_ID_INDEX[channel]
+            # 找出对应的业务名（用于日志）
+            for name, (cid, _) in self.CHANNEL_MAP.items():
+                if cid == channel:
+                    self.logger.info(f"通过二级渠道ID '{channel}' 匹配到业务 '{name}'")
+                    break
+            return (channel, uuid_prefix)
+
+        # 都不匹配：报错
+        available_names = "、".join(self.CHANNEL_MAP.keys())
+        available_ids = "、".join(self._CHANNEL_ID_INDEX.keys())
+        raise ValueError(
+            f"不支持的渠道: {channel}\n"
+            f"可用业务名: {available_names}\n"
+            f"可用二级渠道ID: {available_ids}"
+        )
 
     def _get_uuid_for_channel(self, channel):
-        """根据渠道返回对应的uuid前缀，组装成完整uuid"""
+        """根据渠道名或渠道ID，返回对应的完整uuid（格式：前缀-10位随机数）。
+
+        中文说明（小白必读）：
+          uuid = uuid前缀 + "-" + 10位随机数字
+          例如：ca412182e5668a106054-1234567890
+        """
         _, uuid_prefix = self._get_channel_config(channel)
-        random_min = 10 ** (self.UUID_RANDOM_DIGITS - 1)
-        random_max = 10 ** self.UUID_RANDOM_DIGITS - 1
+        random_min = 10 ** (self.UUID_RANDOM_DIGITS - 1)  # 1000000000
+        random_max = 10 ** self.UUID_RANDOM_DIGITS - 1     # 9999999999
         return f"{uuid_prefix}-{random.randint(random_min, random_max)}"
 
     def download_sku(self, date=None, start_date=None, end_date=None, channel="搜索"):
@@ -417,6 +481,11 @@ class ShopSourceAPI(JDBaseRequest):
             end_date = self.config.get("endDate", date)
 
         channel_id2, uuid_prefix = self._get_channel_config(channel)
+
+        # 中文说明：把channel归一化为友好业务名（用于日志和文件名）
+        #   如果传入的是 "2009" 这种channel_id2，转换为 "推荐"
+        #   如果传入的是 "购物车" 这种业务名，保持不变
+        display_channel = self._resolve_channel_display_name(channel, channel_id2)
 
         data = {
             "date": date,
@@ -434,10 +503,28 @@ class ShopSourceAPI(JDBaseRequest):
             "compareType": self.COMPARE_TYPE,
         }
 
-        self.logger.info(f"下载店铺来源数据: 日期={date}, 渠道={channel}(id2={channel_id2}, uuid_prefix={uuid_prefix[:8]}...)")
+        self.logger.info(f"下载店铺来源数据: 日期={date}, 渠道={display_channel}(id2={channel_id2}, uuid_prefix={uuid_prefix[:8]}...)")
         response = self.request(self.API_URL, data, uuid_prefix=uuid_prefix)
-        filename = f"{channel}流量_{date}.xlsx"
+        # 文件名用友好业务名（即使传入的是channel_id2也能得到"推荐流量_xxx.xlsx"）
+        filename = f"{display_channel}流量_{date}.xlsx"
         return self.save_excel(response, filename)
+
+    def _resolve_channel_display_name(self, channel, channel_id2):
+        """把channel归一化为友好业务名。
+        中文说明（小白必读）：
+          输入"购物车"→ 返回"购物车"（业务名，直接用）
+          输入"3001"  → 返回"购物车"（通过channel_id2反查业务名）
+          输入未注册的→ 返回channel本身（兜底）
+        """
+        # 已经是业务名
+        if channel in self.CHANNEL_MAP:
+            return channel
+        # 是channel_id2，反查业务名
+        for name, (cid, _) in self.CHANNEL_MAP.items():
+            if cid == channel_id2:
+                return name
+        # 兜底：用原值
+        return channel
 
     def download_search_sku(self, date=None, start_date=None, end_date=None):
         """便捷方法：导出搜索流量-SKU维度数据（商品搜索效果业务）"""
