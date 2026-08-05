@@ -16,9 +16,18 @@
 3. 区分【业务可修改配置区】和【底层固定逻辑区】，配置集中放在代码最上方。
 4. Cookie、thor、light_key、User‑mnp、token等动态鉴权参数禁止硬编码，预留配置位并增加注释提醒用户手动抓包填入。
 
+### 全局沟通迭代规则
+1. 信息对齐：输入需求模糊、信息缺失，优先提问确认，禁止自行猜测开发。
+2. 迭代规范：多接口迭代开发，必须和用户逐项对齐任务再执行。
+
+### 归档规则（防止本文件膨胀）
+1. ✅ 所有踩坑经验、项目总结、迭代记录，永久写入独立文档并命名方便查阅（如 `docs/API实现逻辑说明.md`、`.trae/skills/*/SKILL.md`、`agents_old_backup.md`）。
+2. ❌ 禁止再写入根目录 `agents.md`。
+3. ❌ 禁止堆砌项目日志、字段映射、长业务SOP、接口文档到本文件。
+
 ### Skill调度规则（核心）
 当出现下面任务场景，**主动加载对应skill文件，不要在agents.md写业务细节**
-- 粘贴京东抓包HTTP报文、分析szgateway商智接口 → 加载 @.trae/skills/jd-api-analyze/SKILL.md
+- 粘贴京东抓包HTTP报文、分析szgateway商智接口、查阅项目历史/踩坑经验/接口规范 → 加载 @.trae/skills/jd-api-analyze/SKILL.md
 - 处理git命令、shell命令、rm相关操作 → 加载 @.trae/skills/git-safe-operate/SKILL.md
 - 生成/重构本项目python业务代码 → 加载 @.trae/skills/python-code-gen/SKILL.md
 
