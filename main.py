@@ -732,7 +732,11 @@ class ProductFlowAPI(JDBaseRequest):
         warnings.filterwarnings("ignore", message="Workbook contains no default style")
 
         # ① 读取二进制流 → DataFrame（接口返回的原始数据）
-        df = pd.read_excel(io.BytesIO(response.content))
+        # ⚠️ 必须 dtype=str：否则pandas会把"数字样式的SKU"自动转成数值(int64)，
+        #    导致 safe_convert_numeric 的">15位长数字保留文本"保护失效、精度丢失。
+        #    先全部按文本读取，再交给安全转换函数统一处理。
+        #    na_filter=False：空单元格保持空字符串，避免被替换成'nan'文本。
+        df = pd.read_excel(io.BytesIO(response.content), dtype=str, na_filter=False)
 
         # ② 通用日期转换：2026-07-29 → 2026/7/29（统一目标格式）
         date_str = convert_date_format(date)

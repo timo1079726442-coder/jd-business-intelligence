@@ -411,6 +411,7 @@ main.py
 | 2026-08-05 | **config优化+渠道执行规则调整**：① config.xlsx项目名"商品搜索效果"统一为"商品流量来源"，9项业务参数补齐【说明】列中文注释；② **3001渠道执行名改回"商品流量来源_购物车"**（自主访问流量与购物车数据口径重叠，统一以"购物车"命名执行）；③ 自主访问保留注册配置但 `enabled=False`，调度层（`_run_single_business`/`_run_business_batch`）过滤不执行，可随时改回True开启；④ 默认批量执行搜索/推荐/购物车3渠道，实测3/3成功；⑤ 业务上下文备份至 main_old_backup.py（仅存档） |
 | 2026-08-05 | **config精简+固定参数固化**：6项固定业务参数（lastSrcChannelId1/groupType/attributes/sortField/sortType/compareType）经用户确认移出config.xlsx，固化为代码常量 `FIXED_BIZ_PARAMS`（不读config、不警告）；config仅保留可变参数 interval/dateType/limit（`VARIABLE_BIZ_PARAMS`，缺省兜底+警告）及日期/全局配置；`config_consistency_check` 3.2同步更新，实测参数组装完整无警告 |
 | 2026-08-05 | **Excel后置处理（商品流量来源落地+通用工具预留）**：① 新增2个公共工具函数 `convert_date_format()`（日期统一转 yyyy/m/d 不补零，支持8位纯数字/横杠/斜杠±时间，失败返原值）和 `safe_convert_numeric()`（全表数值转换，>15位纯数字保留文本防精度丢失，失败保留原值）；② 商品流量来源导出改为：读Excel→转换日期→首列A插入【日期】列→数值安全转换→写回；③ 日期列写入真实datetime并设 `yyyy/m/d`（带时间用 `yyyy/m/d hh:mm:ss`）单元格格式，打开不弹格式警告；④ 其余报表仅预留工具函数暂不改动；⑤ 实测购物车渠道输出验证通过（A列datetime+数值转换正确） |
+| 2026-08-05 | **踩坑：pandas读取长数字精度丢失**：`pd.read_excel()` 默认会把"数字样式"列（如纯数字SKU）自动推断为int64，导致 `safe_convert_numeric()` 的">15位保留文本"保护失效；修复为 `read_excel(..., dtype=str, na_filter=False)` 先全部按文本读入再统一转换。**Mock验证**：临时脚本替换 `JDBaseRequest.request` 返回含渠道ID(2008/2009/3001)的模拟xlsx、跳过30秒间隔、输出隔离到output_mock，走真实 `run_business()` 批量调度，验证3渠道导出+日期列+16位SKU保留文本全部通过（验证完清理） |
 
 ---
 
