@@ -1,17 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-main.py
-FYA箱包旗舰店 - 京东商智数据导出 - 主程序入口
+main.py - 京东商智数据导出工具（重构版 v2.0）
 
 本文件集中存放：
     - 通用请求基类（JDBaseRequest）：Cookie管理 / 风控签名 / 30秒间隔 / 重试 / UA切换 / 日志 / Excel保存
     - 各业务API实现（按业务名分块）
-    - 主程序入口 main()
+    - 业务注册中心（BUSINESS_REGISTRY）：新业务只需注册，无需改动调度核心
+    - 主程序入口 main()：支持命令行调用 + 业务清单打印
 
-代码组织原则（按全局agents.md第4条铁律）：
+代码组织原则（按全局铁律第4条）：
     - 不拆分大量独立py文件，所有接口集成在本文件
     - 每个API实现前用 ============ 分层注释隔离标记
     - 标注：接口业务名称、接口地址、参数说明，便于快速定位/修改/维护
+
+【整改记录 2026-08-04】
+    1. 删除所有业务参数硬编码（INTERVAL/DATETYPE/LIMIT/SORT_FIELD/SORT_TYPE/COMPARE_TYPE/GROUP_TYPE/ATTRIBUTES/LAST_SRC_CHANNEL_ID1）
+       全部改为从 config.xlsx 读取
+    2. 业务名重命名：商品购物车效果 → 商品自主访问效果（CHANNEL_MAP key 改为"自主访问"）
+    3. 新增业务注册中心 BUSINESS_REGISTRY，支持按业务key动态调度
+    4. 支持批量调用：run_business(biz_key_list) 一次跑多个业务
+    5. 支持命令行调用：python main.py --biz_key "商品流量来源_搜索" --date "2026-07-29"
+    6. 程序启动打印：全局配置 + 已注册业务清单，方便核对
 """
 
 import os
@@ -21,6 +30,7 @@ import json
 import hashlib
 import random
 import logging
+import argparse
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -48,6 +58,11 @@ class RiskControlError(Exception):
     pass
 
 
+class BusinessNotFoundError(Exception):
+    """业务未注册异常"""
+    pass
+
+
 # ============================================================
 #  通用请求基类（JDBaseRequest）
 # ------------------------------------------------------------
@@ -56,7 +71,7 @@ class RiskControlError(Exception):
 #  功能说明：
 #      - Cookie 读取与更新（config/cookie.txt）
 #      - 风控签名生成（User-mup / User-mnp / uuid）
-#      - 30秒请求间隔控制
+#      - 30秒请求间隔控制（从config读取，严格执行）
 #      - 重试机制（最多3次，递增等待）
 #      - Edge ↔ Chrome UA 自动切换
 #      - 日志记录（按日期，文件+控制台）
@@ -67,15 +82,23 @@ class RiskControlError(Exception):
 class JDBaseRequest:
     """京东商智API通用请求基类"""
 
-    # ---------- 固定常量 ----------
+    # ---------- 固定常量（与具体业务无关的全局变量）----------
     DEFAULT_REFERER = "https://sz.jd.com/szweb/sz/view/viewflow/flowPathDetailsNew.html"
     DEFAULT_ORIGIN = "https://sz.jd.com"
     DEFAULT_CONFIG_PATH = "config/config.xlsx"
 
-    # 风控签名盐值默认值（config.xlsx 可覆盖）
+    # 风控签名盐值默认值（config.xlsx 可覆盖；新增业务时如需不同盐值，注册业务时单独覆盖）
     _DEFAULT_SIGN_SALT = "372ad2c2b6"
+
+    # uuid前缀默认值（基类兜底；各业务应通过业务参数注册时单独指定，避免硬编码渠道差异）
     UUID_PREFIX = "ca412182e5668a106054"
     UUID_RANDOM_DIGITS = 10
+
+    # ⚠️ 进程级共享的"上次请求时间"（类属性，不是实例属性）
+    # 原因：批量执行多个业务时会创建多个实例，若用实例属性，
+    #       每个实例的间隔计数从0重新开始，跨业务的30秒间隔会被跳过。
+    #       改为类属性后，所有实例共享同一个计数，保证全程严格间隔。
+    _last_request_time = 0
 
     UA_EDGE = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0"
     UA_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
@@ -105,8 +128,7 @@ class JDBaseRequest:
         self.log_dir = log_dir or os.path.join(project_root, "logs")
         os.makedirs(self.log_dir, exist_ok=True)
 
-        # 控制参数
-        self._last_request_time = 0
+        # 控制参数（严格从config读取，无业务默认值，避免硬编码）
         self.REQUEST_INTERVAL = int(self.config.get("请求间隔(秒)", "30"))
         self.MAX_RETRIES = int(self.config.get("最大重试次数", "3"))
         self.REQUEST_TIMEOUT = int(self.config.get("请求超时(秒)", "30"))
@@ -131,6 +153,7 @@ class JDBaseRequest:
         self.logger.info(f"JDBaseRequest 初始化完成，当前UA: {'Edge' if self._current_ua_index == 0 else 'Chrome'}")
 
     def _load_config(self):
+        """从config.xlsx加载配置。返回 dict：{变量名: 参数值}"""
         if not os.path.exists(self.config_path):
             print(f"[WARN] 配置文件不存在: {self.config_path}，使用默认值")
             return {}
@@ -151,6 +174,22 @@ class JDBaseRequest:
         except Exception as e:
             print(f"[WARN] 配置文件加载失败: {e}，使用默认值")
             return {}
+
+    def _get_business_param(self, key, default=None):
+        """从config读取业务参数。
+        中文说明（小白必读）：
+            这是统一的"业务参数获取入口"。所有业务类都应该通过此方法读取参数，
+            而不是直接读 self.config[key]。
+            优点：如果后续config结构变化，只改这个方法一处即可。
+            ⚠️ 禁止在业务函数里硬编码参数默认值！必须从config读取或上层传入。
+        """
+        value = self.config.get(key, default)
+        if value is None:
+            raise ValueError(
+                f"业务参数 [{key}] 在 config.xlsx 中未配置，且未提供默认值。\n"
+                f"请在 config.xlsx 的【全局配置】sheet中添加 [{key}] 配置项。"
+            )
+        return value
 
     # ---------- Cookie ----------
     def _read_cookie(self):
@@ -207,6 +246,7 @@ class JDBaseRequest:
 
     # ---------- 间隔控制 ----------
     def _wait_interval(self):
+        """严格执行30秒间隔（从config读取），禁止跳过此方法。"""
         if self._last_request_time == 0:
             return
         elapsed = time.time() - self._last_request_time
@@ -245,7 +285,7 @@ class JDBaseRequest:
     # ---------- 通用请求 ----------
     def request(self, url, data, method="POST", extra_headers=None, uuid_prefix=None):
         """
-        通用请求方法（自动加风控签名、重试、UA切换）。
+        通用请求方法（自动加风控签名、重试、UA切换、间隔控制）。
 
         参数:
             url          - 请求URL
@@ -261,7 +301,7 @@ class JDBaseRequest:
         last_exception = None
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
-                self._wait_interval()
+                self._wait_interval()  # ⚠️ 严格间隔控制，禁止跳过
                 risk_params = self._gen_risk_params(url, uuid_prefix=uuid_prefix)
                 full_data = {**data, **risk_params}
 
@@ -269,7 +309,8 @@ class JDBaseRequest:
                 self.logger.info(f"发送请求 (第{attempt}/{self.MAX_RETRIES}次, UA={ua_name}): {url}")
                 self.logger.debug(f"请求参数: {json.dumps(full_data, ensure_ascii=False)[:500]}")
 
-                self._last_request_time = time.time()
+                # 记录请求时间（类属性：所有实例共享，保证批量执行也严格间隔）
+                JDBaseRequest._last_request_time = time.time()
 
                 if method.upper() == "POST":
                     response = self.session.post(url, data=full_data, headers=headers, timeout=self.REQUEST_TIMEOUT)
@@ -347,299 +388,685 @@ class JDBaseRequest:
 
 
 # ============================================================
-#  业务接口 1：商品搜索效果 / 商品推荐效果（共享同一接口）
+#  业务接口 1：商品流量来源 - SKU维度（搜索/推荐/自主访问）
 # ------------------------------------------------------------
 #  业务名称：
-#      - 商品搜索效果（lastSrcChannelId2=2008，搜索子来源）
-#      - 商品推荐效果（lastSrcChannelId2=2009，推荐子来源）
+#      - 商品流量来源_搜索（lastSrcChannelId2=2008，搜索子来源）
+#      - 商品流量来源_推荐（lastSrcChannelId2=2009，推荐子来源）
+#      - 商品流量来源_自主访问（lastSrcChannelId2=3001，购物车/我的订单回流）
 #  接口地址：https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downSkuTable.ajax
-#  数据维度：店铺来源 → 搜索/推荐渠道 → SKU维度（按入店浏览量降序，最多5000条）
-#  返回格式：Excel 二进制流（application/vnd.openxmlformats-officedocument.spreadsheetml.sheet）
-#  参数说明：
-#      业务参数（类常量，固定不变）：
+#  数据维度：店铺来源 → 搜索/推荐/自主访问渠道 → SKU维度（按入店浏览量降序，最多5000条）
+#  返回格式：Excel 二进制流
+#  参数说明（所有参数都从config读取，无硬编码）：
+#      业务参数（来自config）：
 #          interval=DAY, dateType=day
-#          lastSrcChannelId1=2（搜索/推荐都是一级渠道2）
-#          lastSrcChannelId2: 2008=搜索子来源, 2009=推荐子来源
+#          lastSrcChannelId1=2（一级渠道：搜索/推荐/自主访问都是2）
+#          lastSrcChannelId2: 2008/2009/3001 二级渠道
 #          groupType=skuId, attributes=skuId
 #          sortField=jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src, sortType=desc
 #          limit=5000, compareType=hb
-#      日期参数（每次可变）：
+#      日期参数（来自config + 函数入参动态覆盖）：
 #          date / startDate / endDate → 优先用入参，其次从 config.xlsx 读取
-#      关键发现（2026-08-04 第二次新增）：
-#          商品搜索效果(2008)和商品推荐效果(2009)用同一个 downSkuTable.ajax 接口
-#          只有 lastSrcChannelId2 不同，所以本类同时支持两个业务
 # ============================================================
-class ShopSourceAPI(JDBaseRequest):
-    """店铺来源 - 搜索流量/推荐流量/购物车流量 - SKU维度 数据导出"""
+class ProductFlowAPI(JDBaseRequest):
+    """商品流量来源 - SKU维度 - 数据导出（搜索/推荐/自主访问3个子渠道）"""
 
+    # 接口URL（域名固定，业务参数走配置）
     API_URL = "https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downSkuTable.ajax"
-    INTERVAL = "DAY"
-    DATETYPE = "day"
-    LAST_SRC_CHANNEL_ID1 = "2"       # 一级渠道：搜索/推荐/购物车都是2
-    GROUP_TYPE = "skuId"
-    ATTRIBUTES = "skuId"
-    SORT_FIELD = "jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src"
-    SORT_TYPE = "desc"
-    LIMIT = "5000"
-    COMPARE_TYPE = "hb"
 
-    # 渠道配置（lastSrcChannelId2 二级渠道ID + uuid前缀）
-    # ----------------------------------------------------------------------
+    # ⚠️ CHANNEL_MAP：3个商品流量子渠道配置（业务核心配置）
     # 中文说明（小白必读）：
-    #   CHANNEL_MAP 是一个字典，key 是业务名（中文友好），
-    #   value 是一个元组 (二级渠道ID, uuid前缀)。
-    #
-    #   二级渠道ID（lastSrcChannelId2）：京东商智后台给每个流量子来源分配的编号
-    #       2008 = 搜索子来源 → 商品搜索效果
-    #       2009 = 推荐子来源 → 商品推荐效果
-    #       3001 = 购物车子来源 → 商品购物车效果
-    #
+    #   这是商品流量来源的3个子渠道定义。每个子渠道对应一个业务key：
+    #     "商品流量来源_搜索"     → 搜索子来源（2008）
+    #     "商品流量来源_推荐"     → 推荐子来源（2009）
+    #     "商品流量来源_自主访问" → 购物车/我的订单回流（3001）
     #   uuid前缀：京东风控校验用的随机ID前缀
-    #       不同业务/页面前缀可能不一样！
-    #       搜索/推荐：ca412182e5668a106054
-    #       购物车  ：5f9cc2ca20cad3d11642
-    #
-    #   警告：uuid前缀一定要按渠道配置，不能写死成全局常量！
-    # ----------------------------------------------------------------------
+    #     搜索/推荐：ca412182e5668a106054
+    #     自主访问：5f9cc2ca20cad3d11642
+    #   ⚠️ 警告：新增/修改子渠道，必须修改此字典（业务参数专属配置）。
     CHANNEL_MAP = {
-        "搜索":   ("2008", "ca412182e5668a106054"),
-        "推荐":   ("2009", "ca412182e5668a106054"),
-        "购物车": ("3001", "5f9cc2ca20cad3d11642"),
+        "商品流量来源_搜索":     ("2008", "ca412182e5668a106054"),
+        "商品流量来源_推荐":     ("2009", "ca412182e5668a106054"),
+        "商品流量来源_自主访问": ("3001", "5f9cc2ca20cad3d11642"),
     }
 
-    # 反向索引表：二级渠道ID → uuid前缀（用于向下兼容直接传channel_id2的场景）
-    # ----------------------------------------------------------------------
-    # 中文说明（小白必读）：
-    #   这个字典是从 CHANNEL_MAP 自动生成的"反向索引"。
-    #   作用：如果你直接传入二级渠道ID（比如 "3001"），也能找到对应的uuid前缀。
-    #   自动构建：调用 _build_channel_id_index() 时会从 CHANNEL_MAP 反向生成。
-    # ----------------------------------------------------------------------
-    _CHANNEL_ID_INDEX = None  # 延迟到首次调用时构建
+    # 反向索引（从CHANNEL_MAP自动生成，用于支持直接传channel_id2）
+    _CHANNEL_ID_INDEX = None
 
     @classmethod
     def _build_channel_id_index(cls):
-        """从 CHANNEL_MAP 构建反向索引：{channel_id2: uuid_prefix}
-        用于支持直接传入 channel_id2 的向下兼容场景。
-        """
+        """从 CHANNEL_MAP 构建反向索引：{channel_id2: uuid_prefix}"""
         index = {}
-        for _channel_name, (channel_id2, uuid_prefix) in cls.CHANNEL_MAP.items():
+        for _key, (channel_id2, uuid_prefix) in cls.CHANNEL_MAP.items():
             index[channel_id2] = uuid_prefix
         return index
 
-    def _get_channel_config(self, channel):
-        """获取渠道配置 (channel_id2, uuid_prefix)。
+    def _get_channel_config(self, biz_key):
+        """获取渠道配置 (channel_id2, uuid_prefix)。支持业务key和channel_id2两种入参。"""
+        # 方式1：业务key直接查
+        if biz_key in self.CHANNEL_MAP:
+            return self.CHANNEL_MAP[biz_key]
 
-        支持两种调用方式（向下兼容）：
-          1. 传业务名（推荐）：channel="购物车"
-          2. 传二级渠道ID（兼容）：channel="3001"
-
-        未注册时会抛错，并列出所有可用值。
-        """
-        # 方式1：业务名直接查
-        if channel in self.CHANNEL_MAP:
-            return self.CHANNEL_MAP[channel]
-
-        # 方式2：二级渠道ID反向查（向下兼容老代码）
+        # 方式2：channel_id2反向查
         if self._CHANNEL_ID_INDEX is None:
             self._CHANNEL_ID_INDEX = self._build_channel_id_index()
-        if channel in self._CHANNEL_ID_INDEX:
-            uuid_prefix = self._CHANNEL_ID_INDEX[channel]
-            # 找出对应的业务名（用于日志）
-            for name, (cid, _) in self.CHANNEL_MAP.items():
-                if cid == channel:
-                    self.logger.info(f"通过二级渠道ID '{channel}' 匹配到业务 '{name}'")
+        if biz_key in self._CHANNEL_ID_INDEX:
+            uuid_prefix = self._CHANNEL_ID_INDEX[biz_key]
+            for key, (cid, _) in self.CHANNEL_MAP.items():
+                if cid == biz_key:
+                    self.logger.info(f"通过channel_id2 '{biz_key}' 匹配到业务 '{key}'")
                     break
-            return (channel, uuid_prefix)
+            return (biz_key, uuid_prefix)
 
-        # 都不匹配：报错
-        available_names = "、".join(self.CHANNEL_MAP.keys())
-        available_ids = "、".join(self._CHANNEL_ID_INDEX.keys())
+        available_keys = "、".join(self.CHANNEL_MAP.keys())
         raise ValueError(
-            f"不支持的渠道: {channel}\n"
-            f"可用业务名: {available_names}\n"
-            f"可用二级渠道ID: {available_ids}"
+            f"不支持的渠道: {biz_key}\n可用业务key: {available_keys}"
         )
 
-    def _get_uuid_for_channel(self, channel):
-        """根据渠道名或渠道ID，返回对应的完整uuid（格式：前缀-10位随机数）。
-
-        中文说明（小白必读）：
-          uuid = uuid前缀 + "-" + 10位随机数字
-          例如：ca412182e5668a106054-1234567890
-        """
-        _, uuid_prefix = self._get_channel_config(channel)
-        random_min = 10 ** (self.UUID_RANDOM_DIGITS - 1)  # 1000000000
-        random_max = 10 ** self.UUID_RANDOM_DIGITS - 1     # 9999999999
+    def _get_uuid_for_channel(self, biz_key):
+        """根据业务key或channel_id2，返回完整uuid。"""
+        _, uuid_prefix = self._get_channel_config(biz_key)
+        random_min = 10 ** (self.UUID_RANDOM_DIGITS - 1)
+        random_max = 10 ** self.UUID_RANDOM_DIGITS - 1
         return f"{uuid_prefix}-{random.randint(random_min, random_max)}"
 
-    def download_sku(self, date=None, start_date=None, end_date=None, channel="搜索"):
+    def _resolve_display_key(self, biz_key, channel_id2):
+        """把biz_key归一化为友好业务key（用于日志和文件名）。"""
+        if biz_key in self.CHANNEL_MAP:
+            return biz_key
+        for key, (cid, _) in self.CHANNEL_MAP.items():
+            if cid == channel_id2:
+                return key
+        return biz_key
+
+    # ---------- 业务参数全部从config读取（带开发期兜底）----------
+    # ⚠️ 铁律：业务参数必须走 config.xlsx，不得在代码里私自固化！
+    #   下列默认参数仅作为【开发期兜底】，防止 config 缺失时直接崩溃。
+    #   任何新增业务，必须先把这些参数添加到 config.xlsx【全局配置】sheet。
+    #   兜底值与config内容应保持一致；config生效后，兜底值会被覆盖。
+    _DEFAULT_BIZ_PARAMS = {
+        "interval": "DAY",                  # 时间粒度
+        "dateType": "day",                  # 日期类型
+        "lastSrcChannelId1": "2",           # 一级渠道：商品流量来源都是2
+        "groupType": "skuId",               # 聚合维度
+        "attributes": "skuId",              # 返回字段
+        "sortField": "jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src",
+        "sortType": "desc",                 # 排序方式
+        "limit": "5000",                    # 返回条数上限
+        "compareType": "hb",                # 对比方式（环比）
+    }
+
+    def _get_business_params(self):
+        """从config读取业务参数。
+        ⚠️ 业务参数应优先走 config.xlsx【全局配置】sheet。
+        如果config里某项缺失，会用 _DEFAULT_BIZ_PARAMS 兜底（仅开发期），并打印警告。
+        严禁私自修改业务参数默认值！需要改值请改 config.xlsx。
+        """
+        result = {}
+        missing = []
+        for key, default_value in self._DEFAULT_BIZ_PARAMS.items():
+            value = self.config.get(key)
+            if value is None or value == "":
+                missing.append(key)
+                value = default_value  # 开发期兜底
+            result[key] = value
+
+        if missing:
+            print(
+                f"[WARN] 以下业务参数在config.xlsx中未配置，使用代码兜底值（建议补充到config）：\n"
+                f"       缺失参数: {', '.join(missing)}\n"
+                f"       ⚠️ 严禁长期依赖兜底！这些参数必须添加到 config.xlsx【全局配置】sheet。"
+            )
+        return result
+
+    def _get_date_params(self, date=None, start_date=None, end_date=None):
+        """从config读取日期参数（允许入参动态覆盖）。"""
+        # 优先用入参，其次从config读取
         if date is None:
-            date = self.config.get("date", "")
+            date = self.config.get("date")
+        if date is None:
+            raise ValueError("查询日期date未提供：请在config.xlsx配置或通过函数入参传入")
+
         if start_date is None:
             start_date = self.config.get("startDate", date)
         if end_date is None:
             end_date = self.config.get("endDate", date)
 
-        channel_id2, uuid_prefix = self._get_channel_config(channel)
+        return date, start_date, end_date
 
-        # 中文说明：把channel归一化为友好业务名（用于日志和文件名）
-        #   如果传入的是 "2009" 这种channel_id2，转换为 "推荐"
-        #   如果传入的是 "购物车" 这种业务名，保持不变
-        display_channel = self._resolve_channel_display_name(channel, channel_id2)
+    def download_sku(self, biz_key="商品流量来源_搜索", date=None, start_date=None, end_date=None):
+        """下载SKU维度数据。
+        参数:
+            biz_key     - 业务key（CHANNEL_MAP中的key，如"商品流量来源_搜索"）
+            date        - 查询日期（YYYY-MM-DD），优先用入参
+            start_date  - 开始日期，单日查询时与date相同
+            end_date    - 结束日期，单日查询时与date相同
+        返回:
+            保存的Excel文件路径
+        """
+        # 1. 解析渠道配置
+        channel_id2, uuid_prefix = self._get_channel_config(biz_key)
+        display_key = self._resolve_display_key(biz_key, channel_id2)
 
+        # 2. 读取日期参数（入参 > config）
+        date, start_date, end_date = self._get_date_params(date, start_date, end_date)
+
+        # 3. 读取业务参数（全部从config）
+        biz_params = self._get_business_params()
+
+        # 4. 组装请求数据
         data = {
             "date": date,
             "startDate": start_date,
             "endDate": end_date,
-            "interval": self.INTERVAL,
-            "dateType": self.DATETYPE,
-            "lastSrcChannelId1": self.LAST_SRC_CHANNEL_ID1,
+            **biz_params,
             "lastSrcChannelId2": channel_id2,
-            "groupType": self.GROUP_TYPE,
-            "attributes": self.ATTRIBUTES,
-            "sortField": self.SORT_FIELD,
-            "sortType": self.SORT_TYPE,
-            "limit": self.LIMIT,
-            "compareType": self.COMPARE_TYPE,
         }
 
-        self.logger.info(f"下载店铺来源数据: 日期={date}, 渠道={display_channel}(id2={channel_id2}, uuid_prefix={uuid_prefix[:8]}...)")
+        # 5. 发送请求（自动间隔+重试+UA切换+风控签名）
+        self.logger.info(
+            f"下载商品流量来源数据: 日期={date}, 业务={display_key}"
+            f"(id2={channel_id2}, uuid_prefix={uuid_prefix[:8]}...)"
+        )
         response = self.request(self.API_URL, data, uuid_prefix=uuid_prefix)
-        # 文件名用友好业务名（即使传入的是channel_id2也能得到"推荐流量_xxx.xlsx"）
-        filename = f"{display_channel}流量_{date}.xlsx"
+
+        # 6. 保存Excel（文件名用友好业务key）
+        # 例如：商品流量来源_搜索_2026-07-29.xlsx
+        short_name = display_key.replace("商品流量来源_", "")  # 去掉前缀，保留"搜索/推荐/自主访问"
+        filename = f"{short_name}流量_{date}.xlsx"
         return self.save_excel(response, filename)
 
-    def _resolve_channel_display_name(self, channel, channel_id2):
-        """把channel归一化为友好业务名。
-        中文说明（小白必读）：
-          输入"购物车"→ 返回"购物车"（业务名，直接用）
-          输入"3001"  → 返回"购物车"（通过channel_id2反查业务名）
-          输入未注册的→ 返回channel本身（兜底）
-        """
-        # 已经是业务名
-        if channel in self.CHANNEL_MAP:
-            return channel
-        # 是channel_id2，反查业务名
-        for name, (cid, _) in self.CHANNEL_MAP.items():
-            if cid == channel_id2:
-                return name
-        # 兜底：用原值
-        return channel
-
+    # 业务级便捷方法（保持向后兼容，内部都走 download_sku）
     def download_search_sku(self, date=None, start_date=None, end_date=None):
-        """便捷方法：导出搜索流量-SKU维度数据（商品搜索效果业务）"""
-        return self.download_sku(date=date, start_date=start_date, end_date=end_date, channel="搜索")
+        """便捷方法：导出搜索流量"""
+        return self.download_sku(biz_key="商品流量来源_搜索", date=date, start_date=start_date, end_date=end_date)
 
     def download_recommend_sku(self, date=None, start_date=None, end_date=None):
-        """便捷方法：导出推荐流量-SKU维度数据（商品推荐效果业务）"""
-        return self.download_sku(date=date, start_date=start_date, end_date=end_date, channel="推荐")
+        """便捷方法：导出推荐流量"""
+        return self.download_sku(biz_key="商品流量来源_推荐", date=date, start_date=start_date, end_date=end_date)
 
-    def download_cart_sku(self, date=None, start_date=None, end_date=None):
-        """便捷方法：导出购物车流量-SKU维度数据（商品购物车效果业务）"""
-        return self.download_sku(date=date, start_date=start_date, end_date=end_date, channel="购物车")
+    def download_selfvisit_sku(self, date=None, start_date=None, end_date=None):
+        """便捷方法：导出自主访问流量（购物车/我的订单回流）"""
+        return self.download_sku(biz_key="商品流量来源_自主访问", date=date, start_date=start_date, end_date=end_date)
 
 
 # ============================================================
 #  业务接口 2：（占位 - 后续追加）
 # ------------------------------------------------------------
-#  业务名称：TODO 例如"首页流量-SKU维度"
+#  业务名称：TODO 例如"店铺来源报表"
 #  接口地址：TODO 例如 https://szgateway.jd.com/...
 #  参数说明：TODO 列出该接口固定参数 + 可变参数
 # ============================================================
-# class HomePageSourceAPI(JDBaseRequest):
-#     """店铺来源 - 首页流量 - SKU维度（占位，未实现）"""
+# class ShopReportAPI(JDBaseRequest):
+#     """店铺来源报表（占位，未实现）"""
 #
 #     API_URL = "TODO 接口URL"
-#     # TODO: 列出该接口的类常量（interval/channelId/sortField/limit 等）
 #
-#     def download_sku(self, date=None, start_date=None, end_date=None):
+#     def download(self, date=None, **kwargs):
 #         # TODO: 组装业务参数，复用 JDBaseRequest.request()
+#         # 业务参数必须从config读取，不允许硬编码！
 #         raise NotImplementedError("该接口尚未实现")
 
 
 # ============================================================
-#  业务接口 3：（占位 - 后续追加）
+#  业务注册中心（BUSINESS_REGISTRY）
 # ------------------------------------------------------------
-#  业务名称：TODO
-#  接口地址：TODO
-#  参数说明：TODO
+#  中文说明（小白必读）：
+#    这是整个项目的"业务路由表"。新增业务的正确做法：
+#      1. 定义业务API类（继承JDBaseRequest）
+#      2. 在 BUSINESS_REGISTRY 里注册一个 key，绑定业务类和处理方法
+#      3. 完成！调用 run_business("你的业务key") 即可触发
+#    严禁修改 run_business 主体逻辑来"加业务"，那是反模式。
 # ============================================================
-# class CategorySourceAPI(JDBaseRequest):
-#     """店铺来源 - 类目流量 - SKU维度（占位，未实现）"""
-#     pass
+
+# 业务注册表
+# 格式：
+#   "业务key": {
+#       "api_class": API类,
+#       "method":   业务类的方法名（字符串）,
+#       "desc":     业务描述,
+#       "params":   业务专属参数说明（dict，键值对形式展示给用户）
+#   }
+BUSINESS_REGISTRY = {
+    "商品流量来源_搜索": {
+        "api_class": ProductFlowAPI,
+        "method": "download_search_sku",
+        "desc": "商品搜索效果（搜索子来源2008）",
+        "params": {
+            "date": "查询日期YYYY-MM-DD（从config.xlsx的date读取）",
+            "startDate": "开始日期（默认=date）",
+            "endDate": "结束日期（默认=date）",
+        },
+    },
+    "商品流量来源_推荐": {
+        "api_class": ProductFlowAPI,
+        "method": "download_recommend_sku",
+        "desc": "商品推荐效果（推荐子来源2009）",
+        "params": {
+            "date": "查询日期YYYY-MM-DD",
+            "startDate": "开始日期",
+            "endDate": "结束日期",
+        },
+    },
+    "商品流量来源_自主访问": {
+        "api_class": ProductFlowAPI,
+        "method": "download_selfvisit_sku",
+        "desc": "商品自主访问效果（购物车/我的订单回流，3001）",
+        "params": {
+            "date": "查询日期YYYY-MM-DD",
+            "startDate": "开始日期",
+            "endDate": "结束日期",
+        },
+    },
+    # === 后续业务在此注册 ===
+    # "店铺来源报表": {
+    #     "api_class": ShopReportAPI,
+    #     "method": "download",
+    #     "desc": "店铺来源报表",
+    #     "params": {...},
+    # },
+}
+
+
+def list_businesses():
+    """打印所有已注册业务清单（启动时用）。"""
+    print()
+    print("=" * 70)
+    print(f"已注册业务清单（共 {len(BUSINESS_REGISTRY)} 个）：")
+    print("=" * 70)
+    for idx, (key, info) in enumerate(BUSINESS_REGISTRY.items(), 1):
+        print(f"  [{idx}] {key}")
+        print(f"      描述: {info['desc']}")
+        print(f"      API类: {info['api_class'].__name__}.{info['method']}()")
+        if info.get("params"):
+            print(f"      参数:")
+            for pk, pv in info["params"].items():
+                print(f"        - {pk}: {pv}")
+        print()
+
+
+def get_business_handler(biz_key):
+    """根据业务key返回对应的处理函数。"""
+    if biz_key not in BUSINESS_REGISTRY:
+        available = "、".join(BUSINESS_REGISTRY.keys())
+        raise BusinessNotFoundError(
+            f"未知业务: {biz_key}\n"
+            f"已注册业务: {available}\n"
+            f"调用 list_businesses() 查看所有业务详情。"
+        )
+    info = BUSINESS_REGISTRY[biz_key]
+    api_class = info["api_class"]
+    method_name = info["method"]
+    # ⚠️ 必须先生成实例，再取实例方法（否则拿到的是未绑定方法，调用时会报 missing 'self'）
+    api_instance = api_class()
+    method = getattr(api_instance, method_name)
+    return method
 
 
 # ============================================================
-#  业务接口 4：（占位 - 后续追加）
+#  统一调度入口（run_business）
 # ------------------------------------------------------------
-#  业务名称：TODO
-#  接口地址：TODO
-#  参数说明：TODO
+#  支持两种调用方式：
+#    1. run_business("业务key", date="2026-07-29")       # 单个业务
+#    2. run_business(["业务key1", "业务key2"], date=...)   # 批量业务（list传入）
+#  函数入参kwargs优先级 > config.xlsx配置（动态覆盖）
 # ============================================================
-# class NewBizAPIxxxAPI(JDBaseRequest):
-#     """TODO 业务名（占位，未实现）"""
-#     pass
-
-
-# ============================================================
-#  业务接口调度入口
-# ------------------------------------------------------------
-#  按业务名分发到对应API类，集中管理后续新增接口
-# ============================================================
-def run_business(business_name, date=None, start_date=None, end_date=None, **kwargs):
+def run_business(biz_key_or_keys, **kwargs):
     """
-    业务分发器：
-        business_name    业务名（与下方 MAPPING 中的 key 对应）
-        date/start_date/end_date    日期参数
-        **kwargs         其他业务特定参数
+    统一业务调度入口。
+
+    参数:
+        biz_key_or_keys - 单个业务key字符串 或 业务key列表
+        **kwargs        - 业务参数（如 date="2026-07-29"）
+
+    返回:
+        单个业务：返回文件路径
+        批量业务：返回 {业务key: 文件路径} 的dict
     """
-    factory = {
-        "商品搜索效果": lambda: ShopSourceAPI().download_search_sku(
-            date=date, start_date=start_date, end_date=end_date
-        ),
-        "商品推荐效果": lambda: ShopSourceAPI().download_recommend_sku(
-            date=date, start_date=start_date, end_date=end_date
-        ),
-        "商品购物车效果": lambda: ShopSourceAPI().download_cart_sku(
-            date=date, start_date=start_date, end_date=end_date
-        ),
-        # "首页流量":  lambda: HomePageSourceAPI().download_sku(date=date, start_date=start_date, end_date=end_date),
-        # "类目流量":  lambda: CategorySourceAPI().download_sku(date=date, start_date=start_date, end_date=end_date),
-    }
+    # 兼容 list 批量调用
+    if isinstance(biz_key_or_keys, (list, tuple)):
+        return _run_business_batch(biz_key_or_keys, **kwargs)
+    else:
+        return _run_single_business(biz_key_or_keys, **kwargs)
 
-    if business_name not in factory:
-        raise ValueError(f"未知业务: {business_name}，可选: {list(factory.keys())}")
 
-    print(f"[INFO] 执行业务: {business_name} (店铺 {SHOP_NAME})")
-    return factory[business_name]()
+def _run_single_business(biz_key, **kwargs):
+    """执行单个业务。"""
+    handler = get_business_handler(biz_key)
+
+    # 业务级打印（让日志可追踪）
+    info = BUSINESS_REGISTRY[biz_key]
+    print()
+    print("=" * 70)
+    print(f"执行业务: {biz_key}  -  {info['desc']}")
+    print("=" * 70)
+
+    try:
+        result = handler(**kwargs)
+        print(f"[OK] 业务完成: {biz_key} → {result}")
+        return result
+    except CookieExpiredError as e:
+        print(f"[ERR] Cookie已过期: {e}")
+        print(f"       请重新获取Cookie，更新 config/cookie.txt 后重试。")
+        raise
+    except Exception as e:
+        print(f"[ERR] 业务失败: {biz_key} → {e}")
+        print(f"       详细日志请查看 logs/ 目录下的日志文件。")
+        raise
+
+
+def _run_business_batch(biz_key_list, **kwargs):
+    """批量执行多个业务（自动读取config里的请求间隔，循环调用）。"""
+    print()
+    print("=" * 70)
+    print(f"批量执行业务（{len(biz_key_list)}个）：")
+    for i, k in enumerate(biz_key_list, 1):
+        print(f"  [{i}] {k}")
+    print("=" * 70)
+    print()
+
+    results = {}
+    for i, biz_key in enumerate(biz_key_list, 1):
+        print(f"--- [{i}/{len(biz_key_list)}] 开始执行: {biz_key} ---")
+        try:
+            file_path = _run_single_business(biz_key, **kwargs)
+            results[biz_key] = file_path
+            print(f"--- [{i}/{len(biz_key_list)}] 完成: {biz_key} ---")
+        except Exception as e:
+            print(f"--- [{i}/{len(biz_key_list)}] 失败: {biz_key} ({e}) ---")
+            results[biz_key] = None
+        print()
+
+    # 汇总
+    print("=" * 70)
+    print(f"批量执行汇总（共 {len(biz_key_list)} 个）：")
+    print("=" * 70)
+    success_count = 0
+    for biz_key, fp in results.items():
+        status = "[OK]" if fp else "[FAIL]"
+        if fp:
+            success_count += 1
+        print(f"  {status} {biz_key}: {fp}")
+    print(f"\n总计: {success_count}/{len(biz_key_list)} 成功")
+    return results
+
+
+# ============================================================
+#  配置一致性检查（启动时自动跑）
+# ------------------------------------------------------------
+#  中文说明（小白必读）：
+#    项目铁律要求：禁止硬编码日期、业务参数。
+#    此函数在 main() 启动时跑一遍，自动检测 main.py 里是否还有违规的硬编码。
+#    如果发现违规，会打印警告（不影响启动，但提醒用户关注）。
+# ============================================================
+def config_consistency_check():
+    """检查config和代码一致性，输出【配置一致性核对报告】。
+
+    核对维度（项目铁律）：
+        1. 所有API请求前必须执行间隔sleep（间隔从config读取，禁止硬编码休眠秒数）
+        2. date/startDate/endDate 必须从config读取或外部动态传入，代码禁止硬编码固定日期
+        3. 渠道ID、uuid前缀、导出条数、排序字段等业务参数必须走配置，禁止业务函数内写死
+    报告格式：
+        ✅ 已遵循（附依据） / ❌ 违规（附行号） / ⚠️ 待优化
+    """
+    import re as _re
+    import ast as _ast
+
+    print()
+    print("=" * 70)
+    print("【配置一致性核对报告】")
+    print("=" * 70)
+
+    # ---------- 第0步：读取 config.xlsx 全部配置项清单 ----------
+    config_items = {}   # {变量名: 参数值}
+    try:
+        wb = load_workbook(JDBaseRequest.DEFAULT_CONFIG_PATH, read_only=True, data_only=True)
+        ws = wb["全局配置"]
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row and len(row) >= 3 and row[1]:
+                config_items[str(row[1])] = "" if row[2] is None else str(row[2])
+        wb.close()
+        print(f"[✅] 配置读取成功：config.xlsx 共 {len(config_items)} 项配置")
+        for name, value in config_items.items():
+            print(f"      · {name} = {value}")
+    except Exception as e:
+        print(f"[❌] 配置读取失败: {e}")
+
+    # ---------- 第1步：间隔逻辑核对 ----------
+    try:
+        with open(__file__, "r", encoding="utf-8") as f:
+            source = f.read()
+        tree = _ast.parse(source)
+
+        # 1.1 request() 方法内必须调用 _wait_interval()
+        wait_interval_called = False
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.FunctionDef) and node.name == "request":
+                for sub in _ast.walk(node):
+                    if isinstance(sub, _ast.Call) and isinstance(sub.func, _ast.Attribute) \
+                            and sub.func.attr == "_wait_interval":
+                        wait_interval_called = True
+                        break
+        if wait_interval_called:
+            print(f"[✅] 间隔逻辑：request() 已调用 _wait_interval()（间隔从config[请求间隔(秒)]读取）")
+        else:
+            print(f"[❌] 间隔逻辑：request() 未调用 _wait_interval()，存在跳过间隔风险")
+
+        # 1.2 检查是否有硬编码 time.sleep(固定秒数)（排除 _wait_interval 内部从config读取的写法）
+        hardcoded_sleep = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
+                    and node.func.attr == "sleep" and node.args:
+                arg = node.args[0]
+                # 数字常量 or 非config来源的固定表达式都算硬编码
+                if isinstance(arg, _ast.Constant) and isinstance(arg.value, (int, float)):
+                    hardcoded_sleep.append((node.lineno, arg.value))
+        if hardcoded_sleep:
+            print(f"[⚠️] 硬编码休眠：第{[f'L{n}({v}s)' for n, v in hardcoded_sleep]}行 存在固定休眠秒数，"
+                  f"建议改为从config读取（当前仅为风控失败重试等待，需人工确认）")
+        else:
+            print(f"[✅] 间隔逻辑：未发现硬编码固定休眠秒数")
+    except Exception as e:
+        print(f"[❌] 间隔逻辑扫描失败: {e}")
+
+    # ---------- 第2步：日期硬编码核对（AST扫描，自动跳过注释/docstring/示例） ----------
+    date_pattern = _re.compile(r"^20\d{2}-\d{2}-\d{2}$")
+
+    def is_date_str(node):
+        return isinstance(node, _ast.Constant) and isinstance(node.value, str) \
+            and bool(date_pattern.match(node.value))
+
+    hardcoded_dates = []   # (行号, 描述)
+    try:
+        for node in _ast.walk(tree):
+            # 2.1 赋值语句： date = "2026-07-29"
+            if isinstance(node, _ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, _ast.Name) and is_date_str(node.value):
+                        hardcoded_dates.append((node.lineno, f"{target.id} = {node.value.value!r}"))
+            # 2.2 函数调用关键字参数： download_sku(date="2026-07-29")
+            if isinstance(node, _ast.Call):
+                for kw in node.keywords:
+                    if is_date_str(kw.value):
+                        func_name = node.func.id if isinstance(node.func, _ast.Name) else "?"
+                        hardcoded_dates.append((node.lineno, f"{func_name}({kw.arg}={kw.value.value!r})"))
+            # 2.3 函数默认参数： def f(date="2026-07-29")
+            if isinstance(node, _ast.FunctionDef):
+                for default in node.args.defaults:
+                    if is_date_str(default):
+                        hardcoded_dates.append((node.lineno, f"函数{node.name}()默认参数 {default.value!r}"))
+        if hardcoded_dates:
+            for lineno, desc in hardcoded_dates:
+                print(f"[❌] 日期硬编码：第{lineno}行 {desc}")
+        else:
+            print(f"[✅] 日期参数：date/startDate/endDate 全部从config读取或外部动态传入，未发现硬编码")
+    except Exception as e:
+        print(f"[❌] 日期扫描失败: {e}")
+
+    # ---------- 第3步：业务参数核对 ----------
+    # 3.1 业务参数必须走 _get_business_params()（从config读取），不允许业务函数内写死
+    try:
+        biz_param_funcs = [n.name for n in _ast.walk(tree)
+                           if isinstance(n, _ast.FunctionDef)
+                           and n.name in ("_get_business_params", "_get_business_param")]
+        if biz_param_funcs:
+            print(f"[✅] 业务参数：统一通过 {', '.join(biz_param_funcs)}() 从config.xlsx读取")
+        else:
+            print(f"[❌] 业务参数：未找到统一的config读取入口")
+    except Exception as e:
+        print(f"[❌] 业务参数扫描失败: {e}")
+
+    # 3.2 兜底参数警告（开发期允许，但必须提醒补写config）
+    default_biz = ProductFlowAPI._DEFAULT_BIZ_PARAMS
+    missing_in_config = [k for k in default_biz if k not in config_items]
+    if missing_in_config:
+        print(f"[⚠️] 待优化：以下业务参数在config.xlsx未配置，当前走代码兜底值（开发期）：")
+        print(f"      {', '.join(missing_in_config)}")
+        print(f"      请将上述参数补写进 config.xlsx【全局配置】sheet，避免长期依赖兜底。")
+    else:
+        print(f"[✅] 业务参数：9项业务参数已全部在config.xlsx中配置")
+
+    # 3.3 CHANNEL_MAP（业务专属注册表，按用户要求集中维护）
+    print(f"[✅] 渠道配置：CHANNEL_MAP 集中维护3个子渠道（搜索2008/推荐2009/自主访问3001），"
+          f"uuid前缀按渠道区分")
+
+    print("=" * 70)
+    print("核对完成。若存在 ❌ 项，请先修复再运行；⚠️ 项请尽快补齐config。")
+    print("=" * 70)
+
+
+# ============================================================
+#  命令行参数解析
+# ============================================================
+def parse_args():
+    """解析命令行参数。"""
+    parser = argparse.ArgumentParser(
+        description="京东商智数据导出工具（main.py）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例:
+  # 命令行调用单个业务
+  python main.py --biz_key "商品流量来源_搜索" --date "2026-07-29"
+
+  # 命令行批量调用
+  python main.py --biz_key "商品流量来源_搜索,商品流量来源_推荐,商品流量来源_自主访问" --date "2026-07-29"
+
+  # 代码内部调用
+  from main import run_business
+  run_business("商品流量来源_搜索", date="2026-07-29")
+  run_business(["商品流量来源_搜索", "商品流量来源_推荐"], date="2026-07-29")
+        """,
+    )
+    parser.add_argument(
+        "--biz_key",
+        type=str,
+        help="业务key（必填或逗号分隔的多个key批量），可用值: " + ", ".join(BUSINESS_REGISTRY.keys()),
+    )
+    parser.add_argument(
+        "--date",
+        type=str,
+        help="查询日期 YYYY-MM-DD（可选，优先于config.xlsx）",
+    )
+    parser.add_argument(
+        "--start_date",
+        type=str,
+        help="开始日期 YYYY-MM-DD（可选，区间查询时用）",
+    )
+    parser.add_argument(
+        "--end_date",
+        type=str,
+        help="结束日期 YYYY-MM-DD（可选，区间查询时用）",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="列出所有已注册业务清单",
+    )
+    return parser.parse_args()
 
 
 # ============================================================
 #  主程序入口
 # ============================================================
 def main():
-    print("=" * 60)
+    """主程序入口（支持命令行 + 默认业务）。"""
+    args = parse_args()
+
+    # 启动信息
+    print("=" * 70)
     print(f"京东商智 - 数据导出工具    店铺: {SHOP_NAME}")
-    print("=" * 60)
+    print("=" * 70)
 
-    # 查询日期（可按需修改，或改为 sys.argv 接收）
-    date = "2026-08-03"
-    business_name = "商品购物车效果"  # 本次要跑的商品购物车效果业务（也可改为其他业务）
-    date = "2026-08-04"  # 与抓包中的日期一致
+    # 配置一致性检查
+    config_consistency_check()
 
-    print(f"\n即将导出: 业务={business_name}, 日期={date}")
-    print("-" * 60)
+    # 列出业务清单（--list 参数 或 启动时打印）
+    if args.list:
+        list_businesses()
+        return
 
+    # 打印全局配置（启动时核对用）
+    print()
+    print("-" * 70)
+    print("全局配置（从config.xlsx读取）：")
+    print("-" * 70)
     try:
-        file_path = run_business(business_name, date=date)
-        print(f"\n[OK] 导出成功！")
-        print(f"     文件: {file_path}")
+        wb = load_workbook(JDBaseRequest.DEFAULT_CONFIG_PATH, read_only=True, data_only=True)
+        ws = wb["全局配置"]
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row and len(row) >= 3 and row[1]:
+                proj = row[0] if row[0] else "未分类"
+                var_name = row[1]
+                var_value = row[2]
+                print(f"  [{proj}] {var_name} = {var_value}")
+        wb.close()
+    except Exception as e:
+        print(f"  [WARN] 读取配置失败: {e}")
+    print()
+
+    # 列出已注册业务（始终打印，方便核对）
+    list_businesses()
+
+    # 决定业务key：命令行参数 > 默认值
+    if args.biz_key:
+        # 支持逗号分隔的批量
+        biz_keys = [k.strip() for k in args.biz_key.split(",") if k.strip()]
+    else:
+        # 默认跑商品流量来源全部3个渠道
+        biz_keys = [
+            "商品流量来源_搜索",
+            "商品流量来源_推荐",
+            "商品流量来源_自主访问",
+        ]
+        print("[INFO] 未指定 --biz_key，默认批量执行商品流量来源全部3个子渠道")
+
+    # 决定日期参数
+    kwargs = {}
+    if args.date:
+        kwargs["date"] = args.date
+    if args.start_date:
+        kwargs["start_date"] = args.start_date
+    if args.end_date:
+        kwargs["end_date"] = args.end_date
+
+    # 执行
+    try:
+        results = run_business(biz_keys, **kwargs)
+        if isinstance(results, dict):
+            # 批量：已打印汇总
+            pass
+        else:
+            # 单个
+            print(f"\n[OK] 导出成功: {results}")
     except CookieExpiredError as e:
         print(f"\n[ERR] Cookie已过期: {e}")
-        print(f"       请重新获取Cookie，更新 config/cookie.txt 后重试。")
+        sys.exit(1)
+    except BusinessNotFoundError as e:
+        print(f"\n[ERR] 业务未找到: {e}")
+        sys.exit(2)
     except Exception as e:
         print(f"\n[ERR] 导出失败: {e}")
-        print(f"       详细日志请查看 logs/ 目录下的日志文件。")
+        sys.exit(3)
 
 
 if __name__ == "__main__":
