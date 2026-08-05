@@ -30,6 +30,9 @@ main.py - 京东商智数据导出工具（重构版 v2.0）
     5. config精简：6项固定业务参数（lastSrcChannelId1/groupType/attributes/sortField/sortType/compareType）
        经用户确认后移出config.xlsx，固化为代码常量 FIXED_BIZ_PARAMS；
        可变参数 interval/dateType/limit 仍从config.xlsx读取（缺省兜底+警告）
+    6. 商品流量来源导出后置处理：新增公共工具 convert_date_format()/safe_convert_numeric()，
+       导出时首列A插入【日期】列 + 全表数值安全转换（>15位长数字保留文本）+
+       日期列真实日期单元格格式（打开不弹格式警告）
 """
 
 import os
@@ -38,6 +41,7 @@ import time
 import json
 import hashlib
 import random
+import re
 import logging
 import argparse
 from datetime import datetime
@@ -70,6 +74,108 @@ class RiskControlError(Exception):
 class BusinessNotFoundError(Exception):
     """业务未注册异常"""
     pass
+
+
+# ============================================================
+#  公共工具函数（所有报表复用，禁止硬编码具体业务逻辑）
+# ------------------------------------------------------------
+#  两个通用工具：
+#    ① convert_date_format(date_str) —— 通用日期格式转换
+#    ② safe_convert_numeric(df)      —— 全表数值安全转换
+#  说明：商品流量来源报表已接入（插入日期列后处理）；
+#        后续订单/售后/京准通等报表可传入自己的DataFrame/日期字符串直接复用，无需改动。
+# ============================================================
+
+def convert_date_format(date_str):
+    """通用日期格式转换（所有报表统一标准）。
+
+    入参:
+        date_str - 日期字符串，支持以下3种输入：
+            "20260729"              8位纯数字
+            "2026-07-29"            横杠分隔
+            "2026-07-29 13:45:59"   横杠分隔+时间
+    出参:
+        统一目标格式字符串（月/日不补零，时间部分原样保留）：
+            "20260729"            → "2026/7/29"
+            "2026-07-29"          → "2026/7/29"
+            "2026-07-29 13:45:59" → "2026/7/29 13:45:59"
+    兼容异常:
+        无法识别的格式直接返回原值，不报错、不中断程序。
+    """
+    if date_str is None:
+        return date_str
+    s = str(date_str).strip()
+    if not s:
+        return date_str
+
+    # ① 8位纯数字日期：20260729 → 2026/7/29
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", s)
+    if m:
+        return f"{m.group(1)}/{int(m.group(2))}/{int(m.group(3))}"
+
+    # ② 分隔符日期（横杠/斜杠均可），可带时间：2026-07-29 / 2026/07/29 / 2026-07-29 13:45:59
+    m = re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})(.*)", s)
+    if m:
+        # 月/日用 int() 去掉前导0（07→7）；时间部分（含前导空格）原样保留
+        return f"{m.group(1)}/{int(m.group(2))}/{int(m.group(3))}{m.group(4)}"
+
+    # ③ 无法识别 → 原值返回（不报错）
+    return s
+
+
+def safe_convert_numeric(df):
+    """全表数值安全转换（所有报表复用）。
+
+    入参:
+        df - pandas.DataFrame（从Excel读取的表格数据）
+    出参:
+        处理后的DataFrame（直接修改并返回），转换规则：
+            1. 字符串且为纯数字（可含小数点/负号）且数字位数≤15位 → 转成数值（int/float）
+            2. 纯数字但数字位数>15位（订单号/长SKU等） → 保留原始文本，杜绝精度丢失
+            3. 非纯数字（日期/含字母/空值/已是数值类型） → 保留原值；转换失败同样保留原值
+    注意:
+        ⚠️ 调用前请先把日期列用 convert_date_format() 处理好，否则"20260729"这类
+           8位纯数字日期会被误当成普通数字转换（商品流量来源流程已保证先转日期再转数值）。
+    """
+    for col in df.columns:
+        df[col] = [_safe_convert_one(v) for v in df[col].tolist()]
+    return df
+
+
+def _safe_convert_one(value):
+    """单个单元格数值安全转换（safe_convert_numeric 的内部辅助函数）。"""
+    # 非字符串（数值/日期对象/None等）直接返回
+    if value is None or not isinstance(value, str):
+        return value
+    s = value.strip()
+    if not s:
+        return value
+    # 仅"纯数字"（可选负号/小数点）才考虑转换，其余（日期/含字母等）原样保留
+    if not re.fullmatch(r"-?\d+(\.\d+)?", s):
+        return value
+    # 数字位数>15位 → 保留文本（长订单号/长SKU，防止Excel精度丢失）
+    digits_count = len(re.sub(r"[^0-9]", "", s))
+    if digits_count > 15:
+        return value
+    try:
+        return float(s) if "." in s else int(s)
+    except ValueError:
+        return value  # 转换失败 → 保留原值
+
+
+def _parse_date_cell(date_str):
+    """把目标格式日期串解析为datetime对象（失败返回None）。
+
+    支持："2026/7/29" 和 "2026/7/29 13:45:59"
+    用途：写Excel时把日期列从文本改为真实日期对象，避免打开文件弹格式警告。
+    """
+    s = str(date_str).strip()
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 # ============================================================
@@ -593,10 +699,85 @@ class ProductFlowAPI(JDBaseRequest):
         response = self.request(self.API_URL, data, uuid_prefix=uuid_prefix)
 
         # 6. 保存Excel（文件名用友好业务key）
-        # 例如：商品流量来源_搜索_2026-07-29.xlsx
-        short_name = display_key.replace("商品流量来源_", "")  # 去掉前缀，保留"搜索/推荐/自主访问"
+        # 例如：搜索流量_2026-07-29.xlsx
+        short_name = display_key.replace("商品流量来源_", "")  # 去掉前缀，保留"搜索/推荐/购物车"
         filename = f"{short_name}流量_{date}.xlsx"
-        return self.save_excel(response, filename)
+
+        # 7. 后置处理保存：读Excel → 首列插入【日期】 → 数值安全转换 → 写回
+        return self._save_flow_excel(response, filename, date)
+
+    # ---------- 商品流量来源 Excel后置处理（2026-08-05 新增）----------
+    def _save_flow_excel(self, response, filename, date):
+        """商品流量来源专用保存流程（Excel后置处理）。
+
+        导出流程（需求文档要求）：
+            ① 接口返回的Excel二进制流 → 读成DataFrame
+            ② 调用通用日期转换函数 convert_date_format()，把本次查询日期转成统一目标格式
+            ③ 在首列A位置插入【日期】列，值=转换后的查询日期
+            ④ 调用通用数值安全转换函数 safe_convert_numeric()，处理全表字段类型
+            ⑤ 写入Excel并设置日期列单元格格式（打开文件不弹格式警告）
+
+        入参:
+            response - requests响应（content为接口返回的xlsx二进制）
+            filename - 保存文件名（如 搜索流量_2026-07-29.xlsx）
+            date     - 本次查询日期（如 2026-07-29）
+        出参:
+            保存后的Excel文件绝对路径
+        """
+        import io
+        import warnings
+        import pandas as pd
+
+        # 抑制openpyxl读取原始xlsx时的无害警告（"Workbook contains no default style"）
+        warnings.filterwarnings("ignore", message="Workbook contains no default style")
+
+        # ① 读取二进制流 → DataFrame（接口返回的原始数据）
+        df = pd.read_excel(io.BytesIO(response.content))
+
+        # ② 通用日期转换：2026-07-29 → 2026/7/29（统一目标格式）
+        date_str = convert_date_format(date)
+
+        # ③ 首列A位置插入【日期】列，所有行取值为本次查询日期
+        df.insert(0, "日期", date_str)
+
+        # ④ 全表数值安全转换（>15位长数字保留文本，防止精度丢失）
+        df = safe_convert_numeric(df)
+
+        # ⑤ 写入Excel → 日期列改为真实日期单元格格式
+        file_path = os.path.join(self.output_dir, filename)
+        df.to_excel(file_path, index=False, engine="openpyxl")
+        self._set_date_column_format(file_path, date_str)
+
+        self.logger.info(
+            f"Excel已保存: {file_path}（已插入日期列+数值转换，{os.path.getsize(file_path)}字节）"
+        )
+        return file_path
+
+    def _set_date_column_format(self, file_path, date_str):
+        """把Excel第1列(A列，日期列)设置为真实日期单元格格式。
+
+        作用：写入真正的日期对象（而非文本），并设置 yyyy/m/d（或带时间）格式，
+              打开Excel时正常显示 2026/7/29，不会弹出格式警告。
+        入参:
+            file_path - 已写好的Excel文件路径
+            date_str  - 日期列的目标格式字符串（如 2026/7/29 或 2026/7/29 13:45:59）
+        """
+        from openpyxl import load_workbook
+
+        # 解析日期字符串为 datetime 对象；带时间则用日期时间格式
+        date_dt = _parse_date_cell(date_str)
+        has_time = ":" in str(date_str)
+        number_format = "yyyy/m/d hh:mm:ss" if has_time else "yyyy/m/d"
+
+        wb = load_workbook(file_path)
+        ws = wb.active
+        for row in range(2, ws.max_row + 1):   # 第1行是表头，从第2行开始
+            cell = ws.cell(row=row, column=1)  # A列 = 日期列
+            if date_dt is not None:
+                cell.value = date_dt           # 写真实日期对象（非文本）
+            cell.number_format = number_format  # 设置显示格式
+        wb.save(file_path)
+        wb.close()
 
     # 业务级便捷方法（保持向后兼容，内部都走 download_sku）
     def download_search_sku(self, date=None, start_date=None, end_date=None):
