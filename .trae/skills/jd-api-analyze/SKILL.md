@@ -390,6 +390,7 @@ main.py
 | 2026-08-04 | Skill管理规则升级：京东全系业务统一复用jd-api-analyze/SKILL.md，按业务分区隔离（商智/京麦/京准通） |
 | 2026-08-04 | **新增商品购物车效果项目**：CHANNEL_MAP改为元组支持按渠道uuid前缀（购物车3001用5f9cc2ca20cad3d11642，搜索/推荐用ca412182e5668a106054）|
 | 2026-08-04 | **CHANNEL_MAP增强**：增加反向索引 `_CHANNEL_ID_INDEX`，支持直接传channel_id2调用（向下兼容）；新增 `_resolve_channel_display_name()` 让channel_id2传入也能得到友好文件名 |
+| 2026-08-04 | **文件夹命名注释**：为所有目录创建 `FOLDER_NAME.md` 说明（10个文件夹），根目录加 `FOLDERS.md` 总索引，便于快速理解项目结构 |
 
 ---
 
