@@ -27,6 +27,9 @@ main.py - 京东商智数据导出工具（重构版 v2.0）
        （自主访问流量与购物车数据口径重叠，统一以"购物车"命名执行）
     3. 自主访问保留注册配置但标记 enabled=False，调度层过滤不执行，后续需要可随时开启
     4. 默认批量执行：搜索/推荐/购物车 3个启用渠道
+    5. config精简：6项固定业务参数（lastSrcChannelId1/groupType/attributes/sortField/sortType/compareType）
+       经用户确认后移出config.xlsx，固化为代码常量 FIXED_BIZ_PARAMS；
+       可变参数 interval/dateType/limit 仍从config.xlsx读取（缺省兜底+警告）
 """
 
 import os
@@ -404,14 +407,11 @@ class JDBaseRequest:
 #  接口地址：https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downSkuTable.ajax
 #  数据维度：店铺来源 → 搜索/推荐/购物车渠道 → SKU维度（按入店浏览量降序，最多5000条）
 #  返回格式：Excel 二进制流
-#  参数说明（所有参数都从config读取，无硬编码）：
-#      业务参数（来自config）：
-#          interval=DAY, dateType=day
-#          lastSrcChannelId1=2（一级渠道：搜索/推荐/购物车都是2）
-#          lastSrcChannelId2: 2008/2009/3001 二级渠道
-#          groupType=skuId, attributes=skuId
-#          sortField=jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src, sortType=desc
-#          limit=5000, compareType=hb
+#  参数说明：
+#      可变业务参数（来自config.xlsx）：interval, dateType, limit
+#      固定业务常量（经用户确认写死代码）：lastSrcChannelId1=2, groupType=skuId, attributes=skuId,
+#          sortField=按入店浏览量, sortType=desc, compareType=hb
+#      二级渠道 lastSrcChannelId2：2008/2009/3001（由CHANNEL_MAP自动带入）
 #      日期参数（来自config + 函数入参动态覆盖）：
 #          date / startDate / endDate → 优先用入参，其次从 config.xlsx 读取
 # ============================================================
@@ -488,41 +488,54 @@ class ProductFlowAPI(JDBaseRequest):
                 return key
         return biz_key
 
-    # ---------- 业务参数全部从config读取（带开发期兜底）----------
-    # ⚠️ 铁律：业务参数必须走 config.xlsx，不得在代码里私自固化！
-    #   下列默认参数仅作为【开发期兜底】，防止 config 缺失时直接崩溃。
-    #   任何新增业务，必须先把这些参数添加到 config.xlsx【全局配置】sheet。
-    #   兜底值与config内容应保持一致；config生效后，兜底值会被覆盖。
-    _DEFAULT_BIZ_PARAMS = {
-        "interval": "DAY",                  # 时间粒度
-        "dateType": "day",                  # 日期类型
-        "lastSrcChannelId1": "2",           # 一级渠道：商品流量来源都是2
-        "groupType": "skuId",               # 聚合维度
-        "attributes": "skuId",              # 返回字段
-        "sortField": "jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src",
-        "sortType": "desc",                 # 排序方式
-        "limit": "5000",                    # 返回条数上限
-        "compareType": "hb",                # 对比方式（环比）
+    # ---------- 业务参数配置区 ----------
+    # ⚠️ 铁律：经常变化的业务参数必须走 config.xlsx（带开发期兜底+警告）。
+    #    固定不变的业务常量，经用户确认（2026-08-05）后直接作为代码常量，
+    #    不再放入 config.xlsx，避免配置文件冗余。
+
+    # 【可变参数】经常需要调整，从 config.xlsx 读取（缺省用兜底值并打印警告）
+    VARIABLE_BIZ_PARAMS = {
+        "interval": "DAY",      # 时间粒度：DAY=按天汇总 / MONTH=按月汇总
+        "dateType": "day",      # 日期类型：与interval对应（day/month）
+        "limit": "5000",        # 返回条数上限
+    }
+
+    # 【固定常量】经用户确认(2026-08-05)固定不变，直接写死在代码，不读config
+    FIXED_BIZ_PARAMS = {
+        "lastSrcChannelId1": "2",   # 一级渠道：商品流量来源都是2
+        "groupType": "skuId",       # 聚合维度：按商品SKU维度汇总
+        "attributes": "skuId",      # 返回字段：SKU维度数据列
+        "sortField": "jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src",  # 排序字段：按入店浏览量
+        "sortType": "desc",         # 排序方式：降序
+        "compareType": "hb",        # 对比方式：环比
     }
 
     def _get_business_params(self):
-        """从config读取业务参数。
-        ⚠️ 业务参数应优先走 config.xlsx【全局配置】sheet。
-        如果config里某项缺失，会用 _DEFAULT_BIZ_PARAMS 兜底（仅开发期），并打印警告。
-        严禁私自修改业务参数默认值！需要改值请改 config.xlsx。
+        """组装本次请求的全部业务参数。
+
+        规则：
+            ① 可变参数（interval/dateType/limit）从 config.xlsx 读取，
+               缺省时用代码兜底值并打印警告，提醒补写config；
+            ② 固定常量（渠道ID/维度/排序/对比方式等）经用户确认后写死在代码，
+               不读config、不打印警告。
         """
         result = {}
         missing = []
-        for key, default_value in self._DEFAULT_BIZ_PARAMS.items():
+
+        # ① 可变参数：从config读取（优先），缺省用兜底值 + 警告
+        for key, default_value in self.VARIABLE_BIZ_PARAMS.items():
             value = self.config.get(key)
             if value is None or value == "":
                 missing.append(key)
                 value = default_value  # 开发期兜底
             result[key] = value
 
+        # ② 固定常量：直接并入（经用户确认固化，不读config）
+        result.update(self.FIXED_BIZ_PARAMS)
+
         if missing:
             print(
-                f"[WARN] 以下业务参数在config.xlsx中未配置，使用代码兜底值（建议补充到config）：\n"
+                f"[WARN] 以下可变业务参数在config.xlsx中未配置，使用代码兜底值（建议补充到config）：\n"
                 f"       缺失参数: {', '.join(missing)}\n"
                 f"       ⚠️ 严禁长期依赖兜底！这些参数必须添加到 config.xlsx【全局配置】sheet。"
             )
@@ -968,15 +981,16 @@ def config_consistency_check():
     except Exception as e:
         print(f"[❌] 业务参数扫描失败: {e}")
 
-    # 3.2 兜底参数警告（开发期允许，但必须提醒补写config）
-    default_biz = ProductFlowAPI._DEFAULT_BIZ_PARAMS
-    missing_in_config = [k for k in default_biz if k not in config_items]
+    # 3.2 业务参数核对：可变参数必须走config；固定参数为确认常量不要求
+    var_params = ProductFlowAPI.VARIABLE_BIZ_PARAMS
+    missing_in_config = [k for k in var_params if k not in config_items]
     if missing_in_config:
-        print(f"[⚠️] 待优化：以下业务参数在config.xlsx未配置，当前走代码兜底值（开发期）：")
+        print(f"[⚠️] 待优化：以下可变业务参数在config.xlsx未配置，当前走代码兜底值（开发期）：")
         print(f"      {', '.join(missing_in_config)}")
         print(f"      请将上述参数补写进 config.xlsx【全局配置】sheet，避免长期依赖兜底。")
     else:
-        print(f"[✅] 业务参数：9项业务参数已全部在config.xlsx中配置")
+        print(f"[✅] 业务参数：可变参数（{', '.join(var_params)}）已全部在config.xlsx中配置")
+    print(f"[✅] 业务参数：固定常量（{', '.join(ProductFlowAPI.FIXED_BIZ_PARAMS)}）经用户确认写死代码，不依赖config")
 
     # 3.3 CHANNEL_MAP（业务专属注册表，按用户要求集中维护）
     print(f"[✅] 渠道配置：CHANNEL_MAP 集中维护渠道（搜索2008/推荐2009/购物车3001执行；"

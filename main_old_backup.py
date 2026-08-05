@@ -671,7 +671,8 @@ if __name__ == "__main__":
 #   请求方式：POST（application/x-www-form-urlencoded）
 #   风控签名：User-mnp = MD5(URL路径 + uuid + 时间戳 + 盐值372ad2c2b6)
 #   返回格式：Excel 二进制流
-#   业务参数（来自config.xlsx）：interval/dateType/lastSrcChannelId1/groupType/attributes/sortField/sortType/limit/compareType
+#   业务参数：可变参数（来自config.xlsx）interval/dateType/limit；
+#             固定常量（2026-08-05经用户确认写死代码）lastSrcChannelId1/groupType/attributes/sortField/sortType/compareType
 #   日期参数（来自config.xlsx或命令行动态传入）：date/startDate/endDate
 #
 # 四、后续业务规划（业务注册中心扩展，无需改动调度核心）

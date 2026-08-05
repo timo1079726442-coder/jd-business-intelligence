@@ -366,7 +366,7 @@ main.py
 
 后续新增业务（店铺来源报表/订单明细/售后订单/京准通广告报表）统一按以下步骤接入，**禁止大改调度核心**：
 1. 定义业务API类（继承 `JDBaseRequest`，复用 Cookie/签名/间隔/重试/UA切换/日志/Excel保存）
-2. 业务参数一律从 config.xlsx【全局配置】读取（`_get_business_params()` 兜底+警告），禁止业务函数内写死
+2. 可变业务参数从 config.xlsx【全局配置】读取（`_get_business_params()` 兜底+警告）；固定常量须经用户确认后方可固化为代码常量（如 FIXED_BIZ_PARAMS），禁止私自写死
 3. 在 `BUSINESS_REGISTRY` 注册：`"业务key": {"api_class": 类, "method": "方法名", "desc": 描述, "params": {...}}`
 4. 调用：命令行 `python main.py --biz_key "业务key" --date "2026-07-29"`；代码内 `run_business("业务key", date=...)`
 5. 新渠道注意 uuid 前缀差异（商智各页面可能不同，按 CHANNEL_MAP 元组维护）
@@ -409,6 +409,7 @@ main.py
 | 2026-08-04 | **文件夹命名注释**：为所有目录创建 `FOLDER_NAME.md` 说明（10个文件夹），根目录加 `FOLDERS.md` 总索引，便于快速理解项目结构 |
 | 2026-08-05 | **整改v2.0（业务注册中心架构）**：① 新增 `BUSINESS_REGISTRY` 注册表 + `run_business(biz_key_or_list, **kwargs)` 统一调度（支持单/批量）；② `parse_args()` argparse 命令行调用 `python main.py --biz_key "xx" --date "2026-07-29"`；③ 移除全部业务参数硬编码（interval/limit/sortField等9项改走config.xlsx，代码仅留开发期兜底+警告）；④ 业务名"商品购物车效果"改为"商品自主访问效果"（3001，购物车/我的订单回流）；⑤ 新增 `config_consistency_check()` 配置一致性核对报告（✅/❌/⚠️，AST扫描自动跳过docstring/epilog示例日期）；⑥ `_last_request_time` 改类级共享，批量跨实例严格30秒间隔；⑦ 修复 `get_business_handler` 缺self实例化Bug；⑧ 3渠道批量测试3/3成功 |
 | 2026-08-05 | **config优化+渠道执行规则调整**：① config.xlsx项目名"商品搜索效果"统一为"商品流量来源"，9项业务参数补齐【说明】列中文注释；② **3001渠道执行名改回"商品流量来源_购物车"**（自主访问流量与购物车数据口径重叠，统一以"购物车"命名执行）；③ 自主访问保留注册配置但 `enabled=False`，调度层（`_run_single_business`/`_run_business_batch`）过滤不执行，可随时改回True开启；④ 默认批量执行搜索/推荐/购物车3渠道，实测3/3成功；⑤ 业务上下文备份至 main_old_backup.py（仅存档） |
+| 2026-08-05 | **config精简+固定参数固化**：6项固定业务参数（lastSrcChannelId1/groupType/attributes/sortField/sortType/compareType）经用户确认移出config.xlsx，固化为代码常量 `FIXED_BIZ_PARAMS`（不读config、不警告）；config仅保留可变参数 interval/dateType/limit（`VARIABLE_BIZ_PARAMS`，缺省兜底+警告）及日期/全局配置；`config_consistency_check` 3.2同步更新，实测参数组装完整无警告 |
 
 ---
 
