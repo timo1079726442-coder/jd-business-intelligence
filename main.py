@@ -33,6 +33,10 @@ main.py - 京东商智数据导出工具（重构版 v2.0）
     6. 商品流量来源导出后置处理：新增公共工具 convert_date_format()/safe_convert_numeric()，
        导出时首列A插入【日期】列 + 全表数值安全转换（>15位长数字保留文本）+
        日期列真实日期单元格格式（打开不弹格式警告）
+    7. 对齐京东官方订单导出风险提示：safe_convert_numeric 新增按列名规则——
+       强制文本黑名单 TEXT_FORCE_COLUMNS={订单编号}（整列跳过转换保留文本）、
+       整数0位小数白名单 INTEGER_ZERO_DECIMAL_COLUMNS={SKU,SPU}（转数字+格式0）；
+       新增通用 apply_column_formats() 按列名批量设置单元格格式（订单编号@/SKU·SPU数值0位小数/日期格式）
 """
 
 import os
@@ -79,12 +83,32 @@ class BusinessNotFoundError(Exception):
 # ============================================================
 #  公共工具函数（所有报表复用，禁止硬编码具体业务逻辑）
 # ------------------------------------------------------------
-#  两个通用工具：
-#    ① convert_date_format(date_str) —— 通用日期格式转换
-#    ② safe_convert_numeric(df)      —— 全表数值安全转换
+#  通用工具：
+#    ① convert_date_format(date_str)   —— 通用日期格式转换
+#    ② safe_convert_numeric(df)        —— 全表数值安全转换（按列名黑/白名单+长度规则）
+#    ③ apply_column_formats(...)       —— 按列名规则批量设置Excel单元格格式
 #  说明：商品流量来源报表已接入（插入日期列后处理）；
 #        后续订单/售后/京准通等报表可传入自己的DataFrame/日期字符串直接复用，无需改动。
 # ============================================================
+
+# ⚠️ 强制文本列黑名单（对齐京东官方订单导出风险提示）：
+#    命中列整列跳过数值转换，强制保留原始文本字符串，彻底规避订单号科学计数法/末尾数字变0。
+TEXT_FORCE_COLUMNS = {"订单编号"}
+# ⚠️ 整数0位小数白名单：命中列允许转为数字；写入Excel单元格格式为 0（数值、0位小数、无千分位）。
+INTEGER_ZERO_DECIMAL_COLUMNS = {"SKU", "SPU"}
+
+
+def _col_matches(col_name, name_set):
+    """判断列名是否命中规则集合。
+
+    匹配规则：列名精确等于集合元素，或以集合元素结尾。
+    举例：列名"商品SKU"命中"SKU"（以SKU结尾）；而"成交金额（SPU）"不命中"SPU"（以）结尾），
+          避免把带（SPU）后缀的金额/客户数等指标列误套格式。
+    """
+    if col_name in name_set:
+        return True
+    return any(col_name.endswith(name) for name in name_set)
+
 
 def convert_date_format(date_str):
     """通用日期格式转换（所有报表统一标准）。
@@ -124,20 +148,26 @@ def convert_date_format(date_str):
 
 
 def safe_convert_numeric(df):
-    """全表数值安全转换（所有报表复用）。
+    """全表数值安全转换（所有报表复用，全局生效）。
 
     入参:
         df - pandas.DataFrame（从Excel读取的表格数据）
     出参:
         处理后的DataFrame（直接修改并返回），转换规则：
-            1. 字符串且为纯数字（可含小数点/负号）且数字位数≤15位 → 转成数值（int/float）
-            2. 纯数字但数字位数>15位（订单号/长SKU等） → 保留原始文本，杜绝精度丢失
-            3. 非纯数字（日期/含字母/空值/已是数值类型） → 保留原值；转换失败同样保留原值
+            0. 【强制文本黑名单】列名命中 TEXT_FORCE_COLUMNS（如"订单编号"）
+               → 整列完全跳过数值转换，强制保留原始文本字符串（不依赖长度判断）；
+            1. 其他字符串且为纯数字（可含小数点/负号）且数字位数≤15位 → 转成数值（int/float）；
+               其中列名命中 INTEGER_ZERO_DECIMAL_COLUMNS（如"SKU"/"SPU"）时单元格格式为 0（0位小数无千分位）；
+            2. 纯数字但数字位数>15位 → 保留原始文本，杜绝精度丢失（兜底防护，全局保留）；
+            3. 非纯数字（日期/含字母/空值/已是数值类型） → 保留原值；转换失败同样保留原值。
     注意:
         ⚠️ 调用前请先把日期列用 convert_date_format() 处理好，否则"20260729"这类
            8位纯数字日期会被误当成普通数字转换（商品流量来源流程已保证先转日期再转数值）。
     """
     for col in df.columns:
+        # ⚠️ 强制文本黑名单：命中列整列跳过数值转换，保留原始文本（订单编号等长ID）
+        if _col_matches(col, TEXT_FORCE_COLUMNS):
+            continue
         df[col] = [_safe_convert_one(v) for v in df[col].tolist()]
     return df
 
@@ -176,6 +206,67 @@ def _parse_date_cell(date_str):
         except ValueError:
             continue
     return None
+
+
+def apply_column_formats(file_path, df, date_column="日期", date_value=None):
+    """按列名规则批量设置Excel单元格格式（所有报表复用，全局生效）。
+
+    规则（对齐京东官方订单导出风险提示）：
+        - 强制文本列 TEXT_FORCE_COLUMNS（如"订单编号"）→ 单元格格式 @（文本），
+          订单号无论多长都按文本显示，杜绝科学计数法/末尾数字变0；
+        - 整数0位小数列 INTEGER_ZERO_DECIMAL_COLUMNS（如"SKU"/"SPU"）→ 单元格格式 0
+          （数值、0位小数、不使用千位分隔符），仅当单元格值为数字时生效；
+        - date_column 指定列（默认"日期"）→ 日期格式 yyyy/m/d（带时间用 yyyy/m/d hh:mm:ss），
+          并把文本日期替换为真实datetime对象，打开Excel不弹格式警告。
+
+    入参:
+        file_path   - 已用 df.to_excel 写好的Excel文件路径
+        df          - 与Excel表头对应的DataFrame（用于列名→列号映射）
+        date_column - 日期列列名（默认"日期"；其他报表自带日期列时传入自己的列名）
+        date_value  - 日期列的字符串值（如 2026/8/5 或 2026/8/5 13:45:59），用于转真实日期对象
+    出参:
+        无（直接修改并保存Excel文件）
+    """
+    from openpyxl import load_workbook
+
+    wb = load_workbook(file_path)
+    ws = wb.active
+
+    # 表头 → 列号 映射（表头在第1行）
+    header_map = {}
+    for cell in ws[1]:
+        if cell.value is not None:
+            header_map[str(cell.value)] = cell.column
+
+    # ① 日期列：文本 → 真实日期对象 + 日期/日期时间格式
+    if date_column in header_map and date_value is not None:
+        date_dt = _parse_date_cell(date_value)
+        has_time = ":" in str(date_value)
+        date_format = "yyyy/m/d hh:mm:ss" if has_time else "yyyy/m/d"
+        col_idx = header_map[date_column]
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=col_idx)
+            if date_dt is not None:
+                cell.value = date_dt           # 写真实日期对象（非文本）
+            cell.number_format = date_format
+
+    # ② 其他列按列名规则设置格式（订单编号=@文本，SKU/SPU=0数值0位小数）
+    for col_name, col_idx in header_map.items():
+        if _col_matches(col_name, TEXT_FORCE_COLUMNS):
+            fmt = "@"                          # 强制文本格式
+        elif _col_matches(col_name, INTEGER_ZERO_DECIMAL_COLUMNS):
+            fmt = "0"                          # 数值、0位小数、无千分位
+        else:
+            continue
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=col_idx)
+            # SKU/SPU列仅当单元格是数字时才套用"0"格式，避免文本值显示异常
+            if fmt == "0" and not isinstance(cell.value, (int, float)):
+                continue
+            cell.number_format = fmt
+
+    wb.save(file_path)
+    wb.close()
 
 
 # ============================================================
@@ -747,41 +838,15 @@ class ProductFlowAPI(JDBaseRequest):
         # ④ 全表数值安全转换（>15位长数字保留文本，防止精度丢失）
         df = safe_convert_numeric(df)
 
-        # ⑤ 写入Excel → 日期列改为真实日期单元格格式
+        # ⑤ 写入Excel → 按列名规则设置单元格格式（日期列/订单编号@/SKU·SPU数值0位小数）
         file_path = os.path.join(self.output_dir, filename)
         df.to_excel(file_path, index=False, engine="openpyxl")
-        self._set_date_column_format(file_path, date_str)
+        apply_column_formats(file_path, df, date_column="日期", date_value=date_str)
 
         self.logger.info(
-            f"Excel已保存: {file_path}（已插入日期列+数值转换，{os.path.getsize(file_path)}字节）"
+            f"Excel已保存: {file_path}（已插入日期列+数值转换+单元格格式，{os.path.getsize(file_path)}字节）"
         )
         return file_path
-
-    def _set_date_column_format(self, file_path, date_str):
-        """把Excel第1列(A列，日期列)设置为真实日期单元格格式。
-
-        作用：写入真正的日期对象（而非文本），并设置 yyyy/m/d（或带时间）格式，
-              打开Excel时正常显示 2026/7/29，不会弹出格式警告。
-        入参:
-            file_path - 已写好的Excel文件路径
-            date_str  - 日期列的目标格式字符串（如 2026/7/29 或 2026/7/29 13:45:59）
-        """
-        from openpyxl import load_workbook
-
-        # 解析日期字符串为 datetime 对象；带时间则用日期时间格式
-        date_dt = _parse_date_cell(date_str)
-        has_time = ":" in str(date_str)
-        number_format = "yyyy/m/d hh:mm:ss" if has_time else "yyyy/m/d"
-
-        wb = load_workbook(file_path)
-        ws = wb.active
-        for row in range(2, ws.max_row + 1):   # 第1行是表头，从第2行开始
-            cell = ws.cell(row=row, column=1)  # A列 = 日期列
-            if date_dt is not None:
-                cell.value = date_dt           # 写真实日期对象（非文本）
-            cell.number_format = number_format  # 设置显示格式
-        wb.save(file_path)
-        wb.close()
 
     # 业务级便捷方法（保持向后兼容，内部都走 download_sku）
     def download_search_sku(self, date=None, start_date=None, end_date=None):
