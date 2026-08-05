@@ -175,17 +175,23 @@ class JDBaseRequest:
         self.logger.info("Cookie已更新")
 
     # ---------- 风控签名 ----------
-    def _gen_risk_params(self, url):
+    def _gen_risk_params(self, url, uuid_prefix=None):
         """
         生成风控参数：User-mup / User-mnp / uuid
         算法（commons-a5562705.js 逆向）：
             User-mnp = MD5(URL路径 + uuid + 时间戳 + 盐值)
+
+        参数:
+            url         - 接口URL，用于提取URL路径
+            uuid_prefix - 自定义uuid前缀（如不传，用类常量UUID_PREFIX）
+                          不同业务/页面uuid前缀可能不同（参考商智购物车3001用5f9cc2ca20cad3d11642）
         """
         timestamp = int(time.time() * 1000)
 
+        prefix = uuid_prefix if uuid_prefix else self.UUID_PREFIX
         random_min = 10 ** (self.UUID_RANDOM_DIGITS - 1)
         random_max = 10 ** self.UUID_RANDOM_DIGITS - 1
-        uuid_str = f"{self.UUID_PREFIX}-{random.randint(random_min, random_max)}"
+        uuid_str = f"{prefix}-{random.randint(random_min, random_max)}"
 
         parsed = urlparse(url)
         url_path = parsed.path
@@ -237,7 +243,17 @@ class JDBaseRequest:
         self.logger.info(f"UA切换: {old_name} → {new_name}")
 
     # ---------- 通用请求 ----------
-    def request(self, url, data, method="POST", extra_headers=None):
+    def request(self, url, data, method="POST", extra_headers=None, uuid_prefix=None):
+        """
+        通用请求方法（自动加风控签名、重试、UA切换）。
+
+        参数:
+            url          - 请求URL
+            data         - 表单参数dict
+            method       - POST/GET
+            extra_headers- 额外请求头
+            uuid_prefix  - 自定义uuid前缀（不传则用类常量UUID_PREFIX）
+        """
         headers = {}
         if extra_headers:
             headers.update(extra_headers)
@@ -246,7 +262,7 @@ class JDBaseRequest:
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
                 self._wait_interval()
-                risk_params = self._gen_risk_params(url)
+                risk_params = self._gen_risk_params(url, uuid_prefix=uuid_prefix)
                 full_data = {**data, **risk_params}
 
                 ua_name = "Edge" if self._current_ua_index == 0 else "Chrome"
@@ -354,12 +370,12 @@ class JDBaseRequest:
 #          只有 lastSrcChannelId2 不同，所以本类同时支持两个业务
 # ============================================================
 class ShopSourceAPI(JDBaseRequest):
-    """店铺来源 - 搜索流量/推荐流量 - SKU维度 数据导出"""
+    """店铺来源 - 搜索流量/推荐流量/购物车流量 - SKU维度 数据导出"""
 
     API_URL = "https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downSkuTable.ajax"
     INTERVAL = "DAY"
     DATETYPE = "day"
-    LAST_SRC_CHANNEL_ID1 = "2"       # 一级渠道：搜索/推荐都是2
+    LAST_SRC_CHANNEL_ID1 = "2"       # 一级渠道：搜索/推荐/购物车都是2
     GROUP_TYPE = "skuId"
     ATTRIBUTES = "skuId"
     SORT_FIELD = "jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src"
@@ -367,19 +383,30 @@ class ShopSourceAPI(JDBaseRequest):
     LIMIT = "5000"
     COMPARE_TYPE = "hb"
 
-    # 渠道ID映射（lastSrcChannelId2 二级渠道）
-    # 2008 = 搜索子来源（商品搜索效果）
-    # 2009 = 推荐子来源（商品推荐效果）
+    # 渠道配置（lastSrcChannelId2 + uuid前缀）
+    # 2008 = 搜索子来源（商品搜索效果）→ uuid前缀 ca412182e5668a106054
+    # 2009 = 推荐子来源（商品推荐效果）→ uuid前缀 ca412182e5668a106054
+    # 3001 = 购物车子来源（商品购物车效果）→ uuid前缀 5f9cc2ca20cad3d11642
+    # ⚠️ 关键发现：uuid前缀在不同渠道/页面可能不一样，需可配置
     CHANNEL_MAP = {
-        "搜索": "2008",
-        "推荐": "2009",
+        "搜索": ("2008", "ca412182e5668a106054"),
+        "推荐": ("2009", "ca412182e5668a106054"),
+        "购物车": ("3001", "5f9cc2ca20cad3d11642"),
     }
 
-    def _get_channel_id2(self, channel):
+    def _get_channel_config(self, channel):
+        """获取渠道配置 (channel_id2, uuid_prefix)，未注册渠道抛错"""
         if channel not in self.CHANNEL_MAP:
             available = "、".join(self.CHANNEL_MAP.keys())
             raise ValueError(f"不支持的渠道: {channel}\n当前可用渠道: {available}")
         return self.CHANNEL_MAP[channel]
+
+    def _get_uuid_for_channel(self, channel):
+        """根据渠道返回对应的uuid前缀，组装成完整uuid"""
+        _, uuid_prefix = self._get_channel_config(channel)
+        random_min = 10 ** (self.UUID_RANDOM_DIGITS - 1)
+        random_max = 10 ** self.UUID_RANDOM_DIGITS - 1
+        return f"{uuid_prefix}-{random.randint(random_min, random_max)}"
 
     def download_sku(self, date=None, start_date=None, end_date=None, channel="搜索"):
         if date is None:
@@ -389,7 +416,7 @@ class ShopSourceAPI(JDBaseRequest):
         if end_date is None:
             end_date = self.config.get("endDate", date)
 
-        channel_id2 = self._get_channel_id2(channel)
+        channel_id2, uuid_prefix = self._get_channel_config(channel)
 
         data = {
             "date": date,
@@ -407,8 +434,8 @@ class ShopSourceAPI(JDBaseRequest):
             "compareType": self.COMPARE_TYPE,
         }
 
-        self.logger.info(f"下载店铺来源数据: 日期={date}, 渠道={channel}(id2={channel_id2})")
-        response = self.request(self.API_URL, data)
+        self.logger.info(f"下载店铺来源数据: 日期={date}, 渠道={channel}(id2={channel_id2}, uuid_prefix={uuid_prefix[:8]}...)")
+        response = self.request(self.API_URL, data, uuid_prefix=uuid_prefix)
         filename = f"{channel}流量_{date}.xlsx"
         return self.save_excel(response, filename)
 
@@ -419,6 +446,10 @@ class ShopSourceAPI(JDBaseRequest):
     def download_recommend_sku(self, date=None, start_date=None, end_date=None):
         """便捷方法：导出推荐流量-SKU维度数据（商品推荐效果业务）"""
         return self.download_sku(date=date, start_date=start_date, end_date=end_date, channel="推荐")
+
+    def download_cart_sku(self, date=None, start_date=None, end_date=None):
+        """便捷方法：导出购物车流量-SKU维度数据（商品购物车效果业务）"""
+        return self.download_sku(date=date, start_date=start_date, end_date=end_date, channel="购物车")
 
 
 # ============================================================
@@ -482,6 +513,9 @@ def run_business(business_name, date=None, start_date=None, end_date=None, **kwa
         "商品推荐效果": lambda: ShopSourceAPI().download_recommend_sku(
             date=date, start_date=start_date, end_date=end_date
         ),
+        "商品购物车效果": lambda: ShopSourceAPI().download_cart_sku(
+            date=date, start_date=start_date, end_date=end_date
+        ),
         # "首页流量":  lambda: HomePageSourceAPI().download_sku(date=date, start_date=start_date, end_date=end_date),
         # "类目流量":  lambda: CategorySourceAPI().download_sku(date=date, start_date=start_date, end_date=end_date),
     }
@@ -503,7 +537,8 @@ def main():
 
     # 查询日期（可按需修改，或改为 sys.argv 接收）
     date = "2026-08-03"
-    business_name = "商品推荐效果"  # 本次要跑的商品推荐效果业务（也可改为"商品搜索效果"）
+    business_name = "商品购物车效果"  # 本次要跑的商品购物车效果业务（也可改为其他业务）
+    date = "2026-08-04"  # 与抓包中的日期一致
 
     print(f"\n即将导出: 业务={business_name}, 日期={date}")
     print("-" * 60)

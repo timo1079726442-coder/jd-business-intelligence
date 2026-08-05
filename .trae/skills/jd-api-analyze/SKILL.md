@@ -315,6 +315,53 @@ main.py
 
 ---
 
+## 项目3：商品购物车效果（已完成 2026-08-04）
+
+### 项目业务说明
+- **业务名**：`商品购物车效果`
+- **接口**：**与商品搜索效果/推荐效果完全相同**
+- **关键差异**：除了 `lastSrcChannelId2=3001`，**uuid前缀也不同**（5f9cc2ca20cad3d11642）
+- **功能**：导出购物车来源的SKU维度流量数据
+- **输出**：Excel文件（按入店浏览量降序，最多5000条SKU）
+
+### 关键发现（uuid前缀差异）
+| 业务 | lastSrcChannelId2 | uuid前缀 |
+|------|-------------------|----------|
+| 商品搜索效果 | 2008 | `ca412182e5668a106054` |
+| 商品推荐效果 | 2009 | `ca412182e5668a106054` |
+| **商品购物车效果** | **3001** | **`5f9cc2ca20cad3d11642`** ⭐ |
+
+⚠️ **重要发现**：uuid前缀在不同业务/页面可能不一样，**必须按渠道可配置**，不能全局写死。
+
+### 改动重点
+1. **main.py - ShopSourceAPI 类重构**：
+   - `CHANNEL_MAP` 改为 `(channel_id2, uuid_prefix)` 元组
+   - 删除 `_get_channel_id2()`，改用 `_get_channel_config()` 返回元组
+   - 新增 `_get_uuid_for_channel(channel)` 按渠道生成uuid
+   - 基类 `_gen_risk_params(url, uuid_prefix=None)` 增加 uuid_prefix 参数
+   - 基类 `request(url, data, ..., uuid_prefix=None)` 透传 uuid_prefix
+2. **main.py - 新增便捷方法 `download_cart_sku()`**
+3. **main.py - 业务分发器**：注册 `"商品购物车效果"` 映射
+4. **main.py - main() 函数**：默认 `business_name = "商品购物车效果"`，日期改为 `2026-08-04`
+5. **配置文件**：未改动（复用商品搜索效果的 date/startDate/endDate 配置 + 现有签名盐值 372ad2c2b6）
+
+### 踩坑要点
+1. **uuid前缀不一致**：购物车(5f9cc2ca)与搜索/推荐(ca412182)不同
+   - 解决：CHANNEL_MAP每项绑定独立uuid前缀，按渠道动态选择
+2. **基类签名方法扩展**：`_gen_risk_params()` 增加可选参数 `uuid_prefix`
+   - 不破坏向后兼容（旧调用方式仍可用类常量UUID_PREFIX）
+3. **元组解包**：`channel_id2, uuid_prefix = self._get_channel_config(channel)`
+
+### 测试结果
+```
+[INFO] 下载店铺来源数据: 日期=2026-08-04, 渠道=购物车(id2=3001, uuid_prefix=5f9cc2ca...)
+[INFO] 请求成功: HTTP 200, 7651字节
+[INFO] Excel已保存: output/购物车流量_2026-08-04.xlsx (7651字节)
+✅ 导出成功！
+```
+
+---
+
 # 【京麦 seller-v10.shop.jd.com 模块（订单/售后）】
 
 > 📝 暂无项目开发记录，待后续添加。
@@ -341,6 +388,7 @@ main.py
 | 2026-08-04 | Agent体系改造：精简agents.md + 部署3个Skill（jd-api-analyze/git-safe-operate/python-code-gen） |
 | 2026-08-04 | 旧agents.md业务内容精准拆分：备份为agents_old_backup.md，业务SOP全部迁移至jd-api-analyze SKILL |
 | 2026-08-04 | Skill管理规则升级：京东全系业务统一复用jd-api-analyze/SKILL.md，按业务分区隔离（商智/京麦/京准通） |
+| 2026-08-04 | **新增商品购物车效果项目**：CHANNEL_MAP改为元组支持按渠道uuid前缀（购物车3001用5f9cc2ca20cad3d11642，搜索/推荐用ca412182e5668a106054）|
 
 ---
 
