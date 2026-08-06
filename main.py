@@ -1317,6 +1317,15 @@ def main():
     """主程序入口（支持命令行 + 默认业务）。"""
     args = parse_args()
 
+    # 后台异步扫描项目文档索引（不阻塞启动）
+    # 新建 .md / .py 后自动追加到 docs/项目文档索引.xlsx
+    try:
+        from update_doc_index import async_update_index
+        async_update_index()
+    except Exception as e:
+        # 异步扫描失败不影响主业务
+        pass
+
     # 启动信息
     print("=" * 70)
     print(f"京东商智 - 数据导出工具    店铺: {SHOP_NAME}")
