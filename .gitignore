@@ -6,6 +6,10 @@ config/新建文本文档.txt
 output/
 logs/
 
+# CDP 抓包产物（可能含敏感 Cookie + 体积大）
+cdp_network_log.json
+cdp_user_data/
+
 # Python缓存
 __pycache__/
 *.pyc

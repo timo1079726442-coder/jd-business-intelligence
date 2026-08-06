@@ -380,7 +380,121 @@ main.py
 
 # 【京麦 seller-v10.shop.jd.com 模块（订单/售后）】
 
-> 📝 暂无项目开发记录，待后续添加。
+> ⚠️ **本模块首发项目：订单明细【加密】导出（暂停归档 2026-08-06）**
+> 详见下方「项目1：订单明细【加密】导出」。
+
+---
+
+## 项目1：订单明细【加密】导出（⏸️ 暂停归档 2026-08-06）
+
+### 项目状态
+- **状态**：⏸️ **暂停归档**（账号/IP 触发 601 风控限流）
+- **恢复前置**：收到明确的【项目恢复指令】+ 账号冷却 30-120 分钟或换公网 IP + 重新抓包拿到 code=200 成功响应
+- **不要做的事**：禁止继续反复抓包、禁止开发 `jd_order_export.py`（缺成功报文无法验证）
+
+### 业务说明
+- **业务名**：`订单明细【加密】导出`
+- **真实入口页面**：`https://shop.jd.com/jdm/trade/tools/export/ExprotList`（⚠️ 不是 seller-v10.shop.jd.com）
+- **真实接口域名**：`sff.jd.com`
+- **接口路径模板**：`/api?v=1.0&appId=CQLEJWPYPFOVQBC8UFLQ&api=dsm.order.export.exportCenterService.<接口名>`
+- **appId**：`CQLEJWPYPFOVQBC8UFLQ`（从 queryExportType 接口抓到）
+- **客户端标识**：`x-rp-client=h5_2.4.0`，`dsm-platform=pc`，`dsm-lang=zh-CN`
+
+### 5 个目标接口
+| 序号 | 接口名 | 用途 | 备注 |
+|------|--------|------|------|
+| 1 | `countDown` | 前置限流校验 | 进入页面时调用 |
+| 2 | `dsm.order.export.exportCenterService.createdExportTask` | 创建导出任务 | ⚠️ **结尾带ed**，拼错返回 301 |
+| 3 | `queryExportTaskInfo` | 轮询任务状态 | 需循环直到成功 |
+| 4 | `exportTaskPwdSend` | 申请密码短信 | 接口不返回密码明文（仅触发短信下发） |
+| 5 | `export.action` | GET 下载 zip 包 | 需用短信里的密码解压 |
+
+### 关键鉴权 Header
+| Header | 含义 | 类型 |
+|--------|------|------|
+| `h5st` | 前端强签名（一次性） | ⚠️ **不可复用**，必须真实浏览器实时生成 |
+| `dsm-eid` | 设备指纹 | ⚠️ 风控 |
+| `x-referer-page` | 来源页标识 | 动态 |
+| `x-rp-client` | 客户端标识 | 固定 `h5_2.4.0` |
+| `dsm-trace-id` | 追踪 ID | 每次请求唯一 |
+| `Anti-Content` | 风控 token | 响应 set-cookie 返回 |
+| `content-type` | body 类型 | `application/json;charset=UTF-8` |
+
+### 业务硬性约束
+1. **同导出类型账号维度**：两次导出间隔≥10 分钟；单日最多导出 10 次（code=201）
+2. **订单明细【加密】时间跨度**：最大 31 天（超出会被拦截）
+3. **单 taskId 申请密码**：单任务单日≤10 次，两次调用间隔≥60 秒
+4. **密码下发方式**：仅短信，**接口拿不到密码明文**；代码不实现短信解析
+5. **当前账号**：具备订单导出 + 敏感信息导出权限
+
+### 请求体固定规则
+- `taskDataParam` 必须是 **JSON 字符串**（`json.dumps` 序列化），不能直接传对象
+- `orderStatusList:[-1]` = 全部订单状态
+- `sensitiveInfoSign:"0"` = 不导出收件人敏感信息
+
+### 抓包架构（已确定）
+- **方案**：Playwright + `launch_persistent_context()` + CDP 全局监听
+- **监听**：Network.requestWillBeSent + Network.responseReceived
+- **过滤**：全量抓包 + 关键词 `exportCenterService` 标记（不丢弃）
+- **响应体**：>10MB 截断（防爆日志）
+- **超时**：30 分钟（防忘按回车）
+- **用户配置**：独立 `cdp_user_data/`，**Chrome 与 Edge 不可共用**
+
+### 风控硬性约束（项目恢复时必须遵守）
+1. **601 限流**：30-120 分钟冷却；冷却期间任何导出请求都会重置冷却
+2. **禁止多端并发**：脚本浏览器、网页京麦、京麦 APP 不要同时操作同一账号导出模块
+3. **严禁代理/VPN/IP 池访问京麦**（升级风险）
+4. **冷却无效**：换手机热点换公网 IP 重试
+5. **h5st 必须真实浏览器实时生成**（禁止硬编码复用抓包值）
+6. **脚本不允许自动重试 601**（多次触发直接停止抓包，进入暂停归档流程）
+7. **抓包行为**：登录后首页静置 1-2 分钟，缓慢操作，禁止快速连续点击
+
+### 抓包脚本（已交付）
+- 文件：`jd_cdp_capture.py`
+- 特点：可视化浏览器 + CDP 全局监听 + 零页面操作（人工操作）
+- 启动命令：`python jd_cdp_capture.py`
+
+### 抓包日志（保留样本）
+- 文件：`cdp_network_log.json`
+- 状态：**601 限流样本**（50 秒抓包，1641 条请求，仅 2 条命中 exportCenterService）
+- 用途：项目恢复后与新的成功报文对比，验证接口变更
+
+### 完整链路（待实施，待恢复后）
+```
+countDown 前置校验
+  ↓
+createdExportTask 创建导出任务（记录 taskId）
+  ↓
+queryExportTaskInfo 循环轮询（直到成功）
+  ↓
+exportTaskPwdSend 申请密码短信（遵守 60s/单任务 5 次限制）
+  ↓
+export.action GET 下载 {taskId}.zip
+  ↓
+【可选方案A】IMAP 读取 QQ 邮箱 → 解析 iPhone 快捷指令投递的 password
+【降级方案】打印 taskId + zip 路径，提示手动输入短信密码
+  ↓
+解压 zip → 输出 Excel 订单报表
+```
+
+### 边界异常处理（待实施）
+- 时间跨度 >31 天直接拦截（不传给京东）
+- code=201 提示等待 10 分钟冷却
+- 单 taskId 60s 密码申请间隔
+- 邮箱轮询超时保留 zip 退出
+- 解压失败保留 zip 提示排查短信/快捷指令
+- 敏感参数（IMAP 授权码）从配置文件读取，不硬编码
+
+### 完整上下文备份
+- 文件：`main_old_backup.py` 第 723 行后追加【业务上下文备份 2026-08-06】区块
+
+### 踩坑要点
+1. **真实入口不是 seller-v10.shop.jd.com**：实际是 `shop.jd.com/jdm/trade/tools/export/ExprotList`
+2. **真实接口域名不是 seller-v10.shop.jd.com**：是 `sff.jd.com`
+3. **playwright launch + --user-data-dir 会报错**：必须用 `launch_persistent_context(user_data_dir=...)`
+4. **601 限流风控**：账号/IP 维度临时限流，非脚本 BUG，禁止自动重试
+5. **Chrome/Edge 切回必须清理 cdp_user_data/**：避免登录态/Cookie 污染
+6. **h5st 一次性签名**：传统 Python 抓
 
 ---
 
@@ -414,9 +528,21 @@ main.py
 | 2026-08-05 | **踩坑：pandas读取长数字精度丢失**：`pd.read_excel()` 默认会把"数字样式"列（如纯数字SKU）自动推断为int64，导致 `safe_convert_numeric()` 的">15位保留文本"保护失效；修复为 `read_excel(..., dtype=str, na_filter=False)` 先全部按文本读入再统一转换。**Mock验证**：临时脚本替换 `JDBaseRequest.request` 返回含渠道ID(2008/2009/3001)的模拟xlsx、跳过30秒间隔、输出隔离到output_mock，走真实 `run_business()` 批量调度，验证3渠道导出+日期列+16位SKU保留文本全部通过（验证完清理） |
 | 2026-08-05 | **对齐京东官方订单导出风险提示（列名黑/白名单规则）**：① `safe_convert_numeric` 新增强制文本黑名单 `TEXT_FORCE_COLUMNS={订单编号}`（命中列整列跳过数值转换保留文本，不依赖长度判断）和整数0位小数白名单 `INTEGER_ZERO_DECIMAL_COLUMNS={SKU,SPU}`；② 新增通用 `apply_column_formats()` 按列名批量设置单元格格式（订单编号=@文本，SKU/SPU=数值0无千分位，日期列沿用 yyyy/m/d，且SKU/SPU仅对数字单元格套用0格式）；③ 匹配用 `_col_matches()` 结尾匹配（"商品SKU"命中"SKU"，但"成交金额（SPU）"不命中，避免误伤（SPU）后缀指标列）；④ >15位兜底防护全局保留；⑤ Mock回归：订单编号长短全文本+@格式、SKU/SPU数字+格式0、普通字段/兜底不受影响，3渠道全部通过 |
 | 2026-08-05 | **踩坑：`--date` 指定新日期但start/end回落config旧值，导致接口按旧区间取数**：`_get_date_params()` 原先 `start_date=config.get("startDate", date)`，当 config 里 startDate/endDate 是旧日期（07-29）而命令行传 `--date 2026-07-30` 时，实际请求为 `date=07-30&startDate=07-29&endDate=07-29`，接口返回 07-29 数据 → 07-29 与 07-30 导出完全相同、与网页对不上。**修复**：start/end 未显式传入时默认=date。**验证**：修复后 3 渠道与网页导出行数/SKU/数值完全一致。另：uuid前缀是前端每次会话动态生成（3001本次抓包为 d6f270911983d45006dd，此前为5f9cc2ca20cad3d11642），与数据无关，无需更新。 |
+| 2026-08-06 | **京麦订单明细【加密】导出项目启动（⏸️ 暂停归档）**：① 新建 `jd_cdp_capture.py` 抓包脚本（Playwright + `launch_persistent_context` + CDP 全局监听，全量抓包+exportCenterService 标记，10MB 响应截断，30 分钟监听超时）；② 真实入口页面定位为 `shop.jd.com/jdm/trade/tools/export/ExprotList`（不是 seller-v10.shop.jd.com），真实接口域名 `sff.jd.com`；③ 抓到 appId=`CQLEJWPYPFOVQBC8UFLQ`、5 个目标接口的请求结构（仅 queryExportType 命中），关键鉴权 header `h5st`（前端强签名一次性）、`dsm-eid`、`x-rp-client=h5_2.4.0`、`Anti-Content` 等；④ 多次 Chrome/Edge 抓包均收到 `code=601 "操作频繁，请稍后重试"`；⑤ 判断为**账号/IP 临时限流**（非脚本 BUG），按风控约束主动停止抓包，进入暂停归档；⑥ 完整上下文（5 个接口、headers、固定业务规则、IMAP 方案、边界处理）已备份至 `main_old_backup.py` 第 723 行后追加区块；⑦ 抓包脚本+601 限流样本日志保留，方便恢复项目时直接复用。 |
 
 ### 当前未完成事项（2026-08-05）
 - 【已解决✅ 2026-08-05】商品流量来源 2026-07-30 导出 vs 网页对不上 → **根因**：`_get_date_params()` 的 startDate/endDate 回落 config 旧值（07-29），`--date 2026-07-30` 时实际发送 `date=07-30&startDate=07-29&endDate=07-29`，接口按旧区间取数导致 07-29/07-30 数据完全相同。**修复**：start/end 未显式传入时默认=date。**验证**：3渠道与网页导出行数/SKU/数值完全一致。踩坑详见迭代记录。
+
+### 当前未完成事项（2026-08-06）—— 京麦订单明细【加密】导出
+- 【⏸️ 暂停归档 2026-08-06】京麦订单明细【加密】导出项目因持续触发 `code=601 "操作频繁，请稍后重试"` 暂停
+- **根因**：账号/IP 触发京东风控临时限流，**非脚本 BUG**
+- **恢复前置条件**（必须全部满足）：
+    1. 收到明确【项目恢复指令】
+    2. 账号完成 30-120 分钟冷却 或 更换干净公网 IP（手机热点）
+    3. 重新运行 `jd_cdp_capture.py` 抓到 `code=200` 成功响应
+    4. 拿到 5 个完整接口的成功报文后再开发 `jd_order_export.py`
+- **保留物**：`jd_cdp_capture.py` 抓包脚本、`cdp_network_log.json` 601 限流样本、`main_old_backup.py` 完整上下文备份
+- **风控硬性约束**（恢复时必须遵守）：禁止多端并发、严禁代理/IP 池、h5st 必须真实浏览器实时生成、脚本不允许自动重试 601、登录后静置 1-2 分钟缓慢操作
 
 ---
 

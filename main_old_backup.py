@@ -721,3 +721,78 @@ if __name__ == "__main__":
 #   跳过30秒间隔、输出隔离 output_mock，走真实 run_business() 批量调度验证导出链路。
 #   曾借此发现：pandas read_excel 默认把数字样式列转 int64 导致>15位保护失效 → 必须 dtype=str。
 # ============================================================
+
+# ============================================================
+# 【业务上下文备份 2026-08-06 - 京麦订单明细【加密】导出项目｜状态：暂停归档】
+#
+# 1. 项目基本信息
+#   - 项目名：京麦订单明细【加密】导出
+#   - 业务域：京麦 seller-v10.shop.jd.com / 真实入口 shop.jd.com
+#   - 项目状态：暂停归档（账号/IP 触发 601 风控限流）
+#   - 启动时间：2026-08-06
+#   - 暂停原因：连续多次 Chrome/Edge 抓包均收到 code=601「操作频繁，请稍后重试」，
+#               判断非脚本 BUG，是账号/IP 临时限流。继续重试会加重风控标记。
+#
+# 2. 项目交付物（保存状态）
+#   - jd_cdp_capture.py：抓包脚本（Playwright + CDP 全局监听），已就绪
+#   - cdp_network_log.json：抓包日志（601 限流样本，17.5 MB，1641 条请求，2 条 exportCenterService）
+#   - cdp_user_data/：浏览器用户数据目录（暂停前已清理，重启项目可重建）
+#
+# 3. 真实业务信息（关键发现）
+#   - 真实入口页面：https://shop.jd.com/jdm/trade/tools/export/ExprotList
+#   - 真实接口域名：sff.jd.com（不是 seller-v10.shop.jd.com）
+#   - 接口路径模板：/api?v=1.0&appId=CQLEJWPYPFOVQBC8UFLQ&api=dsm.order.export.exportCenterService.<接口名>
+#   - 关键 header：
+#     * h5st（前端强签名，一次性，不可复用）
+#     * dsm-eid（设备指纹）
+#     * x-referer-page（来源页标识）
+#     * x-rp-client=h5_2.4.0（客户端标识）
+#     * dsm-platform=pc, dsm-lang=zh-CN, dsm-trace-id（追踪）
+#     * Anti-Content（风控token，响应里 set-cookie 返回）
+#   - 5 个目标接口：
+#     1) countDown（前置限流校验）
+#     2) createdExportTask（创建导出任务，⚠️结尾带ed，拼错返回301）
+#     3) queryExportTaskInfo（轮询任务状态）
+#     4) exportTaskPwdSend（申请密码短信，接口不返回密码明文）
+#     5) export.action（GET 下载 zip 包）
+#
+# 4. 抓包架构（已确定）
+#   - Playwright + launch_persistent_context（必须用持久化上下文，普通 launch 不支持 --user-data-dir）
+#   - 全局监听 Network.requestWillBeSent + Network.responseReceived
+#   - 全量抓包 + 关键词标记（exportCenterService），解析阶段再筛选
+#   - 响应体 >10MB 截断防爆日志
+#   - 30 分钟监听超时（防止忘按回车）
+#   - 浏览器探测顺序：Chrome → Edge（项目恢复后可调整）
+#   - 独立用户配置目录：cdp_user_data/（Chrome/Edge 不可共用，需清理）
+#
+# 5. 风控硬性约束（项目恢复时必须遵守）
+#   - 601 触发后 30-120 分钟冷却；冷却期间任何导出请求都会重置冷却
+#   - 禁止多端并发操作同一账号的导出模块
+#   - 严禁代理/VPN/IP 池访问京麦
+#   - 冷却无效可换手机热点换公网 IP
+#   - h5st 必须真实浏览器实时生成，禁止硬编码
+#   - 脚本不允许自动重试 601
+#   - 抓包行为：登录后首页静置 1-2 分钟，缓慢操作
+#
+# 6. 项目恢复前置条件（必须全部满足）
+#   - 收到明确【项目恢复指令】
+#   - 账号完成 30-120 分钟冷却或更换干净公网 IP
+#   - 重新运行 jd_cdp_capture.py 抓到 code=200 成功响应
+#   - 拿到成功报文后再开发 jd_order_export.py
+#
+# 7. 拟开发的 jd_order_export.py 框架（待恢复后实施）
+#   - 5 接口完整链路：countDown → createdExportTask → queryExportTaskInfo
+#     → exportTaskPwdSend → export.action
+#   - 可选 IMAP 模块（默认关闭）：
+#     * iPhone 快捷指令监听京东短信 → 投递到 QQ 邮箱
+#     * 程序 IMAP 读取 QQ 邮箱解析 taskId + password
+#     * 关闭时打印 taskId + zip 路径，提示手动输入密码
+#   - 边界处理：
+#     * 时间跨度 >31 天直接拦截
+#     * 同类型 10 分钟间隔 code=201 提示冷却
+#     * 单 taskId 60s 密码申请间隔
+#     * 邮箱轮询超时收不到密码保留 zip 退出
+#     * 解压失败保留 zip 提示排查
+#   - 敏感参数（IMAP 授权码、邮箱账号）从配置文件读取，不硬编码
+# ============================================================
+
