@@ -237,6 +237,18 @@ main.py
 
 > 已完成项目归档，按时间顺序保留所有历史上下文。
 
+### 模块业务定位（2026-08-07 吸收草案合并）
+- **业务范围**：商智域流量报表下载 + Excel 后置清洗处理。商智域含两类域名：
+  - `szgateway.jd.com`：POST 接口（downSkuTable.ajax / downTable.ajax）
+  - `sz.jd.com`：GET 导出接口（exportProList.ajax，项目5）
+- **风控参数**：商智接口用 `Cookie + User-mup/User-mnp + uuid`（uuid 用商智自身前缀，**不可复用京东搜索域/京麦域 uuid**）；**商智 downSkuTable/downTable 不依赖 h5st**（h5st 仅京麦 sff.jd.com 使用），不要给商智接口伪造 h5st。
+- **配置规则**：统一读取 config.xlsx，禁止代码硬编码日期、渠道ID、请求间隔；请求间隔从配置读取，所有网络请求遵守间隔休眠。
+- **调用约束**：
+  1. 入口统一走 `run_business()`，传 `--date` 指定导出日期
+  2. Mock 测试优先执行，不发起真实网络请求验证 Excel 清洗逻辑
+  3. 出现风控/页面繁忙/接口报错 → 立即终止任务输出日志，**不做无限重试**（601 不重试）
+- **京麦订单【加密】导出**：已存档暂停（账号/IP 601 风控），恢复时**仍在 jd-api-analyze 京麦模块内开发，不新建独立 Skill**（AGENTS.md Skill管理规则第2条）
+
 ## 项目1：商品搜索效果（已完成 2026-08-04）
 
 ### 项目业务说明
