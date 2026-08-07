@@ -440,6 +440,66 @@ main.py
 
 ---
 
+## 项目5：商品明细导出（GET 导出，2026-08-07 上线）
+
+### 项目业务说明
+- **业务名**：`商品明细导出`
+- **接口**：`https://sz.jd.com/sz/api/productDetail/exportProList.ajax`（⚠️ **GET 请求**，参数全拼 URL）
+- **页面入口**：`https://sz.jd.com/szweb/sz/view/productAnalysis/productDetail.html`
+- **功能**：按二级/三级类目 + 渠道维度导出商品明细流量报表
+- **输出**：Excel 文件，保存至 **`output/商品明细/{date}/{原始文件名}`** 业务子目录
+- **业务类**：`ProductDetailAPI`（继承 JDBaseRequest）
+
+### 与项目4 的关键差异
+| 维度 | 项目4 downTable.ajax | 本项目 exportProList.ajax |
+|------|---------------------|---------------------------|
+| 请求方式 | POST（表单）| **GET（query 拼 URL）** |
+| 域名 | szgateway.jd.com | **sz.jd.com**（Sec-Fetch-Site=same-origin）|
+| 必带 Header | Origin + Referer | **Referer**（同源无需 Origin）|
+| 分组维度 | 三级渠道 | **商品明细（类目）** |
+| 业务参数 | 12 项表单 | **7 项 query**：type=0 / categoryType=0 / downloadType=dayList（固定）+ second=999999 / third="" / channel=99 / isMonitored=undefined（可变）|
+| 响应校验 | magic 字节 | **双重校验：Content-Disposition attachment + PK\x03\x04** |
+| 文件名 | 代码固定拼接 | **从 Content-Disposition 解析原始名**（filename*=UTF-8'' 需 URL 解码）|
+| 保存目录 | output/ 根目录 | **output/商品明细/{date}/ 子目录** |
+
+### 关键实现点
+1. **GET 请求**：`self.session.get(self.API_URL, params=full_params, headers=extra_headers, timeout=...)`
+2. **完全随机 uuid**：`secrets.token_hex(8) + "-" + secrets.token_hex(5)`（同项目4，禁硬编码前缀）
+3. **风控签名**：`User-mnp = MD5(URL路径 + uuid + 时间戳 + 盐值372ad2c2b6)`（复用全局盐值）
+4. **双重校验**：`_validate_excel_response()` = ①<1KB 空响应拦截 ②magic bytes ③**Content-Disposition: attachment**（项目5 增强）
+5. **文件名解析**：`_parse_content_disposition_filename()` 支持 `filename*=UTF-8''中文.xlsx`（URL 解码）与 `filename="a.xlsx"`
+6. **Excel 后置处理**：`_save_detail_excel_to_path()`（复用 convert_date_format / safe_convert_numeric / apply_column_formats）
+
+### 阶段4 风控修复（2026-08-07，与项目4 同步）
+| # | 缺陷 | 修复 |
+|---|------|------|
+| 1 | 601 抛 RuntimeError 被 `except Exception` 捕获 → 继续重试（违背"601不重试"）| 改用 `RiskControlError`，循环内 `except RiskControlError: raise` 直接抛出不重试 |
+| 2 | 最后一次失败响应有内容（HTML>1KB）→ 误判成功继续保存 | 新增 `success` 标记，只有 break 才算成功，否则抛 RuntimeError |
+| 3 | 文本型 601（HTML 含"操作频繁"）无法识别 | magic 校验分支检测"操作频繁/频繁"→ 抛 RiskControlError 停止重试 |
+
+### 异常抛出规则（阶段4 定版）
+- `CookieExpiredError`：401 / 业务码302·-1 / message含"登录" → 立即停止
+- `RiskControlError`：601 / 文本含"操作频繁" → **不重试**直接抛出
+- `RuntimeError`：-407·-402 / 空响应 / 非Excel / 缺attachment → 重试兜底
+
+### 阶段4 测试结论（mock 单测 24/24 通过）
+- 风控码识别 6/6、双重校验 5/5、文件名解析 3/3、随机参数 4/4、全失败兜底 2/2、601不重试 2/2、成功路径 2/2
+
+### 入口命令
+```bash
+python main.py --biz_key "商品明细导出" --date "2026-08-07"
+python main.py --biz_key "商品明细导出" --date "2026-08-07" --second "12345"  # 指定二级类目
+```
+
+### 踩坑要点
+1. **GET 不 POST**：项目1-4 全是 POST 表单，本项目参数必须拼 URL query
+2. **Sec-Fetch-Site 不同**：本项目 same-origin，项目4 same-site；基类默认 same-site 需用 extra_headers 覆盖
+3. **isMonitored=undefined** 是字符串原样提交，不是空值
+4. **`hasattr` 误判教训**：方法归属校验统一用 `class.__dict__`（如 `'_save_flow_excel' in OfflineChannelAPI.__dict__`）
+5. **`_save_flow_excel` 曾误插类**：阶段3 曾把项目4 的 `_save_flow_excel` 误插进 ProductDetailAPI，导致 OfflineChannelAPI 缺方法；归档前已移回并验证
+
+---
+
 ### 新增业务接入规范（v2.0 业务注册中心，2026-08-05）
 
 后续新增业务（店铺来源报表/订单明细/售后订单/京准通广告报表）统一按以下步骤接入，**禁止大改调度核心**：

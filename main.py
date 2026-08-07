@@ -948,6 +948,33 @@ class OfflineChannelAPI(JDBaseRequest):
         "platformCate1": "",          # 平台品类 1：空字符串=全品类（可命令行覆盖）
     }
 
+    def _get_date_params(self, date=None, start_date=None, end_date=None):
+        """解析本次查询的日期参数（支持动态覆盖）。
+
+        ⚠️ 重要：基类 JDBaseRequest 没有这个方法（ProductFlowAPI 才有），
+        新业务必须自实现，否则会 AttributeError。
+
+        规则（2026-08-05 修复）：
+            date      : 优先用入参（如命令行 --date），其次从 config.xlsx 读取
+            startDate : 优先用入参；未传时默认=date（⚠️ 修复：此前回落config旧值，
+                        导致 --date 指定新日期时 start/end 仍是config里旧日期，
+                        接口按旧区间取数，07-29与07-30导出完全相同）
+            endDate   : 同 startDate
+        """
+        # date：入参优先，其次config
+        if date is None:
+            date = self.config.get("date")
+        if date is None:
+            raise ValueError("查询日期date未提供：请在config.xlsx配置或通过函数入参传入")
+
+        # start/end：入参优先；未传时默认与date一致（单日查询）
+        if start_date is None:
+            start_date = date
+        if end_date is None:
+            end_date = date
+
+        return date, start_date, end_date
+
     def _gen_uuid_random(self):
         """完全随机 UUID 生成器（不依赖任何固定前缀）。
 
@@ -1089,6 +1116,9 @@ class OfflineChannelAPI(JDBaseRequest):
             except CookieExpiredError:
                 # Cookie 过期是硬错误，不能靠重试解决，直接抛出
                 raise
+            except RiskControlError:
+                # 阶段4修复：601 限流等风控硬错误，不重试，直接抛出
+                raise
             except requests.exceptions.Timeout as e:
                 last_exception = e
                 self.logger.warning(f"第{attempt}次请求超时（{self.REQUEST_TIMEOUT}秒）")
@@ -1160,12 +1190,15 @@ class OfflineChannelAPI(JDBaseRequest):
             raise CookieExpiredError(f"Cookie已过期：{error_msg}")
 
         # 601 操作频繁（限流，不重试，让用户决定）
+        # 阶段4修复：抛 RiskControlError 而非 RuntimeError。
+        #   RuntimeError 会被重试循环的 except Exception 捕获 → 继续重试，
+        #   违背"601不重试"约束；RiskControlError 在循环内单独捕获并直接抛出。
         if status_code == 601 or "操作频繁" in error_msg:
             self.logger.error(
                 f"风控限流 601：{error_msg}（账号/IP被临时限流，"
                 f"停止本次调用避免加重风控，请稍后30-120分钟再试）"
             )
-            raise RuntimeError(f"风控限流：{error_msg}")
+            raise RiskControlError(f"风控限流：{error_msg}")
 
         # 其他错误码（-407/-402 等，可重试兜底）
         self.logger.warning(f"风控拦截: {error_msg} (status={status_code})")
@@ -1204,6 +1237,610 @@ class OfflineChannelAPI(JDBaseRequest):
                 f"响应前200字节：{preview!r}"
             )
             raise RuntimeError("响应体不是 Excel 文件（magic bytes 校验失败）")
+
+    def _save_flow_excel(self, response, filename, date):
+        """Excel 后置处理（自实现，基类无此方法）。
+
+        ⚠️ 重要：基类 JDBaseRequest 没有 _save_flow_excel（ProductFlowAPI 才有），
+        新业务必须自实现，否则会 AttributeError。
+
+        流程（与 ProductFlowAPI._save_flow_excel 保持一致）：
+            ① 读 Excel 二进制流 → DataFrame（dtype=str 防长数字精度丢失）
+            ② 通用日期转换（convert_date_format）→ 插入首列【日期】
+            ③ safe_convert_numeric 全表数值安全转换
+            ④ 写入 Excel + apply_column_formats 设置单元格格式
+        """
+        import io
+        import warnings
+        import pandas as pd
+
+        # 抑制openpyxl读取原始xlsx时的无害警告
+        warnings.filterwarnings("ignore", message="Workbook contains no default style")
+
+        # ① 读取二进制流 → DataFrame（dtype=str 防长数字精度丢失，na_filter=False 保留空字符串）
+        df = pd.read_excel(io.BytesIO(response.content), dtype=str, na_filter=False)
+
+        # ② 通用日期转换：2026-08-01 → 2026/8/1（统一目标格式）
+        date_str = convert_date_format(date)
+
+        # ③ 首列A位置插入【日期】列
+        df.insert(0, "日期", date_str)
+
+        # ④ 全表数值安全转换
+        df = safe_convert_numeric(df)
+
+        # ⑤ 写入Excel + 单元格格式
+        file_path = os.path.join(self.output_dir, filename)
+        df.to_excel(file_path, index=False, engine="openpyxl")
+        apply_column_formats(file_path, df, date_column="日期", date_value=date_str)
+
+        self.logger.info(
+            f"Excel已保存: {file_path}（已插入日期列+数值转换+单元格格式，{os.path.getsize(file_path)}字节）"
+        )
+        return file_path
+
+
+# ============================================================
+#  业务接口 3：（新业务 - 商品明细导出，2026-08-07 上线）
+# ------------------------------------------------------------
+#  业务名称：商品明细导出
+#  接口地址：https://sz.jd.com/sz/api/productDetail/exportProList.ajax
+#  业务说明：按商品分析页面，导出商品明细流量报表
+#  业务需求（2026-08-07）：
+#      - 请求方式：GET（参数全拼 URL）
+#      - 域名：sz.jd.com（与项目 4 szgateway.jd.com 不同）
+#      - 必带 Header：Referer=productDetail.html、Sec-Fetch-Site=same-origin
+#      - 业务参数：date / startDate / endDate / type=0 / categoryType=0 / second=999999
+#        / third="" / channel=99 / isMonitored=undefined / downloadType=dayList
+#      - 风控三元组：User-mup / User-mnp / uuid（uuid 完全随机）
+#      - 成功响应：HTTP 200 + Content-Disposition: attachment + body 前两字节 PK
+#  硬性约束（用户 2026-08-07 确认）：
+#      1. GET 不用 POST，参数全拼 URL
+#      2. 风控三元组每次全新生成，UUID 不使用固定前缀
+#      3. Cookie 从 config/cookie.txt 整体读取
+#      4. 必须双重校验：Content-Disposition + PK 魔数
+#      5. 文件名从 Content-Disposition 提取原始名
+#      6. 保存目录：output/商品明细/{date}/{原始文件名}
+# ============================================================
+class ProductDetailAPI(JDBaseRequest):
+    """商品明细导出 API（GET 请求，与项目 4 POST 表单不同）。
+
+    业务定位：
+        商智 sz.jd.com 模块下"商品分析"页面的"商品明细"导出。
+        与项目 4（downTable.ajax / 渠道维度）不同，本接口：
+        - 用 GET 请求（参数全拼 URL）
+        - 域名 sz.jd.com（不是 szgateway.jd.com）
+        - 业务输出"商品明细"维度（每条数据是一个商品）
+        - 成功响应带 Content-Disposition 头（带原始文件名）
+
+    父类复用：
+        - 父类 JDBaseRequest 提供：
+            * Cookie 读取（config/cookie.txt）
+            * 风控签名（基类 _gen_risk_params / _wait_interval）
+            * 自动 30 秒间隔
+            * 自动重试 + UA 切换（_switch_ua）
+            * 日志、session 管理
+
+    自实现部分（项目 4 模式延续，class.__dict__ 已验证基类无这些方法）：
+        - _gen_uuid_random / _gen_risk_params_random：完全随机 UUID（用户抓包证实）
+        - _get_date_params：日期三值一致（基类没有，ProductFlowAPI 才有）
+        - _check_business_code：风控业务码识别（项目 4 独有）
+        - _validate_excel_response：空响应拦截 + Content-Disposition 增强校验
+        - _save_detail_excel：业务子目录保存 + 解析原始文件名
+        - download_product_detail：主方法（GET 请求 + 重试 + UA 切换）
+    """
+
+    # 接口 URL（业务约束，固定）
+    # 注意：域名是 sz.jd.com（与项目 4 szgateway.jd.com 不同）
+    API_URL = "https://sz.jd.com/sz/api/productDetail/exportProList.ajax"
+
+    # 必带请求头（业务约束，固定）
+    # 通俗解释：告诉京东"我是从这个页面来的"，缺失会被拦截
+    # 注意：Sec-Fetch-Site=same-origin（项目 4 是 same-site）
+    REFERER = "https://sz.jd.com/szweb/sz/view/productAnalysis/productDetail.html"
+
+    # 业务输出子目录（与项目 4 区分）
+    # 项目 4：output/{文件名}.xlsx
+    # 项目 5：output/商品明细/{date}/{原始文件名}.xlsx
+    OUTPUT_SUBDIR = "商品明细"
+
+    # 固定业务参数（用户确认 2026-08-07 固化，不读 config）
+    # 通俗解释：这些参数永远不变（业务定义），直接写死代码
+    FIXED_BIZ_PARAMS = {
+        "type": "0",                  # 业务类型
+        "categoryType": "0",          # 类目类型
+        "downloadType": "dayList",    # 下载类型
+    }
+
+    # 可变业务参数（从 CLI/config 覆盖，否则用抓包默认值）
+    # 通俗解释：日期可改，类目/渠道走代码常量（用户确认用抓包默认值）
+    VARIABLE_BIZ_PARAMS = {
+        "second": "999999",           # 二级类目：999999=全类目
+        "third": "",                  # 三级类目：空=不限
+        "channel": "99",              # 渠道：99=全部渠道
+        "isMonitored": "undefined",   # 是否监控商品：undefined=不限
+    }
+
+    # ---------- 项目 5 阶段 3 子任务 1：UUID 完全随机 + 风控签名 ----------
+
+    def _gen_uuid_random(self):
+        """完全随机 UUID 生成器（不依赖任何固定前缀）。
+
+        ⚠️ 业务背景：用户抓包显示 UUID 前缀为 `42005c22589c8b55826d`（非固定 prefix），
+        证明前端 SDK 每次会话运行时动态生成。完全随机化符合用户 2026-08-07
+        "禁止硬编码 uuid 前缀"约束。
+
+        复制来源：项目 4 OfflineChannelAPI._gen_uuid_random（已验证可用）
+
+        返回:
+            str - 形如 "42005c22589c8b55826d-19fdaefe247"（16hex + - + 10hex）
+        """
+        import secrets
+        # 16位小写hex + "-" + 10位小写hex，与抓包格式完全一致
+        prefix = secrets.token_hex(8)        # 8字节 = 16hex 字符
+        suffix = secrets.token_hex(5)        # 5字节 = 10hex 字符
+        return f"{prefix}-{suffix}"
+
+    def _gen_risk_params_random(self, url):
+        """生成风控参数：User-mup / User-mnp / uuid（uuid 完全随机版）。
+
+        与基类 _gen_risk_params 的差异：
+            基类默认用类常量 UUID_PREFIX（ca412182e5668a106054），硬编码
+            本方法用 _gen_uuid_random() 完全随机生成
+
+        算法不变（commons-a5562705.js 逆向）：
+            User-mnp = MD5(URL路径 + uuid + 时间戳 + 盐值)
+
+        复制来源：项目 4 OfflineChannelAPI._gen_risk_params_random
+
+        参数:
+            url - 接口URL，用于提取URL路径
+        返回:
+            dict - {"User-mup": str, "User-mnp": str, "uuid": str}
+        """
+        timestamp = int(time.time() * 1000)  # 毫秒级时间戳，每次必新
+        uuid_str = self._gen_uuid_random()    # 完全随机，不传任何 prefix
+
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        url_path = parsed.path  # GET 路径（去掉 query string）
+
+        # 盐值复用全局 SIGN_SALT（与现有 3 业务 + 项目 4 共用）
+        sign_str = f"{url_path}{uuid_str}{timestamp}{self.SIGN_SALT}"
+        user_mnp = hashlib.md5(sign_str.encode("utf-8")).hexdigest()
+
+        return {
+            "User-mup": str(timestamp),
+            "User-mnp": user_mnp,
+            "uuid": uuid_str,
+        }
+
+    # ---------- 项目 5 阶段 3 子任务 2：日期 + 风控识别 + 响应校验 ----------
+
+    def _get_date_params(self, date=None, start_date=None, end_date=None):
+        """解析本次查询的日期参数（支持动态覆盖）。
+
+        ⚠️ 重要：基类 JDBaseRequest 没有这个方法（ProductFlowAPI 才有，class.__dict__ 已验证），
+        新业务必须自实现，否则会 AttributeError。
+
+        复制来源：项目 4 OfflineChannelAPI._get_date_params（与 ProductFlowAPI 同源）
+
+        规则（2026-08-05 修复）：
+            date      : 优先用入参（如命令行 --date），其次从 config.xlsx 读取
+            startDate : 优先用入参；未传时默认=date
+            endDate   : 同 startDate
+        """
+        # date：入参优先，其次config
+        if date is None:
+            date = self.config.get("date")
+        if date is None:
+            raise ValueError("查询日期date未提供：请在config.xlsx配置或通过函数入参传入")
+
+        # start/end：入参优先；未传时默认与date一致（单日查询）
+        if start_date is None:
+            start_date = date
+        if end_date is None:
+            end_date = date
+
+        return date, start_date, end_date
+
+    def _check_business_code(self, response):
+        """风控业务码识别（json 响应里的 status / message）。
+
+        复制来源：项目 4 OfflineChannelAPI._check_business_code（项目 4 阶段 4 已验证 8/8 单测通过）
+
+        业务背景：
+            京东风控有时返回 HTTP 200 但 body 是 json 错误（"不安全的请求"/"操作频繁"），
+            必须解析 json 才能识别。常见码：
+                - status = -407  → "不安全的请求"（签名错误，重试可能恢复）
+                - status = -402  → 参数缺失
+                - status = 601   → 操作频繁（限流，重试反而加重风控，不自动重试）
+                - status = 302 / -1  → 登录失效
+                - message 含 "登录" / "login" → 同上
+        行为:
+            Cookie 过期 → 抛 CookieExpiredError（外层捕获，停止重试）
+            限流 601    → 仅警告，不重试（避免加重风控；让用户决定）
+            其他负码    → 警告 + 抛 Exception（让重试循环兜底）
+        """
+        content_type = response.headers.get("Content-Type", "")
+        if "json" not in content_type:
+            return  # 非 json 响应，跳过业务码检查
+
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return  # json 解析失败，跳过
+
+        # 仅在 success=False 时检查（status 可正可负：-407/-402/302/-1 是负，601/201 是正）
+        if result.get("success", True):
+            return
+
+        error_msg = result.get("message", "未知错误")
+        status_code = result.get("status")
+
+        # Cookie 过期（硬错误，不可重试）
+        if status_code in (302, -1) or "登录" in error_msg or "login" in error_msg.lower():
+            self.logger.error(f"Cookie可能已过期: {error_msg} (status={status_code})")
+            raise CookieExpiredError(f"Cookie已过期：{error_msg}")
+
+        # 601 操作频繁（限流，不重试，让用户决定）
+        # 阶段4修复：抛 RiskControlError 而非 RuntimeError（同项目4）。
+        #   RuntimeError 会被重试循环的 except Exception 捕获 → 继续重试，
+        #   违背"601不重试"约束；RiskControlError 在循环内单独捕获并直接抛出。
+        if status_code == 601 or "操作频繁" in error_msg:
+            self.logger.error(
+                f"风控限流 601：{error_msg}（账号/IP被临时限流，"
+                f"停止本次调用避免加重风控，请稍后30-120分钟再试）"
+            )
+            raise RiskControlError(f"风控限流：{error_msg}")
+
+        # 其他错误码（-407/-402 等，可重试兜底）
+        self.logger.warning(f"风控拦截: {error_msg} (status={status_code})")
+        raise RuntimeError(f"风控拦截(status={status_code})：{error_msg}")
+
+    def _validate_excel_response(self, response, attempt):
+        """空响应拦截 + Excel magic 字节校验 + Content-Disposition 增强校验（项目 5 新增）。
+
+        复制来源：项目 4 OfflineChannelAPI._validate_excel_response
+        增强点（项目 5）：
+            - 校验响应头是否包含 Content-Disposition: attachment（项目 4 不需要）
+
+        校验规则:
+            1. HTTP 200 但响应体 < 1KB → 视为空响应，抛 Exception
+            2. 响应体前 4 字节不是 "PK\\x03\\x04"（Excel 文件头）→ 视为非 Excel
+            3. 响应头 Content-Disposition 不含 "attachment" → 视为非预期响应（项目 5 新增）
+
+        异常:
+            任何校验失败都抛 RuntimeError，让重试循环兜底
+        """
+        # 1. HTTP 200 但响应体空
+        if response.status_code == 200 and len(response.content) < 1024:
+            preview = response.content[:200].decode("utf-8", errors="replace")
+            self.logger.error(
+                f"[第{attempt}次] 响应体过小（{len(response.content)}字节 < 1KB），"
+                f"疑似风控拦截或服务器错误。响应前200字节：{preview!r}"
+            )
+            raise RuntimeError(f"空响应（{len(response.content)}字节）")
+
+        # 2. Excel magic 字节校验（PK\x03\x04 = zip/xlsx 文件头）
+        if response.content[:4] != b"PK\x03\x04":
+            preview = response.content[:200].decode("utf-8", errors="replace")
+            # 阶段4增强：识别"文本型 601"（非 json 的 HTML 错误页含"操作频繁"字样）
+            # 这类响应说明账号/IP已被限流，重试只会加重风控 → 抛 RiskControlError 停止
+            if "操作频繁" in preview or "频繁" in preview:
+                self.logger.error(
+                    f"[第{attempt}次] 响应疑似风控限流(601)：{preview[:100]!r}"
+                    f"（账号/IP被临时限流，停止重试，请30-120分钟后再试）"
+                )
+                raise RiskControlError(f"风控限流：响应文本含'操作频繁'（{preview[:50]!r}）")
+            self.logger.error(
+                f"[第{attempt}次] 响应体不是有效 Excel 文件（magic bytes 不匹配）。"
+                f"响应前200字节：{preview!r}"
+            )
+            raise RuntimeError("响应体不是 Excel 文件（magic bytes 校验失败）")
+
+        # 3. 【项目 5 增强】Content-Disposition: attachment 校验
+        # 业务背景：本接口返回 Excel 是浏览器下载模式，响应头必须带 attachment
+        #         否则可能是风控拦截返回了错误页（伪装成 200 OK）
+        content_disp = response.headers.get("Content-Disposition", "")
+        if "attachment" not in content_disp:
+            self.logger.error(
+                f"[第{attempt}次] 响应头缺少 Content-Disposition: attachment，"
+                f"疑似风控拦截伪装。实际 Content-Disposition={content_disp!r}"
+            )
+            raise RuntimeError("响应头缺少 Content-Disposition: attachment（疑似风控拦截）")
+
+    # ---------- 项目 5 阶段 3 子任务 3：Excel 后置处理 + 业务子目录 ----------
+
+    def _parse_content_disposition_filename(self, content_disp_header):
+        """从 Content-Disposition 响应头解析原始文件名（含中文 + URL 解码）。
+
+        业务背景：
+            京东响应头示例：Content-Disposition: attachment;filename=19524838_20260806_%E5%85%A8%E9%83%A8%E6%B8%A0%E9%81%93_%E5%95%86%E5%93%81%E6%98%8E%E7%BB%86_%E5%88%86%E5%A4%A9%E4%B8%8B%E8%BD%BD.xlsx
+            - 文件名经过 URL 编码（含中文）
+            - 解析后得到：19524838_20260806_全部渠道_商品明细_分天下载.xlsx
+
+        参数:
+            content_disp_header - 响应头 Content-Disposition 的完整值
+        返回:
+            str - 解码后的文件名（不含路径），如 "19524838_20260806_全部渠道_商品明细_分天下载.xlsx"
+            None - 解析失败
+        """
+        import re
+        from urllib.parse import unquote
+
+        if not content_disp_header:
+            return None
+
+        # 匹配 filename= 后面的值（支持 filename*=UTF-8''... 形式）
+        # 优先尝试 RFC 5987 格式：filename*=UTF-8''<urlencoded>
+        m = re.search(r"filename\*=(?:UTF-8|utf-8)''(.+?)(?:;|$)", content_disp_header)
+        if m:
+            return unquote(m.group(1))
+
+        # 标准格式：filename="xxx" 或 filename=xxx
+        m = re.search(r'filename\s*=\s*"?(?P<name>[^";]+)"?', content_disp_header)
+        if m:
+            return unquote(m.group("name"))
+
+        return None
+
+    def _save_detail_excel(self, response, filename, date):
+        """商品明细 Excel 后置处理（业务子目录 + 解析 Content-Disposition）。
+
+        业务定位：
+            与项目 4 _save_flow_excel 不同，本方法：
+            1. 保存到业务子目录：output/商品明细/{date}/{filename}
+            2. filename 优先用 Content-Disposition 解析的原始文件名（保留京东原始命名）
+            3. 如果 Content-Disposition 解析失败，回退用 CLI 传入的 filename
+
+        流程（与项目 4 _save_flow_excel 保持一致）：
+            ① 读 Excel 二进制流 → DataFrame（dtype=str 防长数字精度丢失）
+            ② 通用日期转换（convert_date_format）→ 插入首列【日期】
+            ③ safe_convert_numeric 全表数值安全转换
+            ④ 写入 Excel + apply_column_formats 设置单元格格式
+        """
+        import io
+        import warnings
+        import pandas as pd
+
+        # 抑制openpyxl读取原始xlsx时的无害警告
+        warnings.filterwarnings("ignore", message="Workbook contains no default style")
+
+        # ① 读取二进制流 → DataFrame
+        df = pd.read_excel(io.BytesIO(response.content), dtype=str, na_filter=False)
+
+        # ② 通用日期转换：2026-08-06 → 2026/8/6
+        date_str = convert_date_format(date)
+
+        # ③ 首列A位置插入【日期】列
+        df.insert(0, "日期", date_str)
+
+        # ④ 全表数值安全转换
+        df = safe_convert_numeric(df)
+
+        # ⑤ 写入Excel
+        file_path = os.path.join(self.output_dir, filename)
+        df.to_excel(file_path, index=False, engine="openpyxl")
+        apply_column_formats(file_path, df, date_column="日期", date_value=date_str)
+
+        self.logger.info(
+            f"Excel已保存: {file_path}（已插入日期列+数值转换+单元格格式，{os.path.getsize(file_path)}字节）"
+        )
+        return file_path
+
+    # ---------- 项目 5 阶段 3 子任务 4：主下载方法 ----------
+
+    def download_product_detail(
+        self,
+        date=None,
+        start_date=None,
+        end_date=None,
+        second=None,
+        third=None,
+        channel=None,
+        is_monitored=None,
+    ):
+        """下载商品明细流量报表（GET 请求，与项目 4 POST 不同）。
+
+        参数:
+            date           - 查询日期 YYYY-MM-DD（入参优先，其次 config）
+            start_date     - 开始日期（默认=date）
+            end_date       - 结束日期（默认=date）
+            second         - 二级类目（默认 "999999"=全类目，CLI 可覆盖）
+            third          - 三级类目（默认 ""=不限）
+            channel        - 渠道（默认 "99"=全部渠道）
+            is_monitored   - 是否监控商品（默认 "undefined"=不限）
+
+        返回:
+            str - 保存的 Excel 文件绝对路径（业务子目录格式）
+        """
+        # 1. 解析日期（入参 > config；与项目 4 同样的三值一致规则）
+        date, start_date, end_date = self._get_date_params(date, start_date, end_date)
+
+        # 2. 读取可变业务参数（CLI 覆盖 → 代码常量兜底）
+        second = second if second is not None else self.VARIABLE_BIZ_PARAMS["second"]
+        third = third if third is not None else self.VARIABLE_BIZ_PARAMS["third"]
+        channel = channel if channel is not None else self.VARIABLE_BIZ_PARAMS["channel"]
+        is_monitored = is_monitored if is_monitored is not None else self.VARIABLE_BIZ_PARAMS["isMonitored"]
+
+        # 3. 组装 URL query 参数
+        query_params = {
+            "date": date,
+            "startDate": start_date,
+            "endDate": end_date,
+            "second": second,
+            "third": third,
+            "channel": channel,
+            "isMonitored": is_monitored,
+            **self.FIXED_BIZ_PARAMS,
+        }
+
+        # 4. 必带请求头（业务约束：Referer 缺失被平台拦截）
+        # 注意：Sec-Fetch-Site 与项目 4 不同（项目 4 是 same-site，本项目是 same-origin）
+        # 基类 _build_default_headers 已设置 same-site，需用 extra_headers 覆盖
+        extra_headers = {
+            "Referer": self.REFERER,
+            "Sec-Fetch-Site": "same-origin",  # 覆盖基类默认 same-site
+        }
+
+        # 5. 发送请求（重试循环 + UA 切换 + 风控识别 + 响应校验）
+        # 与项目 4 模式一致：手写签名后注入（因基类 request() 用 UUID_PREFIX，本业务需完全随机）
+        response = None
+        last_exception = None
+        # 阶段4新增：成功标记。只有 break 跳出循环才算成功，
+        # 防止"最后一次失败但响应有内容(如HTML错误页)"被误判为成功继续保存
+        success = False
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                # 5.1 严格间隔控制（与基类一致）
+                self._wait_interval()
+
+                # 5.2 重新生成风控参数（每次新 UUID + 新时间戳 + 新签名）
+                risk_params = self._gen_risk_params_random(self.API_URL)
+                full_params = {**query_params, **risk_params}
+
+                ua_name = "Edge" if self._current_ua_index == 0 else "Chrome"
+                self.logger.info(
+                    f"[第{attempt}/{self.MAX_RETRIES}次] 下载商品明细报表: "
+                    f"日期={date}, 类目=second={second}/third={third}, "
+                    f"渠道={channel}, UA={ua_name}, uuid={risk_params['uuid'][:8]}..."
+                )
+                self.logger.debug(f"请求参数: {json.dumps(full_params, ensure_ascii=False)[:500]}")
+
+                # 记录请求时间（类属性：所有实例共享）
+                JDBaseRequest._last_request_time = time.time()
+
+                # 5.3 发送 GET 请求（注意：GET 不用 POST，参数拼 URL）
+                response = self.session.get(
+                    self.API_URL,
+                    params=full_params,  # GET 专用：拼 URL query string
+                    headers=extra_headers,
+                    timeout=self.REQUEST_TIMEOUT,
+                )
+
+                # 5.4 HTTP 状态码基础检查
+                if response.status_code == 401:
+                    self.logger.error("HTTP 401 未授权 - Cookie 可能已过期或被禁用")
+                    raise CookieExpiredError("Cookie已过期或无效，请更新 config/cookie.txt")
+                if response.status_code == 403:
+                    self.logger.error("HTTP 403 禁止访问 - Cookie/签名/Referer 校验失败")
+                    # 不抛 CookieExpired，让重试机制 + UA 切换兜底
+
+                # 5.5 风控业务码识别（json 响应里的 status / message）
+                self._check_business_code(response)
+
+                # 5.6 空响应拦截：Excel magic 字节 + Content-Disposition 校验
+                self._validate_excel_response(response, attempt)
+
+                # 5.7 走到这里 = 成功，跳出重试循环
+                self.logger.info(
+                    f"请求成功: HTTP {response.status_code}, "
+                    f"{len(response.content)}字节, "
+                    f"Content-Disposition={response.headers.get('Content-Disposition', '')[:80]}"
+                )
+                success = True  # 阶段4新增：只有走到这里才算成功
+                break
+
+            except CookieExpiredError:
+                # Cookie 过期是硬错误，不能靠重试解决，直接抛出
+                raise
+            except RiskControlError:
+                # 阶段4新增：601 限流等风控硬错误，不重试，直接抛出
+                raise
+            except requests.exceptions.Timeout as e:
+                last_exception = e
+                self.logger.warning(f"第{attempt}次请求超时（{self.REQUEST_TIMEOUT}秒）")
+            except Exception as e:
+                last_exception = e
+                self.logger.warning(f"第{attempt}次请求失败: {e}")
+
+            # 5.8 重试间隔：UA 切换 + 递增等待
+            if attempt < self.MAX_RETRIES:
+                self._switch_ua()
+                wait_seconds = self.REQUEST_INTERVAL * attempt
+                self.logger.info(
+                    f"等待 {wait_seconds}秒 后重试（已切换UA，当前: "
+                    f"{'Edge' if self._current_ua_index == 0 else 'Chrome'}）..."
+                )
+                time.sleep(wait_seconds)
+
+        # 5.9 重试全部失败：上报
+        # 阶段4修复：原条件"response有内容就继续"存在漏洞——
+        #   最后一次失败时若响应体恰有内容(如HTML错误页/风控页)，
+        #   会误判为成功继续保存错误内容。改为 success 标记判断，
+        #   只要没走到 break（success=False）一律抛错。
+        if not success:
+            self.logger.error(f"所有 {self.MAX_RETRIES} 次重试均失败")
+            raise RuntimeError(
+                f"商品明细报表下载失败：{last_exception}（请检查Cookie/网络/风控）"
+            ) from last_exception
+
+        # 6. 解析 Content-Disposition 获取原始文件名（含中文 URL 解码）
+        content_disp = response.headers.get("Content-Disposition", "")
+        original_filename = self._parse_content_disposition_filename(content_disp)
+
+        if not original_filename:
+            # 兜底：用 CLI 传入的 filename 格式（业务子目录 + date）
+            self.logger.warning(
+                f"无法从 Content-Disposition 解析文件名（头={content_disp[:80]!r}），"
+                f"使用兜底命名"
+            )
+            original_filename = f"{second or '全类目'}_{date}_商品明细.xlsx"
+
+        # 7. 构造业务子目录路径：output/商品明细/{date}/{filename}
+        # 注意：业务子目录确保不与其他业务混淆
+        date_subdir = os.path.join(self.OUTPUT_SUBDIR, date)
+        business_output_dir = os.path.join(self.output_dir, date_subdir)
+        os.makedirs(business_output_dir, exist_ok=True)
+
+        # 8. Excel 后置处理（业务子目录 + 解析 Content-Disposition 文件名）
+        # 与项目 4 _save_flow_excel 区别：传入 output_dir 的子目录版本
+        target_path = os.path.join(business_output_dir, original_filename)
+
+        # 复用 _save_detail_excel 但指定具体路径
+        return self._save_detail_excel_to_path(response, target_path, date)
+
+
+    def _save_detail_excel_to_path(self, response, target_path, date):
+        """商品明细 Excel 后置处理（指定具体路径版本）。
+
+        业务定位：与 _save_detail_excel 类似，但允许调用方指定完整路径（不限制在 output_dir）
+
+        流程：
+            ① 读 Excel 二进制流 → DataFrame
+            ② 通用日期转换 → 插入首列【日期】
+            ③ safe_convert_numeric 全表数值安全转换
+            ④ 写入 Excel（指定路径）+ apply_column_formats
+        """
+        import io
+        import warnings
+        import pandas as pd
+
+        # 抑制openpyxl读取原始xlsx时的无害警告
+        warnings.filterwarnings("ignore", message="Workbook contains no default style")
+
+        # ① 读取二进制流 → DataFrame
+        df = pd.read_excel(io.BytesIO(response.content), dtype=str, na_filter=False)
+
+        # ② 通用日期转换：2026-08-06 → 2026/8/6
+        date_str = convert_date_format(date)
+
+        # ③ 首列A位置插入【日期】列
+        df.insert(0, "日期", date_str)
+
+        # ④ 全表数值安全转换
+        df = safe_convert_numeric(df)
+
+        # ⑤ 写入Excel（指定完整路径，含业务子目录）
+        df.to_excel(target_path, index=False, engine="openpyxl")
+        apply_column_formats(target_path, df, date_column="日期", date_value=date_str)
+
+        self.logger.info(
+            f"Excel已保存: {target_path}（已插入日期列+数值转换+单元格格式，{os.path.getsize(target_path)}字节）"
+        )
+        return target_path
 
 
 # ============================================================
@@ -1280,6 +1917,18 @@ BUSINESS_REGISTRY = {
             "startDate": "开始日期（默认=date）",
             "endDate": "结束日期（默认=date）",
             "platformCate1": "平台品类1（默认空=全品类）",
+        },
+    },
+    # 业务：商品明细导出（2026-08-07 上线，GET 请求）
+    "商品明细导出": {
+        "api_class": ProductDetailAPI,
+        "method": "download_product_detail",
+        "desc": "商品明细导出（按二级/三级类目，GET导出，保存至 output/商品明细/{date}/）",
+        "params": {
+            "date": "查询日期YYYY-MM-DD（入参或config）",
+            "second": "二级类目ID（默认999999=全类目）",
+            "third": "三级类目ID（默认空=不限）",
+            "channel": "渠道ID（默认99=全部渠道）",
         },
     },
 }

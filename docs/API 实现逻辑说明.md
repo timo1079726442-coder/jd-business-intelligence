@@ -357,3 +357,120 @@ done
 - 业务沉淀：`.trae/skills/jd-api-analyze/SKILL.md` 项目4
 - 踩坑记录：`全局复利的踩坑日志.md` 坑6（UUID 策略差异）
 - 文档索引：自动入库到 `docs/项目文档索引.xlsx`
+
+---
+
+## 项目 5：商品明细导出（ProductDetailAPI）｜2026-08-07 上线
+
+### 业务定位
+在「商品分析-商品明细」页面按**二级/三级类目 + 渠道**维度导出商品明细流量报表。与项目1-3（SKU维度）、项目4（三级渠道维度）不同——本项目按**商品维度**导出明细，且为**GET 请求**（参数全拼 URL）。
+
+### 接口
+| 字段 | 内容 |
+|------|------|
+| **URL** | `https://sz.jd.com/sz/api/productDetail/exportProList.ajax` |
+| **方法** | **GET**（参数全拼 URL query string，与项目1-4 的 POST 完全不同）|
+| **域名** | `sz.jd.com`（项目1-4 是 `szgateway.jd.com`）|
+| **页面入口** | `https://sz.jd.com/szweb/sz/view/productAnalysis/productDetail.html` |
+| **Sec-Fetch-Site** | `same-origin`（项目4 是 `same-site`，必须显式覆盖基类默认值）|
+| **成功响应** | HTTP 200 + `Content-Disposition: attachment` + body 前 4 字节 `PK\x03\x04` |
+
+### 必带 Header
+```python
+REFERER = "https://sz.jd.com/szweb/sz/view/productAnalysis/productDetail.html"
+extra_headers = {"Referer": REFERER, "Sec-Fetch-Site": "same-origin"}
+```
+
+### 业务参数（GET query，7 项 = 3 固定 + 3 可变 + 日期 3 值）
+| 参数 | 值 | 类型 | 说明 |
+|------|-----|------|------|
+| `type` | `0` | ❌ 固定 | FIXED_BIZ_PARAMS |
+| `categoryType` | `0` | ❌ 固定 | FIXED_BIZ_PARAMS |
+| `downloadType` | `dayList` | ❌ 固定 | 下载类型（日列表）|
+| `second` | `999999` | ✅ 可变 | 二级类目，默认全类目，CLI `--second` 可覆盖 |
+| `third` | `""` | ✅ 可变 | 三级类目，默认空不限 |
+| `channel` | `99` | ✅ 可变 | 渠道，默认全部 |
+| `isMonitored` | `undefined` | ✅ 可变 | 是否监控商品 |
+| `date` / `startDate` / `endDate` | `2026-08-07` | ✅ 可变 | 三值必须一致（复用踩坑经验）|
+| `User-mup` | 毫秒时间戳 | ⚠️ 风控 | 每次调用 `int(time.time()*1000)` |
+| `User-mnp` | MD5 签名 | ⚠️ 风控 | 算法与项目1-4 相同 |
+| `uuid` | 完全随机 | ⚠️ 风控 | 16hex-10hex，与项目4 相同 |
+
+> 注意：`isMonitored=undefined` 是**字符串**，拼 URL 时 requests 会原样编码为 `undefined`（真实抓包如此）。
+
+### 风控签名算法（复用全局盐值）
+```
+User-mnp = MD5(URL路径 + uuid + 时间戳 + "372ad2c2b6")
+```
+- 盐值从 config.xlsx【全局配置】读取，与项目1-4 共用
+- uuid 完全随机：`secrets.token_hex(8) + "-" + secrets.token_hex(5)`（与项目4 相同，抓包证实前缀每次不同）
+
+### 目录规则（本项目独有，业务子目录）
+```
+output/商品明细/{date}/{原始文件名}
+例：output/商品明细/2026-08-07/商品明细导出_2026-08-07.xlsx
+```
+- 原始文件名从响应头 `Content-Disposition` 解析（`filename*=UTF-8''...` 需 URL 解码；`filename="..."` 直接提取）
+- 解析失败时兜底命名：`{second or '全类目'}_{date}_商品明细.xlsx`
+- Excel 后置处理：日期列插入 + 数值安全转换 + 单元格格式（复用公共工具函数）
+
+### 容错与风控适配（阶段 4 修复，3 处核心缺陷）
+| # | 缺陷 | 原行为 | 修复后 |
+|---|------|--------|--------|
+| 1 | **601 限流"不重试"失效** | 601 抛 RuntimeError → 被 `except Exception` 捕获 → **继续重试 3 次**（加重风控）| 601 抛 `RiskControlError` → 循环内 `except RiskControlError: raise` **直接抛出不重试**（单测验证只请求 1 次）|
+| 2 | **最后一次失败误保存错误内容** | 判断"response 有内容 → 继续保存"，若最后一次响应是 HTML 错误页（>1KB）会**误判成功保存错误内容** | 新增 `success` 标记，只有 `break` 才算成功，否则一律抛 RuntimeError |
+| 3 | **文本型 601 无法识别** | 非 json 的 HTML 错误页（含"操作频繁"）只当普通失败重试 3 次 | magic 校验分支检测"操作频繁/频繁"字样 → 抛 `RiskControlError` 停止重试 |
+
+> 修复1 同时**同步应用到项目4**（同属"601不重试"全局风控硬约束，非业务功能改动，与京麦 SKILL 第八节一致）。
+
+### 异常抛出规则（阶段 4 定版）
+| 异常 | 触发场景 | 处理 |
+|------|----------|------|
+| `CookieExpiredError` | HTTP 401；业务码 302/-1；message 含"登录/login" | **立即停止**，提示更新 config/cookie.txt |
+| `RiskControlError` | 业务码 601；文本含"操作频繁/频繁" | **不重试**，直接抛出，提示冷却 30-120 分钟 |
+| `RuntimeError` | 业务码 -407/-402；空响应(<1KB)；非 Excel(magic 不匹配)；缺 attachment | **重试兜底**（UA 切换 + 递增等待）|
+| `requests.exceptions.Timeout` | 请求超时（30 秒）| 重试 |
+
+### 测试结论（阶段 4，mock 网络单测 24/24 通过，临时脚本已删）
+| 类别 | 覆盖点 | 结果 |
+|------|--------|------|
+| 风控码识别 | 601→RiskControlError / 302·登录→CookieExpiredError / -407→RuntimeError / 正常放行 / 非json跳过 | 6/6 ✅ |
+| 双重校验 | 正常通过 / 缺attachment / HTML错误页 / 文本型601 / 空响应 | 5/5 ✅ |
+| 文件名解析 | UTF-8中文解码 / 普通文件名 / 空头兜底 | 3/3 ✅ |
+| 随机参数 | uuid两次不同 / mnp 32位md5 / mup时间戳 / uuid 16hex-10hex格式 | 4/4 ✅ |
+| 全失败兜底 | 抛 RuntimeError 且不误保存 | 2/2 ✅ |
+| 601 不重试 | 抛 RiskControlError 且只请求1次 | 2/2 ✅ |
+| 成功路径 | 路径含 `output/商品明细/{date}/` 子目录 | 2/2 ✅ |
+
+### 入口命令
+```bash
+# 列出业务
+python main.py --list
+
+# 单日全类目导出
+python main.py --biz_key "商品明细导出" --date "2026-08-07"
+
+# 指定二级类目
+python main.py --biz_key "商品明细导出" --date "2026-08-07" --second "12345"
+```
+
+### 与项目4 的核心差异汇总
+| 维度 | 项目4（downTable.ajax）| 项目5（exportProList.ajax）|
+|------|----------------------|--------------------------|
+| 业务类 | OfflineChannelAPI | **ProductDetailAPI** |
+| 请求方式 | POST（表单）| **GET（参数拼 URL）** |
+| 域名 | szgateway.jd.com | **sz.jd.com** |
+| Sec-Fetch-Site | same-site | **same-origin** |
+| 必带 Header | Origin + Referer | **Referer**（同源无需 Origin）|
+| 分组维度 | 三级渠道 | **商品明细（类目）** |
+| 业务参数 | 12 项表单 | **7 项 query**（type/categoryType/downloadType/second/third/channel/isMonitored）|
+| 响应校验 | magic 字节 | **Content-Disposition attachment + magic 字节双重校验** |
+| 文件名 | 代码固定拼接 | **从 Content-Disposition 解析原始名** |
+| 保存目录 | output/ 根目录 | **output/商品明细/{date}/ 子目录** |
+| 601 处理 | 阶段4 同步修复为不重试 | **不重试（RiskControlError）** |
+
+### 变更记录
+| 日期 | 改动 |
+|------|------|
+| 2026-08-07 | 阶段3：ProductDetailAPI 完整实现 + BUSINESS_REGISTRY 注册（第6业务）+ 修复 `_save_flow_excel` 误插类 Bug |
+| 2026-08-07 | 阶段4：601 改抛 RiskControlError 不重试（含项目4 同步）；success 标记防误保存；文本型 601 识别；单测 24/24 通过 |
