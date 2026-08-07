@@ -796,3 +796,96 @@ if __name__ == "__main__":
 #   - 敏感参数（IMAP 授权码、邮箱账号）从配置文件读取，不硬编码
 # ============================================================
 
+
+# ============================================================
+# 【业务上下文备份 2026-08-07】店铺来源-三级渠道（离线流量报表）
+# ------------------------------------------------------------
+# 本区块为「项目 4：店铺来源-三级渠道」完整业务上下文存档，
+# 不影响主程序运行；仅用于人工查阅 / 项目回溯 / 阶段性对比。
+#
+# 上线时间：2026-08-07
+# 状态：✅ 已上线（业务类实现 + 容错 + 文档归档完成）
+# 项目目标：按三级流量渠道分组，导出店铺来源离线日度流量报表
+# ============================================================
+
+# 1. 真实业务信息（来自用户 2026-08-06/07 抓包）
+# ------------------------------------------------------------
+# - 接口地址：https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downTable.ajax
+# - 请求方法：POST application/x-www-form-urlencoded
+# - 返回内容：Excel 二进制（magic bytes: PK\x03\x04）
+# - 真实入口页面：https://sz.jd.com/szweb/sz/view/viewflow/viewSourcesVNew.html
+# - 必带 Header（缺失即拦截）：
+#       Origin: https://sz.jd.com
+#       Referer: https://sz.jd.com/szweb/sz/view/viewflow/viewSourcesVNew.html
+
+# 2. 业务表单参数（13 项 = 9 固定 + 1 可变 + 3 风控动态）
+# ------------------------------------------------------------
+# 固定常量（用户确认固化为代码常量，不读 config）：
+#   compareType=hb / interval=DAY / dateType=day / downType=day
+#   groupType=lastSrcChannelId3 / attributes=lastSrcChannelId3
+#   sortField=jdr_sch_traffic_enter_shop__visitor_cnt_shop_last_src
+#   sortType=desc / lastSrcChannelId1=2
+# 可变参数（从 config 读取）：
+#   platformCate1=""（空=全品类）/ date / startDate / endDate
+# 风控动态（运行时生成，不入代码）：
+#   User-mup / User-mnp / uuid
+
+# 3. 风控签名（与项目 1-3 复用 MD5 公式，盐值 372ad2c2b6 共用）
+# ------------------------------------------------------------
+# User-mnp = MD5(URL路径 + uuid + 时间戳 + 盐值)
+# 算法来源：commons-a5562705.js 逆向（与项目1-3 同源）
+
+# 4. UUID 完全随机（与项目1-3 关键差异）
+# ------------------------------------------------------------
+# 项目1-3：固定 prefix（如 ca412182e5668a106054）+ 随机后缀
+# 项目 4：完全随机（prefix 也随机）
+#
+# 用户两次抓包（间隔 13 秒）：
+#   抓包 1：uuid=f1d5ae161b41f4153fc0-19fd685e6a1
+#   抓包 2：uuid=a31e066d8e94f4f39a3a-19fda02c2d4
+# 前缀完全不同 → 必须完全随机化
+#
+# Python 实现：secrets.token_hex(8) + secrets.token_hex(5)
+# 优势：加密随机 + 不依赖基类 UUID_PREFIX + 符合"禁止硬编码 uuid"
+
+# 5. 容错与风控适配（阶段 4 新增）
+# ------------------------------------------------------------
+# - 重试循环：3 次递增等待 30/60/90 秒
+# - UA 切换：每次重试前 Edge↔Chrome
+# - 601 限流：不重试（避免加重风控，让用户决定）
+# - Cookie 过期：抛 CookieExpiredError 立即停
+# - 空响应拦截：HTTP 200 + <1KB → 视为失败
+# - Excel 字节校验：magic bytes 不等于 PK\x03\x04 → 视为失败
+
+# 6. 集成方式
+# ------------------------------------------------------------
+# - 新业务类：OfflineChannelAPI（继承 JDBaseRequest）
+# - 注册入口：BUSINESS_REGISTRY["店铺来源_三级渠道"]
+# - 调用命令：python main.py --biz_key "店铺来源_三级渠道" --date "2026-08-04"
+# - 输出文件：output/店铺来源_三级渠道_YYYY-MM-DD.xlsx
+
+# 7. 阶段交付节奏（5 阶段，每阶段输出总结等你确认）
+# ------------------------------------------------------------
+# 阶段 1：需求拆解 + 方案选型 + 风险梳理（基于用户 2 次抓包）
+# 阶段 2：项目骨架搭建（评估 config/基类/JDBaseRequest 能力，零改动验证）
+# 阶段 3：核心接口逻辑实现（OfflineChannelAPI 类 + UUID 完全随机 + 业务方法）
+# 阶段 4：容错与风控适配（重试循环 + UA 切换 + 空响应拦截 + 风控业务码识别）
+# 阶段 5：测试 + 文档归档（状态校验 + SKILL.md 沉淀 + 踩坑日志 + API 说明文档）
+
+# 8. 踩坑要点（与 SKILL.md / 踩坑日志同步）
+# ------------------------------------------------------------
+# 1. UUID 策略分业务：项目1-3 固定 prefix，本项目完全随机
+# 2. 必带 Header 缺失被拦截（Origin/Referer 必须传）
+# 3. sortField 字段名按业务调整（浏览量 → 访客数）
+# 4. 601 限流不重试（与京麦项目 SKILL 第八节一致）
+# 5. 业务表单参数新增 downType / platformCate1（项目1-3 没有）
+
+# 9. 关联文档
+# ------------------------------------------------------------
+# - 业务类实现：main.py（搜索 class OfflineChannelAPI）
+# - 业务沉淀：.trae/skills/jd-api-analyze/SKILL.md 项目4
+# - 踩坑记录：全局复利的踩坑日志.md 坑6（UUID 完全随机 vs 固定 prefix）
+# - 接口说明：docs/API 实现逻辑说明.md 项目 4
+# - 文档索引：docs/项目文档索引.xlsx（自动入库）
+# ============================================================
+

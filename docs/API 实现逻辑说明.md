@@ -230,3 +230,130 @@ run_business(["商品流量来源_搜索", "商品流量来源_推荐"], date="2
 | 2026-08-05 | Excel后置处理：日期列插入/数值安全转换/单元格格式 + 公共工具函数封装 |
 | 2026-08-05 | 对齐京东订单导出风险：订单编号强制文本黑名单 + SKU/SPU数值0位小数 |
 | 2026-08-05 | ⚠️ 修复日期参数同步Bug：--date 时 start/end 默认=date，数据与网页核对完全一致 |
+
+---
+
+## 项目 4：店铺来源-三级渠道（离线流量报表）｜2026-08-07 上线
+
+### 业务定位
+按三级流量渠道（`lastSrcChannelId3`）分组，导出店铺来源离线日度流量报表。**与项目 1-3 的"商品流量来源（SKU 维度）"完全不同**——本项目是"渠道流量来源"维度。
+
+### 接口
+| 字段 | 内容 |
+|------|------|
+| **URL** | `https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downTable.ajax` |
+| **方法** | POST |
+| **Content-Type** | `application/x-www-form-urlencoded` |
+| **页面入口** | `https://sz.jd.com/szweb/sz/view/viewflow/viewSourcesVNew.html` |
+
+### 必带 Header（用户 2026-08-06 强调，缺失即拦截）
+```python
+ORIGIN = "https://sz.jd.com"
+REFERER = "https://sz.jd.com/szweb/sz/view/viewflow/viewSourcesVNew.html"
+```
+
+### 业务表单参数（13 项 = 9 固定 + 1 可变 + 3 风控动态）
+
+| 参数 | 值 | 类型 | 说明 |
+|------|-----|------|------|
+| `compareType` | `hb` | ❌ 固定 | 对比方式：环比 |
+| `interval` | `DAY` | ❌ 固定 | 聚合粒度 |
+| `dateType` | `day` | ❌ 固定 | 日期类型 |
+| `downType` | `day` | ❌ 固定 | 下载类型（本项目独有）|
+| `groupType` | `lastSrcChannelId3` | ❌ 固定 | 分组维度 |
+| `attributes` | `lastSrcChannelId3` | ❌ 固定 | 返回字段 |
+| `sortField` | `jdr_sch_traffic_enter_shop__visitor_cnt_shop_last_src` | ❌ 固定 | 排序字段（候选 A，进店访客数降序）|
+| `sortType` | `desc` | ❌ 固定 | 排序方式 |
+| `lastSrcChannelId1` | `2` | ❌ 固定 | 一级渠道 |
+| `platformCate1` | `""`（默认空）| ✅ 可变 | 平台品类 1（本项目独有），空=全品类 |
+| `date` / `startDate` / `endDate` | `2026-08-04` | ✅ 可变 | 三值必须一致 |
+| `User-mup` | 毫秒时间戳 | ⚠️ 风控 | 每次调用 `int(time.time()*1000)` |
+| `User-mnp` | MD5 签名 | ⚠️ 风控 | 算法见下 |
+| `uuid` | 完全随机 | ⚠️ 风控 | **与项目1-3不同，必须完全随机化** |
+
+### 风控签名算法（与项目1-3 复用）
+```
+User-mnp = MD5(URL路径 + uuid + 时间戳 + "372ad2c2b6")
+```
+- 盐值 `372ad2c2b6` 从 config.xlsx【全局配置】读取（与项目1-3 共用）
+- 失败排查：参考 SKILL.md 第三节"签名验证失败排查指南"
+
+### UUID 完全随机生成（与项目1-3 关键差异）
+```python
+def _gen_uuid_random(self):
+    import secrets
+    prefix = secrets.token_hex(8)        # 8字节 = 16hex
+    suffix = secrets.token_hex(5)        # 5字节 = 10hex
+    return f"{prefix}-{suffix}"
+```
+- 用户抓包两次（间隔 13 秒）：`f1d5ae161b41f4153fc0` → `a31e066d8e94f4f39a3a`，**前缀完全不同**
+- 与项目1-3（prefix 固定 `ca412182e5668a106054`）模式不同
+- **不依赖基类 UUID_PREFIX**（符合用户 2026-08-06 "禁止硬编码 uuid" 约束）
+
+### 入口命令
+```bash
+# 列出所有业务（含本项目）
+python main.py --list
+
+# 跑本项目（指定日期）
+python main.py --biz_key "店铺来源_三级渠道" --date "2026-08-04"
+
+# 批量跑（按日期分多次跑）
+for d in 2026-08-04 2026-08-05 2026-08-06; do
+    python main.py --biz_key "店铺来源_三级渠道" --date "$d"
+    sleep 30  # 严格30秒间隔，防止风控
+done
+```
+
+### 容错与风控适配（阶段 4 新增）
+| 场景 | 行为 |
+|------|------|
+| HTTP 200 + < 1KB | 视为空响应，抛 RuntimeError，重试 |
+| HTTP 200 + magic bytes ≠ `PK\x03\x04` | 视为非 Excel，记录前 200 字节，重试 |
+| HTTP 401 | 抛 CookieExpiredError，停止重试 |
+| HTTP 403 | 警告 + 重试（UA 切换兜底） |
+| 业务码 601（操作频繁） | **不重试**（避免加重风控，让用户决定）|
+| 业务码 302/-1（含"登录"） | 抛 CookieExpiredError，停止重试 |
+| 业务码 -407/-402（签名错误）| 重试兜底（UA 切换）|
+| 超时（30 秒）| 重试 |
+| 其他网络异常 | 重试（UA 切换）|
+
+### 重试机制（与基类 request() 对齐）
+- 最多 3 次（`MAX_RETRIES`，从 config 读取）
+- 递增等待：`30 / 60 / 90 秒`（`REQUEST_INTERVAL * attempt`）
+- 每次重试前切换 UA（Edge ↔ Chrome）
+
+### 输出
+- 文件名：`店铺来源_三级渠道_YYYY-MM-DD.xlsx`（保存到 `output/`）
+- Excel 后置处理：复用基类 `_save_flow_excel`（日期列插入 / 数值安全转换 / 单元格格式）
+
+### 与项目1-3 的核心差异汇总
+| 维度 | 项目1-3（downSkuTable.ajax）| 项目4（downTable.ajax）|
+|------|--------------------------|----------------------|
+| 业务类 | ProductFlowAPI | **OfflineChannelAPI** |
+| 分组维度 | SKU（id2=2008/2009/3001）| **三级渠道**（id3）|
+| 业务目的 | 商品效果分析 | 渠道投产分析 |
+| Referer | flowPathDetailsNew.html | **viewSourcesVNew.html** |
+| 业务参数 | 9 项 | **12 项**（+downType / +platformCate1）|
+| 排序字段 | 进店浏览量 | **进店访客数** |
+| UUID 策略 | 固定 prefix + 随机后缀 | **完全随机** |
+| 鉴权签名 | UUID_PREFIX（基类常量）| **业务内完全随机** |
+
+### 入口检查清单（写代码前确认）
+- [x] 业务类继承 JDBaseRequest
+- [x] API_URL / ORIGIN / REFERER 类常量固定
+- [x] FIXED_BIZ_PARAMS 9 项（含 lastSrcChannelId1 / groupType / attributes / sortField / sortType / compareType / interval / dateType / downType）
+- [x] VARIABLE_BIZ_PARAMS 1 项（platformCate1，默认空）
+- [x] _gen_uuid_random() 完全随机（不依赖 UUID_PREFIX）
+- [x] _gen_risk_params_random() 复用 MD5 算法 + 全局 SIGN_SALT
+- [x] download_offline_channel() 主方法：日期解析 + 参数组装 + 必带 header + 重试循环 + 风控识别 + Excel 校验 + 后置保存
+- [x] _check_business_code() 风控业务码识别
+- [x] _validate_excel_response() 空响应 + magic bytes 校验
+- [x] BUSINESS_REGISTRY 注册 `"店铺来源_三级渠道"`
+- [x] config_consistency_check() 报告新增 3.4 节
+
+### 关联文件
+- 业务类：`main.py`（搜索 `class OfflineChannelAPI`）
+- 业务沉淀：`.trae/skills/jd-api-analyze/SKILL.md` 项目4
+- 踩坑记录：`全局复利的踩坑日志.md` 坑6（UUID 策略差异）
+- 文档索引：自动入库到 `docs/项目文档索引.xlsx`

@@ -362,6 +362,84 @@ main.py
 
 ---
 
+## 项目4：店铺来源-三级渠道（离线流量报表，2026-08-06 上线）
+
+### 项目业务说明
+- **业务名**：`店铺来源_三级渠道`
+- **接口**：`https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downTable.ajax`
+- **功能**：按三级流量渠道（lastSrcChannelId3）分组，导出店铺来源离线日度流量报表
+- **输出**：Excel 文件（按进店访客数降序）
+
+### 与已完成项目的关键差异
+| 维度 | 项目1-3 downSkuTable.ajax | 本项目 downTable.ajax |
+|------|--------------------------|----------------------|
+| 分组维度 | SKU（lastSrcChannelId2）| **三级渠道**（lastSrcChannelId3）|
+| 业务目的 | 商品效果分析 | 渠道投产分析 |
+| 接口域名 | szgateway.jd.com | **同** szgateway.jd.com |
+| 必带 Header | Referer=flowPathDetailsNew | **Referer=viewSourcesVNew.html** |
+| 业务表单参数 | 9 项 | **12 项**（新增 downType / platformCate1）|
+| 排序字段 | 进店浏览量（_browse_page_cnt_）| **进店访客数**（_visitor_cnt_，候选A兜底）|
+| 业务类名 | ProductFlowAPI | **OfflineChannelAPI**（继承 JDBaseRequest）|
+| UUID 生成 | 按渠道传 prefix | **完全随机 16hex + 10hex**（不依赖基类 UUID_PREFIX）|
+
+### 关键发现（UUID 完全随机）
+| 抓包时间 | UUID 前缀（16位）| 后缀格式 |
+|----------|----------------|----------|
+| 2026-08-07 11:42（旧抓包）| `f1d5ae161b41f4153fc0` | `-` + 10位hex |
+| 2026-08-07 11:53（新抓包）| `a31e066d8e94f4f39a3a` | `-` + 10位hex |
+| **Python 实际生成**（本项目）| `secrets.token_hex(8)` | `-` + `secrets.token_hex(5)` |
+
+**结论**：与项目1-3的"固定 prefix + 随机数"不同，本项目要求 UUID **完全随机**（前缀也随机），符合用户 2026-08-06 强调的"禁止硬编码 uuid"约束。
+
+### 必带 Header（用户 2026-08-06 强调）
+- `Origin: https://sz.jd.com`
+- `Referer: https://sz.jd.com/szweb/sz/view/viewflow/viewSourcesVNew.html`
+- 缺失任一 → **平台直接拦截**
+
+### 业务表单参数（13 项）
+| 参数 | 示例 | 类型 |
+|------|------|------|
+| `compareType` | hb | ❌ 固定 |
+| `interval` | DAY | ❌ 固定 |
+| `dateType` | day | ❌ 固定 |
+| `downType` | day | ❌ 固定 |
+| `groupType` | lastSrcChannelId3 | ❌ 固定 |
+| `attributes` | lastSrcChannelId3 | ❌ 固定 |
+| `sortField` | `...visitor_cnt_shop_last_src` | ❌ 固定（候选A）|
+| `sortType` | desc | ❌ 固定 |
+| `lastSrcChannelId1` | 2 | ❌ 固定 |
+| `platformCate1` | ""（空=全品类）| ✅ 可变 |
+| `date` / `startDate` / `endDate` | 2026-08-04 | ✅ 可变 |
+| `User-mup` | 毫秒时间戳 | ⚠️ 风控（动态生成）|
+| `User-mnp` | MD5 签名 | ⚠️ 风控（动态生成）|
+| `uuid` | 完全随机 | ⚠️ 风控（动态生成）|
+
+### 重试与风控适配（阶段 4 新增）
+- **重试循环**：最多 3 次，递增等待 30/60/90 秒
+- **UA 切换**：每次重试前切换 Edge↔Chrome（兜底）
+- **601 限流**：不重试（与京麦项目 SKILL 第八节一致，避免加重风控）
+- **Cookie 过期**：抛 CookieExpiredError，立即停止
+- **空响应拦截**：HTTP 200 但 <1KB → 视为失败
+- **Excel magic 字节校验**：`PK\x03\x04` 字节头校验
+
+### 改动重点（2026-08-06）
+1. **新增业务类** `OfflineChannelAPI`（继承 JDBaseRequest），~190 行含完整中文注释
+2. **UUID 完全随机**：业务内自实现 `_gen_uuid_random()` + `_gen_risk_params_random()`，**不依赖基类 UUID_PREFIX**
+3. **必带 Header**：类常量 `ORIGIN` / `REFERER`，通过 `extra_headers` 传入
+4. **重试循环 + 风控识别**：业务内手写（基类 `request()` 不支持 UUID 完全随机场景）
+5. **config_consistency_check 报告**：新增 3.4 节展示新业务配置
+6. **BUSINESS_REGISTRY**：注册 `"店铺来源_三级渠道"` 业务 key
+
+### 踩坑要点
+1. **UUID 完全是随机的**：与项目1-3不同，prefix 也随机，不能传固定 prefix
+2. **业务表单参数新增 downType / platformCate1**：项目1-3没有
+3. **sortField 字段名按业务调整**：从浏览量改访客数（候选 A：`...visitor_cnt_shop_last_src`）
+4. **必带 Header 缺失被拦截**：必须显式传 Origin/Referer
+5. **601 不重试**：与 SKILL 第八节"风控硬性约束"一致
+6. **测试方式**：阶段 5 不跑真实下载（Cookie 真实有效性需用户浏览器复测）
+
+---
+
 ### 新增业务接入规范（v2.0 业务注册中心，2026-08-05）
 
 后续新增业务（店铺来源报表/订单明细/售后订单/京准通广告报表）统一按以下步骤接入，**禁止大改调度核心**：
@@ -528,6 +606,7 @@ export.action GET 下载 {taskId}.zip
 | 2026-08-05 | **踩坑：pandas读取长数字精度丢失**：`pd.read_excel()` 默认会把"数字样式"列（如纯数字SKU）自动推断为int64，导致 `safe_convert_numeric()` 的">15位保留文本"保护失效；修复为 `read_excel(..., dtype=str, na_filter=False)` 先全部按文本读入再统一转换。**Mock验证**：临时脚本替换 `JDBaseRequest.request` 返回含渠道ID(2008/2009/3001)的模拟xlsx、跳过30秒间隔、输出隔离到output_mock，走真实 `run_business()` 批量调度，验证3渠道导出+日期列+16位SKU保留文本全部通过（验证完清理） |
 | 2026-08-05 | **对齐京东官方订单导出风险提示（列名黑/白名单规则）**：① `safe_convert_numeric` 新增强制文本黑名单 `TEXT_FORCE_COLUMNS={订单编号}`（命中列整列跳过数值转换保留文本，不依赖长度判断）和整数0位小数白名单 `INTEGER_ZERO_DECIMAL_COLUMNS={SKU,SPU}`；② 新增通用 `apply_column_formats()` 按列名批量设置单元格格式（订单编号=@文本，SKU/SPU=数值0无千分位，日期列沿用 yyyy/m/d，且SKU/SPU仅对数字单元格套用0格式）；③ 匹配用 `_col_matches()` 结尾匹配（"商品SKU"命中"SKU"，但"成交金额（SPU）"不命中，避免误伤（SPU）后缀指标列）；④ >15位兜底防护全局保留；⑤ Mock回归：订单编号长短全文本+@格式、SKU/SPU数字+格式0、普通字段/兜底不受影响，3渠道全部通过 |
 | 2026-08-05 | **踩坑：`--date` 指定新日期但start/end回落config旧值，导致接口按旧区间取数**：`_get_date_params()` 原先 `start_date=config.get("startDate", date)`，当 config 里 startDate/endDate 是旧日期（07-29）而命令行传 `--date 2026-07-30` 时，实际请求为 `date=07-30&startDate=07-29&endDate=07-29`，接口返回 07-29 数据 → 07-29 与 07-30 导出完全相同、与网页对不上。**修复**：start/end 未显式传入时默认=date。**验证**：修复后 3 渠道与网页导出行数/SKU/数值完全一致。另：uuid前缀是前端每次会话动态生成（3001本次抓包为 d6f270911983d45006dd，此前为5f9cc2ca20cad3d11642），与数据无关，无需更新。 |
+| 2026-08-07 | **店铺来源-三级渠道（离线流量报表）项目上线**：① 新增 `OfflineChannelAPI` 类（继承 `JDBaseRequest`，~190 行含完整中文注释）；② 业务流程：5 阶段分阶段交付（阶段1需求拆解+选型、阶段2项目骨架零改动验证、阶段3新业务类实现、阶段4重试循环+UA切换+风控识别+Excel校验、阶段5测试+归档）；③ UUID 完全随机生成（`secrets.token_hex(8) + secrets.token_hex(5)`，**不依赖基类 UUID_PREFIX**，符合用户"禁止硬编码 uuid"约束）；④ 必带 Header `Origin/Referer=viewSourcesVNew.html`（用户2026-08-06 强调缺失被拦截）；⑤ 业务表单参数新增 `downType/day` 和 `platformCate1`（空=全品类），排序字段从浏览量改为访客数（候选 A `...visitor_cnt_shop_last_src`）；⑥ 重试循环：3 次递增等待 30/60/90秒 + UA 切换兜底 + 601 不重试 + Cookie 过期立即停 + 空响应拦截 + Excel magic bytes 校验；⑦ `config_consistency_check()` 报告新增 3.4 节展示新业务配置；⑧ 8/8 单元测试全过（mock 模拟 8 种场景）；⑨ BUSINESS_REGISTRY 注册 `"店铺来源_三级渠道"` 业务 key；⑩ 入口命令：`python main.py --biz_key "店铺来源_三级渠道" --date "2026-08-04"` |
 | 2026-08-06 | **京麦订单明细【加密】导出项目启动（⏸️ 暂停归档）**：① 新建 `jd_cdp_capture.py` 抓包脚本（Playwright + `launch_persistent_context` + CDP 全局监听，全量抓包+exportCenterService 标记，10MB 响应截断，30 分钟监听超时）；② 真实入口页面定位为 `shop.jd.com/jdm/trade/tools/export/ExprotList`（不是 seller-v10.shop.jd.com），真实接口域名 `sff.jd.com`；③ 抓到 appId=`CQLEJWPYPFOVQBC8UFLQ`、5 个目标接口的请求结构（仅 queryExportType 命中），关键鉴权 header `h5st`（前端强签名一次性）、`dsm-eid`、`x-rp-client=h5_2.4.0`、`Anti-Content` 等；④ 多次 Chrome/Edge 抓包均收到 `code=601 "操作频繁，请稍后重试"`；⑤ 判断为**账号/IP 临时限流**（非脚本 BUG），按风控约束主动停止抓包，进入暂停归档；⑥ 完整上下文（5 个接口、headers、固定业务规则、IMAP 方案、边界处理）已备份至 `main_old_backup.py` 第 723 行后追加区块；⑦ 抓包脚本+601 限流样本日志保留，方便恢复项目时直接复用。 |
 
 ### 当前未完成事项（2026-08-05）

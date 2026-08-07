@@ -878,19 +878,332 @@ class ProductFlowAPI(JDBaseRequest):
 # ============================================================
 #  业务接口 2：（占位 - 后续追加）
 # ------------------------------------------------------------
-#  业务名称：TODO 例如"店铺来源报表"
-#  接口地址：TODO 例如 https://szgateway.jd.com/...
-#  参数说明：TODO 列出该接口固定参数 + 可变参数
+#  业务名称：店铺来源_三级渠道（离线流量报表）
+#  接口地址：https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downTable.ajax
+#  业务说明：按三级流量渠道分组，导出店铺来源离线日度流量报表
+#  业务需求（2026-08-06）：
+#      - 对比方式=hb（环比）
+#      - 聚合粒度=DAY（按日）
+#      - 分组维度=lastSrcChannelId3（三级渠道 ID）
+#      - 排序字段=进店访客数降序
+#      - 日期类型=day（离线日度）
+#      - 下载类型=downType=day
+#      - 平台品类=platformCate1（空=全品类）
+#  硬性约束（用户 2026-08-06 确认）：
+#      1. 必带 Origin/Referer（缺失被平台拦截）
+#      2. 业务表单参数固定不变（13 个字段）
+#      3. User-mup / User-mnp / uuid 每次调用动态生成（禁止硬编码）
+#      4. Cookie 从浏览器会话获取（走 config/cookie.txt，禁止入代码）
 # ============================================================
-# class ShopReportAPI(JDBaseRequest):
-#     """店铺来源报表（占位，未实现）"""
-#
-#     API_URL = "TODO 接口URL"
-#
-#     def download(self, date=None, **kwargs):
-#         # TODO: 组装业务参数，复用 JDBaseRequest.request()
-#         # 业务参数必须从config读取，不允许硬编码！
-#         raise NotImplementedError("该接口尚未实现")
+class OfflineChannelAPI(JDBaseRequest):
+    """店铺来源-离线渠道流量报表 API。
+
+    业务定位：
+        商智 szgateway.jd.com 模块下"店铺来源-离线渠道"维度的报表导出。
+        与商品流量来源（downSkuTable.ajax / SKU 维度）不同，本接口按
+        三级流量渠道分组，输出渠道维度的访客/浏览/成交数据。
+
+    父类复用：
+        - 父类 JDBaseRequest 提供：
+            * Cookie 读取（config/cookie.txt）
+            * 风控签名（User-mnp MD5 哈希，盐值复用全局 SIGN_SALT）
+            * 自动 30 秒间隔（_wait_interval）
+            * 自动重试 + UA 切换
+            * 日志、Excel 保存
+
+    自实现部分：
+        - UUID 完全随机生成器（_gen_uuid_random）：不依赖父类 UUID_PREFIX，
+          避免硬编码任何 uuid 前缀（你抓包显示 UUID 完全随机）。
+        - 业务参数分组：groupType/attributes/dimensions/排序 走 FIXED_BIZ_PARAMS，
+          业务专属常量不走 config（沿用现有 3 业务的固化模式）。
+        - Excel 后置处理：复用父类 _save_flow_excel（商品流量来源专用后置）。
+    """
+
+    # 接口 URL（业务约束，固定）
+    # 通俗解释：按三级渠道下载离线流量报表
+    API_URL = "https://szgateway.jd.com/szpaas/szajax/shop/source/offlineFlowSource/downTable.ajax"
+
+    # 必带请求头（业务约束，固定）
+    # 通俗解释：告诉京东"我是从这个页面来的"，缺失会被拦截
+    ORIGIN = "https://sz.jd.com"
+    REFERER = "https://sz.jd.com/szweb/sz/view/viewflow/viewSourcesVNew.html"
+
+    # 固定业务参数（用户确认 2026-08-06 固化，不读 config）
+    # 通俗解释：这些参数永远不变（业务定义），直接写死代码
+    FIXED_BIZ_PARAMS = {
+        "compareType": "hb",          # 对比方式：环比
+        "interval": "DAY",            # 聚合粒度：按日
+        "dateType": "day",            # 日期类型：离线日度
+        "downType": "day",            # 下载类型：按日
+        "groupType": "lastSrcChannelId3",   # 分组维度：三级渠道
+        "attributes": "lastSrcChannelId3",  # 返回字段：三级渠道 ID
+        "sortField": "jdr_sch_traffic_enter_shop__visitor_cnt_shop_last_src",  # 排序字段：进店访客数（候选 A 兜底）
+        "sortType": "desc",           # 排序方式：降序
+        "lastSrcChannelId1": "2",     # 一级渠道：商品流量来源都是 2
+    }
+
+    # 可变业务参数（从 config 读取，缺省用兜底值并打印警告）
+    # 通俗解释：日期可改，其他业务不变
+    VARIABLE_BIZ_PARAMS = {
+        "platformCate1": "",          # 平台品类 1：空字符串=全品类（可命令行覆盖）
+    }
+
+    def _gen_uuid_random(self):
+        """完全随机 UUID 生成器（不依赖任何固定前缀）。
+
+        业务背景：
+            你抓包显示 UUID 前缀两次完全不同（f1d5ae16 / a31e066d），
+            证明前端 SDK 每次会话生成新 UUID。
+            本方法用 Python secrets 生成 16hex + "-" + 10hex，与抓包格式一致。
+
+        返回:
+            str - 形如 "a31e066d8e94f4f39a3a-19fda02c2d4"
+        """
+        import secrets
+        # 16位小写hex + "-" + 10位小写hex，与你抓包格式一致
+        prefix = secrets.token_hex(8)        # 8字节 = 16hex 字符
+        suffix = secrets.token_hex(5)        # 5字节 = 10hex 字符
+        return f"{prefix}-{suffix}"
+
+    def _gen_risk_params_random(self, url):
+        """生成风控参数：User-mup / User-mnp / uuid（uuid 完全随机版）。
+
+        与父类 _gen_risk_params 的差异：
+            父类默认用类常量 UUID_PREFIX（硬编码 ca412182...）
+            本方法用 _gen_uuid_random() 完全随机生成
+
+        算法不变（commons-a5562705.js 逆向）：
+            User-mnp = MD5(URL路径 + uuid + 时间戳 + 盐值)
+
+        参数:
+            url - 接口URL，用于提取URL路径
+        返回:
+            dict - {"User-mup": str, "User-mnp": str, "uuid": str}
+        """
+        timestamp = int(time.time() * 1000)  # 毫秒级时间戳，每次必新
+        uuid_str = self._gen_uuid_random()    # 完全随机，不传任何 prefix
+
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        url_path = parsed.path
+
+        # 盐值复用全局 SIGN_SALT（与现有 3 业务共用，确保 MD5 哈希算法一致）
+        sign_str = f"{url_path}{uuid_str}{timestamp}{self.SIGN_SALT}"
+        user_mnp = hashlib.md5(sign_str.encode("utf-8")).hexdigest()
+
+        return {
+            "User-mup": str(timestamp),
+            "User-mnp": user_mnp,
+            "uuid": uuid_str,
+        }
+
+    def download_offline_channel(self, date=None, start_date=None, end_date=None, platform_cate1=None):
+        """下载店铺来源-三级渠道离线流量报表。
+
+        参数:
+            date           - 查询日期 YYYY-MM-DD（入参优先，其次 config）
+            start_date     - 开始日期（单日查询=date）
+            end_date       - 结束日期（单日查询=date）
+            platform_cate1 - 平台品类 1（默认空=全品类；如传值则下载指定品类报表）
+
+        返回:
+            str - 保存的 Excel 文件绝对路径
+        """
+        # 1. 解析日期（入参 > config；与现有 _get_date_params 同源）
+        date, start_date, end_date = self._get_date_params(date, start_date, end_date)
+
+        # 2. 读取可变业务参数（platformCate1）
+        platform_cate1 = platform_cate1 if platform_cate1 is not None else self.VARIABLE_BIZ_PARAMS["platformCate1"]
+
+        # 3. 组装业务参数（固定常量 + 可变参数）
+        biz_data = {
+            "date": date,
+            "startDate": start_date,
+            "endDate": end_date,
+            "platformCate1": platform_cate1,
+            **self.FIXED_BIZ_PARAMS,
+        }
+
+        # 4. 必带请求头（业务约束：Origin/Referer 缺失被平台拦截）
+        extra_headers = {
+            "Origin": self.ORIGIN,
+            "Referer": self.REFERER,
+        }
+
+        # 5. 发送请求（带完整重试循环：递增等待 + UA切换 + 风控识别 + Excel校验）
+        #    本业务要求 uuid 完全随机，绕过基类 UUID_PREFIX 默认 → 手写签名
+        #    重试策略（与基类 request() 对齐）：
+        #        最多 MAX_RETRIES 次
+        #        第 2/3 次前自动切换 UA（Edge ↔ Chrome）
+        #        递增等待 REQUEST_INTERVAL * attempt（30/60/90 秒）
+        #        Cookie 过期立即停止（不可重试）
+        response = None  # 显式初始化，便于重试作用域
+        last_exception = None
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                # 5.1 严格间隔控制（与基类一致）
+                self._wait_interval()
+
+                # 5.2 重新生成风控参数（每次新 UUID + 新时间戳 + 新签名）
+                risk_params = self._gen_risk_params_random(self.API_URL)
+                full_data = {**biz_data, **risk_params}
+
+                ua_name = "Edge" if self._current_ua_index == 0 else "Chrome"
+                self.logger.info(
+                    f"[第{attempt}/{self.MAX_RETRIES}次] 下载店铺来源-三级渠道报表: "
+                    f"日期={date}, 平台品类='{platform_cate1 or '全品类'}', "
+                    f"UA={ua_name}, uuid={risk_params['uuid'][:8]}..."
+                )
+                self.logger.debug(f"请求参数: {json.dumps(full_data, ensure_ascii=False)[:500]}")
+
+                # 记录请求时间（类属性：所有实例共享，保证批量执行也严格间隔）
+                JDBaseRequest._last_request_time = time.time()
+
+                # 5.3 发送 POST 请求
+                response = self.session.post(
+                    self.API_URL,
+                    data=full_data,
+                    headers=extra_headers,
+                    timeout=self.REQUEST_TIMEOUT,
+                )
+
+                # 5.4 HTTP 状态码基础检查
+                if response.status_code == 401:
+                    self.logger.error("HTTP 401 未授权 - Cookie 可能已过期或被禁用")
+                    raise CookieExpiredError("Cookie已过期或无效，请更新 config/cookie.txt")
+                if response.status_code == 403:
+                    self.logger.error("HTTP 403 禁止访问 - Cookie/签名/Origin 校验失败")
+                    # 不抛 CookieExpired，让重试机制 + UA 切换兜底
+
+                # 5.5 风控业务码识别（json 响应里的 status / message）
+                self._check_business_code(response)
+
+                # 5.6 空响应拦截：Excel magic 字节校验
+                self._validate_excel_response(response, attempt)
+
+                # 5.7 走到这里 = 成功，跳出重试循环
+                self.logger.info(f"请求成功: HTTP {response.status_code}, {len(response.content)}字节")
+                break
+
+            except CookieExpiredError:
+                # Cookie 过期是硬错误，不能靠重试解决，直接抛出
+                raise
+            except requests.exceptions.Timeout as e:
+                last_exception = e
+                self.logger.warning(f"第{attempt}次请求超时（{self.REQUEST_TIMEOUT}秒）")
+            except Exception as e:
+                last_exception = e
+                self.logger.warning(f"第{attempt}次请求失败: {e}")
+
+            # 5.8 重试间隔：UA 切换 + 递增等待
+            if attempt < self.MAX_RETRIES:
+                # 每次重试前切换 UA（Edge ↔ Chrome 兜底）
+                self._switch_ua()
+                wait_seconds = self.REQUEST_INTERVAL * attempt
+                self.logger.info(
+                    f"等待 {wait_seconds}秒 后重试（已切换UA，当前: "
+                    f"{'Edge' if self._current_ua_index == 0 else 'Chrome'}）..."
+                )
+                time.sleep(wait_seconds)
+
+        # 5.9 重试全部失败：上报
+        if response is None or last_exception is not None and not (response and len(response.content) > 0):
+            self.logger.error(f"所有 {self.MAX_RETRIES} 次重试均失败")
+            raise RuntimeError(
+                f"店铺来源-三级渠道报表下载失败：{last_exception}（请检查Cookie/网络/风控）"
+            ) from last_exception
+
+        # 7. 保存 Excel（文件名友好：店铺来源_三级渠道_YYYY-MM-DD.xlsx）
+        filename = f"店铺来源_三级渠道_{date}.xlsx"
+
+        # 8. 后置处理：复用基类 _save_flow_excel（与商品流量来源同样的 Excel 处理流程）
+        return self._save_flow_excel(response, filename, date)
+
+    # ---------- 阶段 4 新增：风控 / 空响应辅助方法（业务内自实现）----------
+
+    def _check_business_code(self, response):
+        """风控业务码识别（json 响应里的 status / message）。
+
+        业务背景：
+            京东风控有时返回 HTTP 200 但 body 是 json 错误（"不安全的请求"/"操作频繁"），
+            必须解析 json 才能识别。常见码：
+                - status = -407  → "不安全的请求"（签名错误，重试可能恢复）
+                - status = -402  → 参数缺失
+                - status = 601   → 操作频繁（限流，重试反而加重风控，不自动重试）
+                - status = 302 / -1  → 登录失效
+                - message 含 "登录" / "login" → 同上
+        行为:
+            Cookie 过期 → 抛 CookieExpiredError（外层捕获，停止重试）
+            限流 601    → 仅警告，不重试（避免加重风控；让用户决定）
+            其他负码    → 警告 + 抛 Exception（让重试循环兜底）
+        """
+        content_type = response.headers.get("Content-Type", "")
+        if "json" not in content_type:
+            return  # 非 json 响应，跳过业务码检查
+
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return  # json 解析失败，跳过
+
+        # 仅在 success=False 时检查（status 可正可负：-407/-402/302/-1 是负，601/201 是正）
+        if result.get("success", True):
+            return
+
+        error_msg = result.get("message", "未知错误")
+        status_code = result.get("status")
+
+        # Cookie 过期（硬错误，不可重试）
+        if status_code in (302, -1) or "登录" in error_msg or "login" in error_msg.lower():
+            self.logger.error(f"Cookie可能已过期: {error_msg} (status={status_code})")
+            raise CookieExpiredError(f"Cookie已过期：{error_msg}")
+
+        # 601 操作频繁（限流，不重试，让用户决定）
+        if status_code == 601 or "操作频繁" in error_msg:
+            self.logger.error(
+                f"风控限流 601：{error_msg}（账号/IP被临时限流，"
+                f"停止本次调用避免加重风控，请稍后30-120分钟再试）"
+            )
+            raise RuntimeError(f"风控限流：{error_msg}")
+
+        # 其他错误码（-407/-402 等，可重试兜底）
+        self.logger.warning(f"风控拦截: {error_msg} (status={status_code})")
+        raise RuntimeError(f"风控拦截(status={status_code})：{error_msg}")
+
+    def _validate_excel_response(self, response, attempt):
+        """空响应拦截 + Excel magic 字节校验。
+
+        业务背景：
+            风控拦截时服务器可能返回 HTML 错误页（"网页解析失败"）或
+            简短 json 错误（"不支持网页类型"）伪装成"成功响应"，
+            字节数<1KB + 不是 xlsx → 视为失败，让重试机制兜底。
+
+        校验规则:
+            1. HTTP 200 但响应体 < 1KB → 视为空响应，抛 Exception
+            2. 响应体前 4 字节不是 "PK\\x03\\x04"（Excel 文件头）→ 视为非 Excel，
+               记录前 200 字节供排查，抛 Exception
+
+        异常:
+            任何校验失败都抛 RuntimeError，让重试循环兜底
+        """
+        # 1. HTTP 200 但响应体空
+        if response.status_code == 200 and len(response.content) < 1024:
+            preview = response.content[:200].decode("utf-8", errors="replace")
+            self.logger.error(
+                f"[第{attempt}次] 响应体过小（{len(response.content)}字节 < 1KB），"
+                f"疑似风控拦截或服务器错误。响应前200字节：{preview!r}"
+            )
+            raise RuntimeError(f"空响应（{len(response.content)}字节）")
+
+        # 2. Excel magic 字节校验（PK\x03\x04 = zip/xlsx 文件头）
+        if response.content[:4] != b"PK\x03\x04":
+            preview = response.content[:200].decode("utf-8", errors="replace")
+            self.logger.error(
+                f"[第{attempt}次] 响应体不是有效 Excel 文件（magic bytes 不匹配）。"
+                f"响应前200字节：{preview!r}"
+            )
+            raise RuntimeError("响应体不是 Excel 文件（magic bytes 校验失败）")
 
 
 # ============================================================
@@ -957,12 +1270,18 @@ BUSINESS_REGISTRY = {
         },
     },
     # === 后续业务在此注册 ===
-    # "店铺来源报表": {
-    #     "api_class": ShopReportAPI,
-    #     "method": "download",
-    #     "desc": "店铺来源报表",
-    #     "params": {...},
-    # },
+    # 业务：店铺来源-三级渠道（离线流量报表，2026-08-06 上线）
+    "店铺来源_三级渠道": {
+        "api_class": OfflineChannelAPI,
+        "method": "download_offline_channel",
+        "desc": "店铺来源离线渠道流量报表（按三级渠道分组，进店访客数降序）",
+        "params": {
+            "date": "查询日期YYYY-MM-DD（入参或config）",
+            "startDate": "开始日期（默认=date）",
+            "endDate": "结束日期（默认=date）",
+            "platformCate1": "平台品类1（默认空=全品类）",
+        },
+    },
 }
 
 
@@ -1254,6 +1573,14 @@ def config_consistency_check():
     # 3.3 CHANNEL_MAP（业务专属注册表，按用户要求集中维护）
     print(f"[✅] 渠道配置：CHANNEL_MAP 集中维护渠道（搜索2008/推荐2009/购物车3001执行；"
           f"自主访问3001与购物车口径重叠已停用），uuid前缀按渠道区分")
+
+    # 3.4 【阶段4新增】店铺来源-三级渠道业务专用配置（OfflineChannelAPI）
+    print(f"[✅] 店铺来源-三级渠道：")
+    print(f"      - 必带请求头: Origin={OfflineChannelAPI.ORIGIN}, Referer={OfflineChannelAPI.REFERER}")
+    print(f"      - UUID策略: 完全随机（不依赖类常量UUID_PREFIX，符合用户2026-08-06确认的'禁止硬编码'要求）")
+    print(f"      - 固定业务参数: {', '.join(OfflineChannelAPI.FIXED_BIZ_PARAMS.keys())}")
+    print(f"      - 可变业务参数: {', '.join(OfflineChannelAPI.VARIABLE_BIZ_PARAMS.keys())}")
+    print(f"      - 入口: python main.py --biz_key '店铺来源_三级渠道' --date '2026-08-04'")
 
     print("=" * 70)
     print("核对完成。若存在 ❌ 项，请先修复再运行；⚠️ 项请尽快补齐config。")
