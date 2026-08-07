@@ -147,6 +147,60 @@ def convert_date_format(date_str):
     return s
 
 
+def _find_date_cols(df):
+    """查找DataFrame中报表自带(原始)的日期/时间列。
+
+    识别标准（2026-08-07 公共规则1）：
+        - 列名精确等于"日期"或"时间"
+        - 或以"日期"结尾（如"下单日期"）
+    ⚠️ 刻意不用"以'时间'结尾"匹配：防止"最近上架时间"等业务时间字段
+       （列里是上架日期而非本报表统计日期）被误判为日期列。
+
+    返回:
+        list - 命中的列名列表；空列表 = 报表无日期/时间列（需要程序插入【日期】列）
+    """
+    hits = []
+    for col in df.columns:
+        name = str(col).strip()
+        if name == "日期" or name == "时间" or name.endswith("日期"):
+            hits.append(col)
+    return hits
+
+
+def prepare_date_columns(df, date):
+    """Excel日期列统一处理（公共规则1+2，所有报表复用）。
+
+    规则1（日期列智能新增）：
+        - 报表已存在【日期】/【时间】列 → **禁止重复插入**日期列，
+          仅对已有日期/时间列做格式标准化转换；
+        - 报表无任何日期/时间列 → 在首列插入【日期】列，值=本次查询日期。
+
+    规则2（日期格式统一）：yyyy/m/d（如 2026/7/29），带时分秒保留时间部分。
+        输入兼容：20260729 / 2026-07-29 / 2026-07-29 13:45:59（内部调用 convert_date_format）。
+
+    入参:
+        df   - 从Excel读出的DataFrame（dtype=str）
+        date - 本次查询日期（如 2026-07-29），仅"插入新列"场景用到
+    出参:
+        (date_column, date_value)
+            date_column - 实际承载日期的列名
+                          （插入列="日期"；自带日期列=第一个命中的列名）
+            date_value  - 插入列场景：日期字符串值（供 apply_column_formats 用）；
+                          自带日期列场景：None（值逐格不同，由 apply_column_formats 逐格解析）
+    """
+    date_cols = _find_date_cols(df)
+    if date_cols:
+        # 报表自带日期/时间列 → 禁止重复插入，只做格式标准化（2026-07-29 → 2026/7/29）
+        for col in date_cols:
+            df[col] = [convert_date_format(v) for v in df[col].tolist()]
+        return date_cols[0], None
+
+    # 报表无日期/时间列 → 首列插入【日期】列，全列取本次查询日期
+    date_str = convert_date_format(date)
+    df.insert(0, "日期", date_str)
+    return "日期", date_str
+
+
 def safe_convert_numeric(df):
     """全表数值安全转换（所有报表复用，全局生效）。
 
@@ -238,17 +292,29 @@ def apply_column_formats(file_path, df, date_column="日期", date_value=None):
         if cell.value is not None:
             header_map[str(cell.value)] = cell.column
 
-    # ① 日期列：文本 → 真实日期对象 + 日期/日期时间格式
-    if date_column in header_map and date_value is not None:
-        date_dt = _parse_date_cell(date_value)
-        has_time = ":" in str(date_value)
-        date_format = "yyyy/m/d hh:mm:ss" if has_time else "yyyy/m/d"
+    # ① 日期列：逐格文本 → 真实日期对象 + 日期/日期时间格式
+    # 支持两种调用场景（2026-08-07 公共规则1+2）：
+    #   - 程序插入的【日期】列（date_value 提供，全列同值）
+    #   - 报表自带日期/时间列（date_value=None，每格值可能不同，逐格解析）
+    if date_column in header_map:
+        # 插入列场景：解析 date_value 得到基准格式（全列同值，用于兜底套格式）
+        base_fmt = None
+        if date_value is not None and _parse_date_cell(date_value) is not None:
+            base_fmt = "yyyy/m/d hh:mm:ss" if ":" in str(date_value) else "yyyy/m/d"
         col_idx = header_map[date_column]
         for row in range(2, ws.max_row + 1):
             cell = ws.cell(row=row, column=col_idx)
-            if date_dt is not None:
-                cell.value = date_dt           # 写真实日期对象（非文本）
-            cell.number_format = date_format
+            v = cell.value
+            if isinstance(v, str):
+                dt = _parse_date_cell(v)
+                if dt is not None:
+                    cell.value = dt           # 文本日期 → 真实日期对象（非文本）
+                    # 每格按自身是否带时间决定格式（yyyy/m/d 或 yyyy/m/d hh:mm:ss）
+                    cell.number_format = "yyyy/m/d hh:mm:ss" if ":" in v else "yyyy/m/d"
+                    continue
+            # 非文本（已是日期对象/数值）或无法解析 → 保留原值，有基准格式则套用
+            if base_fmt is not None:
+                cell.number_format = base_fmt
 
     # ② 其他列按列名规则设置格式（订单编号=@文本，SKU/SPU=0数值0位小数）
     for col_name, col_idx in header_map.items():
@@ -810,12 +876,13 @@ class ProductFlowAPI(JDBaseRequest):
     def _save_flow_excel(self, response, filename, date):
         """商品流量来源专用保存流程（Excel后置处理）。
 
-        导出流程（需求文档要求）：
+        导出流程（需求文档要求 + 2026-08-07 公共规则1+2）：
             ① 接口返回的Excel二进制流 → 读成DataFrame
-            ② 调用通用日期转换函数 convert_date_format()，把本次查询日期转成统一目标格式
-            ③ 在首列A位置插入【日期】列，值=转换后的查询日期
-            ④ 调用通用数值安全转换函数 safe_convert_numeric()，处理全表字段类型
-            ⑤ 写入Excel并设置日期列单元格格式（打开文件不弹格式警告）
+            ② 日期列统一处理 prepare_date_columns()：
+               报表自带【日期】/【时间】列 → 禁止重复插入，仅做格式标准化；
+               无日期/时间列 → 首列插入【日期】列（值=查询日期，yyyy/m/d）
+            ③ 调用通用数值安全转换函数 safe_convert_numeric()，处理全表字段类型
+            ④ 写入Excel并设置日期列单元格格式（打开文件不弹格式警告）
 
         入参:
             response - requests响应（content为接口返回的xlsx二进制）
@@ -838,11 +905,10 @@ class ProductFlowAPI(JDBaseRequest):
         #    na_filter=False：空单元格保持空字符串，避免被替换成'nan'文本。
         df = pd.read_excel(io.BytesIO(response.content), dtype=str, na_filter=False)
 
-        # ② 通用日期转换：2026-07-29 → 2026/7/29（统一目标格式）
-        date_str = convert_date_format(date)
-
-        # ③ 首列A位置插入【日期】列，所有行取值为本次查询日期
-        df.insert(0, "日期", date_str)
+        # ②③ 日期列统一处理（公共规则1+2，2026-08-07）：
+        #    报表自带【日期】/【时间】列 → 禁止重复插入日期列，仅做格式标准化；
+        #    报表无日期/时间列 → 首列插入【日期】列，值=本次查询日期。
+        date_column, date_value = prepare_date_columns(df, date)
 
         # ④ 全表数值安全转换（>15位长数字保留文本，防止精度丢失）
         df = safe_convert_numeric(df)
@@ -850,7 +916,7 @@ class ProductFlowAPI(JDBaseRequest):
         # ⑤ 写入Excel → 按列名规则设置单元格格式（日期列/订单编号@/SKU·SPU数值0位小数）
         file_path = os.path.join(self.output_dir, filename)
         df.to_excel(file_path, index=False, engine="openpyxl")
-        apply_column_formats(file_path, df, date_column="日期", date_value=date_str)
+        apply_column_formats(file_path, df, date_column=date_column, date_value=date_value)
 
         self.logger.info(
             f"Excel已保存: {file_path}（已插入日期列+数值转换+单元格格式，{os.path.getsize(file_path)}字节）"
@@ -1260,11 +1326,10 @@ class OfflineChannelAPI(JDBaseRequest):
         # ① 读取二进制流 → DataFrame（dtype=str 防长数字精度丢失，na_filter=False 保留空字符串）
         df = pd.read_excel(io.BytesIO(response.content), dtype=str, na_filter=False)
 
-        # ② 通用日期转换：2026-08-01 → 2026/8/1（统一目标格式）
-        date_str = convert_date_format(date)
-
-        # ③ 首列A位置插入【日期】列
-        df.insert(0, "日期", date_str)
+        # ②③ 日期列统一处理（公共规则1+2，2026-08-07）：
+        #    报表自带【日期】/【时间】列 → 禁止重复插入日期列，仅做格式标准化；
+        #    报表无日期/时间列 → 首列插入【日期】列，值=本次查询日期。
+        date_column, date_value = prepare_date_columns(df, date)
 
         # ④ 全表数值安全转换
         df = safe_convert_numeric(df)
@@ -1272,7 +1337,7 @@ class OfflineChannelAPI(JDBaseRequest):
         # ⑤ 写入Excel + 单元格格式
         file_path = os.path.join(self.output_dir, filename)
         df.to_excel(file_path, index=False, engine="openpyxl")
-        apply_column_formats(file_path, df, date_column="日期", date_value=date_str)
+        apply_column_formats(file_path, df, date_column=date_column, date_value=date_value)
 
         self.logger.info(
             f"Excel已保存: {file_path}（已插入日期列+数值转换+单元格格式，{os.path.getsize(file_path)}字节）"
@@ -1610,11 +1675,10 @@ class ProductDetailAPI(JDBaseRequest):
         # ① 读取二进制流 → DataFrame
         df = pd.read_excel(io.BytesIO(response.content), dtype=str, na_filter=False)
 
-        # ② 通用日期转换：2026-08-06 → 2026/8/6
-        date_str = convert_date_format(date)
-
-        # ③ 首列A位置插入【日期】列
-        df.insert(0, "日期", date_str)
+        # ②③ 日期列统一处理（公共规则1+2，2026-08-07）：
+        #    报表自带【日期】/【时间】列 → 禁止重复插入日期列，仅做格式标准化；
+        #    报表无日期/时间列 → 首列插入【日期】列，值=本次查询日期。
+        date_column, date_value = prepare_date_columns(df, date)
 
         # ④ 全表数值安全转换
         df = safe_convert_numeric(df)
@@ -1622,7 +1686,7 @@ class ProductDetailAPI(JDBaseRequest):
         # ⑤ 写入Excel
         file_path = os.path.join(self.output_dir, filename)
         df.to_excel(file_path, index=False, engine="openpyxl")
-        apply_column_formats(file_path, df, date_column="日期", date_value=date_str)
+        apply_column_formats(file_path, df, date_column=date_column, date_value=date_value)
 
         self.logger.info(
             f"Excel已保存: {file_path}（已插入日期列+数值转换+单元格格式，{os.path.getsize(file_path)}字节）"
@@ -1824,18 +1888,17 @@ class ProductDetailAPI(JDBaseRequest):
         # ① 读取二进制流 → DataFrame
         df = pd.read_excel(io.BytesIO(response.content), dtype=str, na_filter=False)
 
-        # ② 通用日期转换：2026-08-06 → 2026/8/6
-        date_str = convert_date_format(date)
-
-        # ③ 首列A位置插入【日期】列
-        df.insert(0, "日期", date_str)
+        # ②③ 日期列统一处理（公共规则1+2，2026-08-07）：
+        #    报表自带【日期】/【时间】列 → 禁止重复插入日期列，仅做格式标准化；
+        #    报表无日期/时间列 → 首列插入【日期】列，值=本次查询日期。
+        date_column, date_value = prepare_date_columns(df, date)
 
         # ④ 全表数值安全转换
         df = safe_convert_numeric(df)
 
         # ⑤ 写入Excel（指定完整路径，含业务子目录）
         df.to_excel(target_path, index=False, engine="openpyxl")
-        apply_column_formats(target_path, df, date_column="日期", date_value=date_str)
+        apply_column_formats(target_path, df, date_column=date_column, date_value=date_value)
 
         self.logger.info(
             f"Excel已保存: {target_path}（已插入日期列+数值转换+单元格格式，{os.path.getsize(target_path)}字节）"
