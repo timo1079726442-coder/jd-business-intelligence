@@ -512,6 +512,62 @@ python main.py --biz_key "商品明细导出" --date "2026-08-07" --second "1234
 
 ---
 
+## 项目6：商品流失分析（POST 导出，xls 转存，2026-08-07 上线）
+
+### 项目业务说明
+- **业务名**：`商品流失分析`
+- **接口**：`https://sz.jd.com/sz/api/competitionAnalysis/exportLossProList.ajax`（⚠️ **POST 表单**）
+- **页面入口**：`https://sz.jd.com/sz/view/competitionAnalysis/lossAnalysiss.html`
+- **功能**：竞争-竞争流失-商品流失分析，导出引起本店成交客户流失的竞品商品明细
+- **输出**：**.xls 响应** → 读取后转存 .xlsx，保存至 `output/商品流失分析/{date}/` 业务子目录
+- **业务类**：`LossProductAPI`（继承 JDBaseRequest），BUSINESS_REGISTRY 第 7 业务
+
+### 与项目5 的关键差异
+| 维度 | 项目5 exportProList.ajax | 本项目 exportLossProList.ajax |
+|------|--------------------------|-------------------------------|
+| 请求方式 | GET（参数拼 URL）| **POST（表单）** |
+| 响应格式 | .xlsx（`PK\x03\x04`）| **.xls（`\xD0\xCF\x11\xE0` OLE2，全项目首次）** |
+| 读取引擎 | openpyxl | **xlrd（公共函数 `read_excel_bytes()` 按魔数自动识别）** |
+| 保存方式 | 直接保存 | **xls 读取 → 转存 .xlsx**（后缀 xls→xlsx 替换）|
+| filename 头 | `filename*=UTF-8''`（URL 编码）| **`filename=`（UTF-8 字节直放，charset=utf-8）** |
+| 固定业务参数 | type/categoryType/downloadType | **indChannel=99 / unitType=0**（用户确认固化）|
+| 必带 Header | Referer | **Origin + Referer**（Sec-Fetch-Site=same-origin）|
+
+### 关键实现点
+1. **POST 表单**：`self.session.post(self.API_URL, data=full_params, headers=extra_headers, ...)`
+2. **公共函数 `read_excel_bytes(content)`**（main.py 顶部，全项目复用）：
+   - `PK\x03\x04` → 默认引擎；`\xD0\xCF\x11\xE0` → `engine="xlrd"`（需 `pip install xlrd>=2.0.1`，pandas 3.0 要求）；否则 ValueError
+3. **完全随机 uuid**：`secrets.token_hex(8) + "-" + secrets.token_hex(5)`（同项目4/5，禁硬编码前缀）
+4. **风控签名**：`User-mnp = MD5(URL路径 + uuid + 时间戳 + 盐值372ad2c2b6)`（复用全局盐值）
+5. **双魔数校验**：`_validate_excel_response()` 接受 xls/xlsx 任一魔数 + Content-Disposition attachment（项目6 独有）
+6. **Excel 后置处理**：`_save_excel_to_path()`（read_excel_bytes → prepare_date_columns → safe_convert_numeric → 写 xlsx + apply_column_formats）
+
+### ⚠️ 文件名编码踩坑（阶段5 真实导出发现，2026-08-07 修复）
+- **现象**：真实导出文件名乱码 `鍟嗗搧娴佸け鍒嗘瀽_鍏ㄩ儴娓犻亾...`
+- **根因**：服务器 filename 字节是 **UTF-8**（charset=utf-8），requests 按 latin-1 解码成 U+00xx；此前代码按 **GBK** 解码 → UTF-8 字节被 GBK 解出"鍟嗗搧"乱码（mock 用 GBK 构造样本所以没暴露）
+- **修复**：`_parse_content_disposition_filename` 改 **UTF-8 优先解码**、GBK 回退：
+  `raw.encode('latin-1')` 还原字节 → 先 `decode('utf-8')`（无 `\ufffd` 即返回）→ 失败再 `decode('gbk')`
+- **验证**：4 场景（真实UTF-8 / GBK兼容 / filename*URL编码 / 纯ASCII）4/4 通过；真实导出文件名正常
+
+### 阶段4 容错适配（与项目4/5 对齐）
+- 重试循环 3 次递增等待 30/60/90s + UA 切换 Edge↔Chrome
+- 601 抛 `RiskControlError` **不重试**；401/302·登录抛 `CookieExpiredError` 立即停
+- `<1KB` 空响应拦截、双魔数校验失败抛 RuntimeError、缺 attachment 抛 RuntimeError
+- `success` 标记防"最后一次失败但有内容"误保存
+
+### 入口命令
+```bash
+python main.py --biz_key "商品流失分析" --date "2026-08-05"
+```
+
+### 踩坑要点
+1. **.xls 与 .xlsx 魔数不同**：xls=`\xD0\xCF\x11\xE0`，xlsx=`PK\x03\x04`；校验与读取都要双兼容
+2. **filename 编码按 UTF-8 优先**：京东 charset=utf-8 声明是真实的；GBK 解码 UTF-8 字节必出"鍟嗗搧"乱码；GBK 仅作回退
+3. **mock 样本编码要和真实一致**：mock 用 GBK 构造掩盖了真实 UTF-8 问题，单测+真实导出双验证必要
+4. **依赖**：xlrd>=2.0.1（pandas 3.0 要求），缺装时 xls 读取报 ImportError
+
+---
+
 ### 新增业务接入规范（v2.0 业务注册中心，2026-08-05）
 
 后续新增业务（店铺来源报表/订单明细/售后订单/京准通广告报表）统一按以下步骤接入，**禁止大改调度核心**：
@@ -658,6 +714,8 @@ export.action GET 下载 {taskId}.zip
 
 | 日期 | 改动概要 |
 |------|----------|
+| 2026-08-07 | **商品流失分析项目上线（5 阶段交付，第 7 业务）**：① 新增 `LossProductAPI` 类（继承 `JDBaseRequest`），**POST 表单**（`sz.jd.com/sz/api/competitionAnalysis/exportLossProList.ajax`，Sec-Fetch-Site=same-origin）；② 业务参数 8 项表单（date/startDate/endDate 可变；indChannel=99/unitType=0 固定经用户确认固化）；③ 固定业务参数 `indChannel=99`、`unitType=0`；④ **首次处理 .xls 响应**：新增公共函数 `read_excel_bytes()` 按魔数自动识别 xlsx（`PK\x03\x04`，openpyxl）与 xls（`\xD0\xCF\x11\xE0`，xlrd 引擎，需 xlrd>=2.0.1）；⑤ 响应校验升级**双魔数**（xls/xlsx 任一）+ Content-Disposition attachment；⑥ 保存为 xls 读取 → 转存 .xlsx，落 `output/商品流失分析/{date}/` 子目录；⑦ **阶段5 真实导出发现 filename 为 UTF-8 字节**（charset=utf-8，非 GBK）：修复 `_parse_content_disposition_filename` 为 **UTF-8 优先 + GBK 回退**（此前按 GBK 解码产生"鍟嗗搧"乱码），4 场景验证 4/4 通过，真实导出文件名正常；⑧ 阶段4 容错与项目4/5 对齐（601 不重试 RiskControlError / success 标记 / 双魔数校验）；⑨ mock 单测 30/30 通过；⑩ 入口：`python main.py --biz_key "商品流失分析" --date "2026-08-05"` |
+| 2026-08-07 | 商智模块业务定位更新：商智域含 szgateway.jd.com（POST 接口）与 sz.jd.com（GET/POST 导出接口），统一按项目编号归档 |
 | 2026-08-04 | 初始化项目，破解京东风控签名，API测试成功，创建规范文档 |
 | 2026-08-04 | 创建项目API清单Excel，含5个工作表共115条记录 |
 | 2026-08-04 | 创建API实现逻辑说明文档 + 通用请求基类base.py（含30秒间隔/重试/日志），测试通过 |

@@ -499,3 +499,96 @@ python main.py --biz_key "商品明细导出" --date "2026-08-07" --second "1234
 |------|------|
 | 2026-08-07 | 阶段3：ProductDetailAPI 完整实现 + BUSINESS_REGISTRY 注册（第6业务）+ 修复 `_save_flow_excel` 误插类 Bug |
 | 2026-08-07 | 阶段4：601 改抛 RiskControlError 不重试（含项目4 同步）；success 标记防误保存；文本型 601 识别；单测 24/24 通过 |
+
+---
+
+## 项目 6：商品流失分析（LossProductAPI）｜2026-08-07 上线
+
+### 业务定位
+在「竞争分析-竞争流失-商品流失分析」页面导出**流失商品明细报表**（哪些商品引起本店成交客户流失到竞品店）。与项目5 同属 `sz.jd.com` 域，但**首次出现 `.xls`（OLE2复合文档）响应**，是核心差异。
+
+### 接口
+| 字段 | 内容 |
+|------|------|
+| **URL** | `https://sz.jd.com/sz/api/competitionAnalysis/exportLossProList.ajax` |
+| **方法** | **POST**（表单 `application/x-www-form-urlencoded`，与项目5 的 GET 不同）|
+| **域名** | `sz.jd.com` |
+| **页面入口** | `https://sz.jd.com/sz/view/competitionAnalysis/lossAnalysiss.html` |
+| **Sec-Fetch-Site** | `same-origin`（同项目5，覆盖基类默认）|
+| **成功响应** | HTTP 200 + `Content-Disposition: attachment;charset=utf-8` + body 前 4 字节 **`\xD0\xCF\x11\xE0`（.xls 魔数）** |
+| **响应文件名头** | `filename=商品流失分析_全部渠道_SPU_20260805_20260805.xls`（**UTF-8 字节直放**，非 URL 编码）|
+
+### 必带 Header
+```python
+ORIGIN  = "https://sz.jd.com"
+REFERER = "https://sz.jd.com/sz/view/competitionAnalysis/lossAnalysiss.html"
+extra_headers = {"Origin": ORIGIN, "Referer": REFERER, "Sec-Fetch-Site": "same-origin"}
+```
+
+### 业务表单参数（POST，固定 2 项 + 日期 3 值 + 风控 3 项）
+| 参数 | 值 | 类型 | 说明 |
+|------|-----|------|------|
+| `indChannel` | `99` | ❌ 固定 | 渠道（99=全部渠道，用户确认固化 FIXED_BIZ_PARAMS）|
+| `unitType` | `0` | ❌ 固定 | 维度（0=SPU，用户确认固化）|
+| `date` / `startDate` / `endDate` | `2026-08-05` | ✅ 可变 | 三值必须一致（复用踩坑经验）|
+| `User-mup` | 毫秒时间戳 | ⚠️ 风控 | `int(time.time()*1000)` |
+| `User-mnp` | MD5 签名 | ⚠️ 风控 | `MD5(URL路径 + uuid + 时间戳 + 盐值372ad2c2b6)` |
+| `uuid` | 完全随机 | ⚠️ 风控 | `secrets.token_hex(8) + "-" + secrets.token_hex(5)`（16hex-10hex，同项目4/5）|
+
+### .xls 读取与转存（本项目核心新增）
+- **响应魔数**：`.xls` 是 `\xD0\xCF\x11\xE0`（OLE2复合文档），`.xlsx` 是 `PK\x03\x04`（zip）
+- **公共函数** `read_excel_bytes(content)`（main.py 顶部）：按魔数自动选引擎
+  - `PK\x03\x04` → 默认 openpyxl 引擎
+  - `\xD0\xCF\x11\xE0` → `engine="xlrd"`（需 `pip install xlrd>=2.0.1`，pandas 3.0 要求）
+  - 都不匹配 → `ValueError`（调用方重试兜底）
+- **保存流程** `_save_excel_to_path()`：`read_excel_bytes` → `prepare_date_columns`（规则1+2）→ `safe_convert_numeric`（规则3）→ 写 `.xlsx` + `apply_column_formats`
+- 输出统一**转存为 .xlsx**（用户确认决策），后缀 `xls → xlsx` 替换
+
+### ⚠️ 文件名编码踩坑（阶段5 真实导出发现，已修复）
+| 现象 | 根因 | 修复 |
+|------|------|------|
+| 真实导出文件名乱码 `鍟嗗搧娴佸け鍒嗘瀽_鍏ㄩ儴娓犻亾...` | 服务器 filename 字节是 **UTF-8**（header 声明 charset=utf-8），requests 按 latin-1 解码成 U+00xx 字符；此前按 GBK 解码 UTF-8 字节 → 产生"鍟嗗搧"乱码 | `_parse_content_disposition_filename` 改为 **UTF-8 优先解码**、GBK 回退：`raw.encode('latin-1')` 还原字节 → 先 `decode('utf-8')` 且无 `\ufffd` 替换符即返回 → 失败再 `decode('gbk')` 回退 |
+| mock 测试用 GBK 字节构造 → 当时没暴露 | mock 与真实服务器编码不一致 | 验证脚本覆盖 4 场景（真实UTF-8 / GBK兼容 / filename*URL编码 / 纯ASCII），4/4 通过 |
+
+### 容错与风控适配（阶段 4，与项目4/5 对齐）
+| 场景 | 行为 |
+|------|------|
+| HTTP 200 + < 1KB | 空响应拦截 → RuntimeError 重试 |
+| 魔数 ≠ `PK\x03\x04` 且 ≠ `\xD0\xCF\x11\xE0` | 非 Excel → RuntimeError 重试（**双魔数校验**，本项目独有）|
+| 缺 `Content-Disposition: attachment` | 疑似风控伪装 → RuntimeError 重试 |
+| HTTP 401 / 业务码 302·-1·登录 | `CookieExpiredError` 立即停止 |
+| 业务码 601 / 文本"操作频繁" | `RiskControlError` **不重试**直接抛出 |
+| `success` 标记 | 只有 break 才算成功，防最后一次失败误保存 |
+| 重试 | 3 次递增等待 30/60/90s + UA 切换 Edge↔Chrome |
+
+### 测试结论
+| 阶段 | 结果 |
+|------|------|
+| 阶段4 mock 单测 | **30/30 通过**（xls 读取 / GBK·UTF-8 文件名 / 双魔数校验 / 601 不重试 / success 标记 / 转存 xlsx / 公共规则）|
+| 阶段5 真实导出 | HTTP 200 + 8192 字节 + **文件名正常**（UTF-8 解码修复后）→ 转存 xlsx 6340 字节 |
+| 数据核对 | 14 行 × 13 列（日期/商品名称/商品ID/流失成交金额/流失成交客户数/流失率/关注后流失人数/加购后流失人数/关注后跳失人数/加购后跳失人数/直接跳失人数/引起流失的商品数/引起流失的店铺数），与抓包响应一致；商品ID 保留文本、日期列首列插入 |
+
+### 入口命令
+```bash
+python main.py --biz_key "商品流失分析" --date "2026-08-05"
+```
+
+### 与项目5 的核心差异汇总
+| 维度 | 项目5（exportProList.ajax）| 项目6（exportLossProList.ajax）|
+|------|---------------------------|------------------------------|
+| 业务类 | ProductDetailAPI | **LossProductAPI** |
+| 请求方式 | GET（参数拼 URL）| **POST（表单）** |
+| 页面入口 | productAnalysis/productDetail.html | **competitionAnalysis/lossAnalysiss.html** |
+| 响应格式 | .xlsx（PK 魔数）| **.xls（\xD0\xCF\x11\xE0 魔数，首次出现）** |
+| filename 头 | `filename*=UTF-8''`（URL 编码）| **`filename=`（UTF-8 字节直放）** |
+| 读取引擎 | openpyxl | **xlrd（read_excel_bytes 自动识别）** |
+| 保存 | 直接保存 | **xls 读取 → 转存 .xlsx** |
+| 固定业务参数 | type/categoryType/downloadType | **indChannel=99 / unitType=0** |
+
+### 变更记录
+| 日期 | 改动 |
+|------|------|
+| 2026-08-07 | 阶段1-2：需求拆解 + 骨架零改动验证（30/30 mock 通过）|
+| 2026-08-07 | 阶段3：LossProductAPI 完整实现（POST + xls 读取 + 业务子目录）+ BUSINESS_REGISTRY 注册（第7业务）|
+| 2026-08-07 | 阶段4：双魔数校验 + RiskControlError + success 标记 + 601 不重试 |
+| 2026-08-07 | 阶段5：真实导出发现 filename **UTF-8 编码**乱码 → `_parse_content_disposition_filename` UTF-8 优先解码 + GBK 回退；重测通过；文档归档 |

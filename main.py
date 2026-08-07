@@ -227,6 +227,33 @@ def build_business_output_path(output_dir, filename, date):
     return os.path.join(business_dir, filename)
 
 
+def read_excel_bytes(content):
+    """通用Excel二进制读取（xlsx + xls 双格式兼容，2026-08-07 项目6新增）。
+
+    背景：京东商智部分接口返回 .xls（OLE2复合文档，如竞争-商品流失分析 exportLossProList），
+    其文件头是 \xD0\xCF\x11\xE0（非 xlsx 的 PK\x03\x04），pandas 需显式 engine='xlrd' 才能读取。
+    此前所有报表都是 .xlsx，用 openpyxl 引擎即可；本项目首次出现 .xls，故抽成公共函数统一处理。
+
+    入参:
+        content - 接口返回的Excel文件字节流（bytes）
+    出参:
+        DataFrame（dtype=str 防长数字精度丢失；na_filter=False 保留空字符串）
+    异常:
+        无法识别的Excel格式 → ValueError（由调用方重试兜底）
+    """
+    import io
+    import pandas as pd
+
+    magic = content[:4]
+    if magic == b"PK\x03\x04":
+        # .xlsx（zip容器），pandas 默认 openpyxl 引擎
+        return pd.read_excel(io.BytesIO(content), dtype=str, na_filter=False)
+    if magic == b"\xD0\xCF\x11\xE0":
+        # .xls（OLE2复合文档），xlrd 引擎（pandas 3.0 仍保留 XlrdReader）
+        return pd.read_excel(io.BytesIO(content), dtype=str, na_filter=False, engine="xlrd")
+    raise ValueError(f"无法识别的Excel格式（magic={magic!r}）")
+
+
 def safe_convert_numeric(df):
     """全表数值安全转换（所有报表复用，全局生效）。
 
@@ -1941,6 +1968,390 @@ class ProductDetailAPI(JDBaseRequest):
 
 
 # ============================================================
+#  业务接口 4：（新业务 - 商品流失分析，2026-08-07 上线）
+# ------------------------------------------------------------
+#  业务名称：商品流失分析
+#  接口地址：https://sz.jd.com/sz/api/competitionAnalysis/exportLossProList.ajax
+#  业务说明：竞争分析-竞争流失-商品流失分析，导出流失商品明细报表
+#  业务需求（2026-08-07 用户提供抓包，阶段1确认）：
+#      - 请求方式：POST（表单 application/x-www-form-urlencoded，同项目4）
+#      - 域名：sz.jd.com（同项目5，Sec-Fetch-Site=same-origin）
+#      - 页面入口：/sz/view/competitionAnalysis/lossAnalysiss.html（注意是 /sz/view/ 非 /szweb/sz/view/）
+#      - 业务参数：indChannel=99（渠道）、unitType=0（SPU维度）→ 用户确认固定写死
+#      - 响应格式：⚠️ .xls（OLE2复合文档），魔数 D0CF11E0，需 xlrd 读取
+#      - 文件名头：filename= 为 GBK 字节乱码（如"鍟嗗搧娴佸け鍒嗘瀽"），需 latin-1→GBK 还原
+#      - 保存规则：读取 xls → 转存 xlsx → output/商品流失分析/{date}/
+#  硬性约束：
+#      1. 风控三元组每次全新生成，uuid 完全随机（16hex-10hex，同项目4/5）
+#      2. 601 不重试（抛 RiskControlError，同项目4/5 阶段4 修复）
+#      3. Cookie 从 config/cookie.txt 整体读取
+# ============================================================
+class LossProductAPI(JDBaseRequest):
+    """商品流失分析 API（竞争分析-竞争流失-商品流失，2026-08-07）。
+
+    POST 表单（同项目4） + sz.jd.com 域（同项目5） + .xls 响应（首次出现） + GBK 文件名（首次出现）。
+    与项目4/5 的差异集中在：响应校验（xls/xlsx 双魔数）、文件名解析（UTF-8/GBK 双兼容）、
+    xls 读取转存 xlsx。其余（重试/UA切换/风控码识别/success标记）与项目4/5 阶段4 完全一致。
+    """
+
+    # 接口 URL（业务约束，固定）
+    API_URL = "https://sz.jd.com/sz/api/competitionAnalysis/exportLossProList.ajax"
+
+    # 必带请求头（业务约束，固定）
+    ORIGIN = "https://sz.jd.com"
+    REFERER = "https://sz.jd.com/sz/view/competitionAnalysis/lossAnalysiss.html"
+
+    # 业务子目录（输出目录规则 AGENTS.md Excel规则4）
+    OUTPUT_SUBDIR = "商品流失分析"
+
+    # 【固定业务参数】用户 2026-08-07 确认固化（抓包值），写死代码不读config
+    FIXED_BIZ_PARAMS = {
+        "indChannel": "99",   # 渠道：99=全部渠道（抓包确认）
+        "unitType": "0",      # 维度：0=SPU 维度（抓包确认）
+    }
+    # 本业务无可变业务参数（日期 + 风控三元组动态生成）
+
+    # ---------- 完全随机 UUID（与项目4/5 相同模式）----------
+
+    def _gen_uuid_random(self):
+        """完全随机 UUID 生成器（16hex-10hex，与抓包格式一致）。
+
+        ⚠️ 背景：抓包 uuid=`a94057e3a4eab84aae5d-19fdb7dc648`（16hex-10hex），
+        前缀每次会话变化，禁止硬编码前缀（AGENTS.md 风控归档）。
+        """
+        import secrets
+        prefix = secrets.token_hex(8)   # 8字节 = 16hex
+        suffix = secrets.token_hex(5)   # 5字节 = 10hex
+        return f"{prefix}-{suffix}"
+
+    def _gen_risk_params_random(self, url):
+        """动态生成风控三元组（完全随机 uuid + 毫秒时间戳 + MD5签名）。
+
+        签名算法（与项目1-5 一致）：
+            User-mnp = MD5(URL路径 + uuid + 时间戳 + 全局盐值 372ad2c2b6)
+        """
+        import hashlib
+        import time as _time
+        from urllib.parse import urlparse
+
+        uuid_str = self._gen_uuid_random()
+        timestamp = int(_time.time() * 1000)   # 13位毫秒时间戳
+        url_path = urlparse(url).path         # 取URL路径（去掉域名和query）
+
+        sign_str = f"{url_path}{uuid_str}{timestamp}{self.SIGN_SALT}"
+        user_mnp = hashlib.md5(sign_str.encode("utf-8")).hexdigest()
+
+        return {
+            "User-mup": str(timestamp),
+            "User-mnp": user_mnp,
+            "uuid": uuid_str,
+        }
+
+    def _get_date_params(self, date=None, start_date=None, end_date=None):
+        """日期三值一致规则（与项目4/5 相同，踩坑 2026-08-05）。"""
+        if date is None:
+            date = self.config.get("date")
+        if date is None:
+            raise ValueError("查询日期date未提供：请在config.xlsx配置或通过函数入参传入")
+        if start_date is None:
+            start_date = date
+        if end_date is None:
+            end_date = date
+        return date, start_date, end_date
+
+    # ---------- 风控 / 响应校验辅助方法（项目6 适配 xls）----------
+
+    def _check_business_code(self, response):
+        """风控业务码识别（与项目4/5 完全一致，含 601 不重试）。"""
+        content_type = response.headers.get("Content-Type", "")
+        if "json" not in content_type:
+            return
+        try:
+            result = response.json()
+        except Exception:
+            return
+        if result.get("success", True):
+            return
+        error_msg = result.get("message", "未知错误")
+        status_code = result.get("status")
+        # Cookie 过期（硬错误）
+        if status_code in (302, -1) or "登录" in error_msg or "login" in error_msg.lower():
+            self.logger.error(f"Cookie可能已过期: {error_msg} (status={status_code})")
+            raise CookieExpiredError(f"Cookie已过期：{error_msg}")
+        # 601 限流（不重试）
+        if status_code == 601 or "操作频繁" in error_msg:
+            self.logger.error(
+                f"风控限流 601：{error_msg}（账号/IP被临时限流，停止本次调用避免加重风控，请稍后30-120分钟再试）"
+            )
+            raise RiskControlError(f"风控限流：{error_msg}")
+        # 其他错误码
+        self.logger.warning(f"风控拦截: {error_msg} (status={status_code})")
+        raise RuntimeError(f"风控拦截(status={status_code})：{error_msg}")
+
+    def _validate_excel_response(self, response, attempt):
+        """响应校验（项目6 适配：xls/xlsx 双魔数 + Content-Disposition）。
+
+        校验规则:
+            1. HTTP 200 但响应体 < 1KB → 空响应
+            2. 魔数校验：.xlsx=PK\\x03\\x04（zip） 或 .xls=\\xD0\\xCF\\x11\\xE0（OLE2）
+               —— 与项目4/5 只认 PK 不同，本项目兼容两种（首次出现 xls 响应）
+            3. 响应头必须含 Content-Disposition: attachment（风控伪装拦截）
+        """
+        # 1. 空响应拦截
+        if response.status_code == 200 and len(response.content) < 1024:
+            preview = response.content[:200].decode("utf-8", errors="replace")
+            self.logger.error(
+                f"[第{attempt}次] 响应体过小（{len(response.content)}字节 < 1KB），"
+                f"疑似风控拦截或服务器错误。响应前200字节：{preview!r}"
+            )
+            raise RuntimeError(f"空响应（{len(response.content)}字节）")
+
+        # 2. Excel 魔数校验（xlsx 或 xls 任一通过）
+        magic = response.content[:4]
+        if magic not in (b"PK\x03\x04", b"\xD0\xCF\x11\xE0"):
+            preview = response.content[:200].decode("utf-8", errors="replace")
+            self.logger.error(
+                f"[第{attempt}次] 响应体不是有效 Excel（xlsx=PK/xls=D0CF 均不匹配，实际={magic!r}）。"
+                f"响应前200字节：{preview!r}"
+            )
+            raise RuntimeError(f"响应体不是 Excel 文件（magic bytes 校验失败: {magic!r}）")
+
+        # 3. Content-Disposition: attachment 校验（风控伪装拦截）
+        content_disp = response.headers.get("Content-Disposition", "")
+        if "attachment" not in content_disp:
+            self.logger.error(
+                f"[第{attempt}次] 响应头缺少 Content-Disposition: attachment，"
+                f"疑似风控拦截伪装。实际 Content-Disposition={content_disp!r}"
+            )
+            raise RuntimeError("响应头缺少 Content-Disposition: attachment（疑似风控拦截）")
+
+    def _parse_content_disposition_filename(self, content_disp_header):
+        """解析 Content-Disposition 文件名（UTF-8 与 GBK 双兼容，项目6增强）。
+
+        京东响应头两类文件名：
+            1. filename*=UTF-8''商品明细.xlsx（URL编码中文，项目5 商品明细）
+            2. filename=<UTF-8字节>（本项目商品流失分析：真实字节 UTF-8，charset=utf-8）
+               —— HTTP 头按 latin-1 解码成 U+00xx 字符，用 encode('latin-1') 还原字节后
+                  **UTF-8 优先解码**（个别接口可能 GBK 字节，做 GBK 回退双兼容）
+
+        返回:
+            str 或 None（无法解析）
+        """
+        if not content_disp_header:
+            return None
+
+        # ① filename*=UTF-8''...（URL 编码）
+        m = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", content_disp_header, re.IGNORECASE)
+        if m:
+            import urllib.parse
+            raw = m.group(1).strip().strip('"')
+            try:
+                return urllib.parse.unquote(raw)
+            except Exception:
+                return raw
+
+        # ② filename=...（真实字节为 UTF-8；个别接口可能 GBK，双兼容）
+        # ⚠️ 踩坑（2026-08-07 真实导出）：京东此接口 filename 字节是 UTF-8 编码
+        #   （header 声明 charset=utf-8），requests 按 latin-1 解码成 U+00xx 字符；
+        #   必须先 encode('latin-1') 还原字节，再 **UTF-8 优先**解码。
+        #   若按 GBK 解码会把 UTF-8 字节解成"鍟嗗搧..."乱码（此前真实导出踩坑）。
+        m = re.search(r"filename\s*=\s*\"?([^;\"]+)\"?", content_disp_header, re.IGNORECASE)
+        if m:
+            raw = m.group(1).strip()
+            # 还原 HTTP 层字节（latin-1 是 HTTP header 的传输编码）
+            try:
+                raw_bytes = raw.encode("latin-1")
+            except UnicodeEncodeError:
+                return raw   # 已含非 latin-1 字符（可能是已解码的中文），原样返回
+            # 优先 UTF-8（本项目真实场景）
+            try:
+                decoded = raw_bytes.decode("utf-8")
+                if "\ufffd" not in decoded:
+                    return decoded
+            except UnicodeDecodeError:
+                pass
+            # 回退 GBK（兼容个别接口用 GBK 字节）
+            try:
+                decoded = raw_bytes.decode("gbk")
+                if "\ufffd" not in decoded:
+                    return decoded
+            except UnicodeDecodeError:
+                pass
+            return raw
+        return None
+
+    # ---------- Excel 后置处理（xls 读取 → 转存 xlsx）----------
+
+    def _save_excel_to_path(self, response, target_path, date):
+        """Excel 后置处理（项目6 版：read_excel_bytes 自动识别 xlsx/xls）。
+
+        流程：
+            ① read_excel_bytes() 读取（xlsx 用 openpyxl / xls 用 xlrd）
+            ② prepare_date_columns() 日期列智能处理（公共规则1+2）
+            ③ safe_convert_numeric() 数值安全转换（公共规则3）
+            ④ 写入 .xlsx + apply_column_formats() 设置单元格格式
+        """
+        import warnings
+
+        # 抑制openpyxl读取原始xlsx时的无害警告
+        warnings.filterwarnings("ignore", message="Workbook contains no default style")
+
+        # ① 读取（自动识别 xlsx/xls）
+        df = read_excel_bytes(response.content)
+
+        # ②③ 日期列统一处理（公共规则1+2）
+        date_column, date_value = prepare_date_columns(df, date)
+
+        # ④ 全表数值安全转换（公共规则3）
+        df = safe_convert_numeric(df)
+
+        # ⑤ 写入 .xlsx（转存格式，统一用 openpyxl 引擎）+ 单元格格式
+        df.to_excel(target_path, index=False, engine="openpyxl")
+        apply_column_formats(target_path, df, date_column=date_column, date_value=date_value)
+
+        self.logger.info(
+            f"Excel已保存: {target_path}（xls→xlsx转存+日期列+数值转换+单元格格式，{os.path.getsize(target_path)}字节）"
+        )
+        return target_path
+
+    # ---------- 主下载方法 ----------
+
+    def download_loss_product(self, date=None, start_date=None, end_date=None):
+        """下载商品流失分析报表（POST 请求，xls 响应转存 xlsx）。
+
+        参数:
+            date        - 查询日期 YYYY-MM-DD（入参优先，其次 config）
+            start_date  - 开始日期（默认=date）
+            end_date    - 结束日期（默认=date）
+        返回:
+            str - 保存的 Excel 文件绝对路径（output/商品流失分析/{date}/ 子目录）
+        """
+        # 1. 解析日期（入参 > config；三值一致规则）
+        date, start_date, end_date = self._get_date_params(date, start_date, end_date)
+
+        # 2. 组装业务参数（固定常量 + 日期）
+        form_params = {
+            "date": date,
+            "startDate": start_date,
+            "endDate": end_date,
+            **self.FIXED_BIZ_PARAMS,
+        }
+
+        # 3. 必带请求头（业务约束：Origin/Referer 缺失被拦截）
+        # 注意：Sec-Fetch-Site=same-origin（与项目5 相同，覆盖基类默认 same-site）
+        extra_headers = {
+            "Origin": self.ORIGIN,
+            "Referer": self.REFERER,
+            "Sec-Fetch-Site": "same-origin",
+        }
+
+        # 4. 发送请求（重试循环 + UA切换 + 风控识别 + 响应校验 + success标记）
+        response = None
+        last_exception = None
+        success = False   # 阶段4 修复：只有 break 才算成功，防误保存错误内容
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                # 4.1 严格间隔控制（与基类一致）
+                self._wait_interval()
+
+                # 4.2 重新生成风控参数（每次新 uuid + 新时间戳 + 新签名）
+                risk_params = self._gen_risk_params_random(self.API_URL)
+                full_params = {**form_params, **risk_params}
+
+                ua_name = "Edge" if self._current_ua_index == 0 else "Chrome"
+                self.logger.info(
+                    f"[第{attempt}/{self.MAX_RETRIES}次] 下载商品流失分析报表: "
+                    f"日期={date}, UA={ua_name}, uuid={risk_params['uuid'][:8]}..."
+                )
+
+                # 记录请求时间（类属性：所有实例共享）
+                JDBaseRequest._last_request_time = time.time()
+
+                # 4.3 发送 POST 请求（表单，同项目4）
+                response = self.session.post(
+                    self.API_URL,
+                    data=full_params,
+                    headers=extra_headers,
+                    timeout=self.REQUEST_TIMEOUT,
+                )
+
+                # 4.4 HTTP 状态码基础检查
+                if response.status_code == 401:
+                    self.logger.error("HTTP 401 未授权 - Cookie 可能已过期或被禁用")
+                    raise CookieExpiredError("Cookie已过期或无效，请更新 config/cookie.txt")
+                if response.status_code == 403:
+                    self.logger.error("HTTP 403 禁止访问 - Cookie/签名/Origin 校验失败")
+                    # 不抛 CookieExpired，让重试机制 + UA 切换兜底
+
+                # 4.5 风控业务码识别
+                self._check_business_code(response)
+
+                # 4.6 响应校验（xls/xlsx 双魔数 + Content-Disposition）
+                self._validate_excel_response(response, attempt)
+
+                # 4.7 走到这里 = 成功
+                self.logger.info(
+                    f"请求成功: HTTP {response.status_code}, {len(response.content)}字节, "
+                    f"Content-Disposition={response.headers.get('Content-Disposition', '')[:60]}"
+                )
+                success = True
+                break
+
+            except CookieExpiredError:
+                raise
+            except RiskControlError:
+                raise
+            except requests.exceptions.Timeout as e:
+                last_exception = e
+                self.logger.warning(f"第{attempt}次请求超时（{self.REQUEST_TIMEOUT}秒）")
+            except Exception as e:
+                last_exception = e
+                self.logger.warning(f"第{attempt}次请求失败: {e}")
+
+            # 4.8 重试间隔：UA 切换 + 递增等待
+            if attempt < self.MAX_RETRIES:
+                self._switch_ua()
+                wait_seconds = self.REQUEST_INTERVAL * attempt
+                self.logger.info(
+                    f"等待 {wait_seconds}秒 后重试（已切换UA，当前: "
+                    f"{'Edge' if self._current_ua_index == 0 else 'Chrome'}）..."
+                )
+                time.sleep(wait_seconds)
+
+        # 4.9 重试全部失败：上报（success 标记兜底，防误保存）
+        if not success:
+            self.logger.error(f"所有 {self.MAX_RETRIES} 次重试均失败")
+            raise RuntimeError(
+                f"商品流失分析报表下载失败：{last_exception}（请检查Cookie/网络/风控）"
+            ) from last_exception
+
+        # 5. 解析 Content-Disposition 原始文件名（GBK/UTF-8 双兼容）
+        content_disp = response.headers.get("Content-Disposition", "")
+        original_filename = self._parse_content_disposition_filename(content_disp)
+
+        if not original_filename:
+            # 兜底：无法解析时用友好命名
+            self.logger.warning(
+                f"无法从 Content-Disposition 解析文件名（头={content_disp[:80]!r}），使用兜底命名"
+            )
+            original_filename = f"商品流失分析_{date}.xls"
+
+        # 6. 转存格式：.xls → .xlsx（统一输出 xlsx，内容已由 _save_excel_to_path 转换）
+        if original_filename.lower().endswith(".xls"):
+            original_filename = original_filename[:-4] + ".xlsx"
+
+        # 7. 构造业务子目录路径：output/商品流失分析/{date}/{filename}
+        date_subdir = os.path.join(self.OUTPUT_SUBDIR, date)
+        business_output_dir = os.path.join(self.output_dir, date_subdir)
+        os.makedirs(business_output_dir, exist_ok=True)
+        target_path = os.path.join(business_output_dir, original_filename)
+
+        # 8. Excel 后置处理（xls 读取 → 转存 xlsx）
+        return self._save_excel_to_path(response, target_path, date)
+
+
+# ============================================================
 #  业务注册中心（BUSINESS_REGISTRY）
 # ------------------------------------------------------------
 #  中文说明（小白必读）：
@@ -2026,6 +2437,17 @@ BUSINESS_REGISTRY = {
             "second": "二级类目ID（默认999999=全类目）",
             "third": "三级类目ID（默认空=不限）",
             "channel": "渠道ID（默认99=全部渠道）",
+        },
+    },
+    # 业务：商品流失分析（2026-08-07 上线，POST 请求，xls 响应转存 xlsx）
+    "商品流失分析": {
+        "api_class": LossProductAPI,
+        "method": "download_loss_product",
+        "desc": "商品流失分析（竞争-竞争流失-商品流失，POST导出，xls转存xlsx，output/商品流失分析/{date}/）",
+        "params": {
+            "date": "查询日期YYYY-MM-DD（入参或config）",
+            "startDate": "开始日期（默认=date）",
+            "endDate": "结束日期（默认=date）",
         },
     },
 }
