@@ -201,6 +201,32 @@ def prepare_date_columns(df, date):
     return "日期", date_str
 
 
+def build_business_output_path(output_dir, filename, date):
+    """按业务模块+日期子文件夹构造Excel保存路径（AGENTS.md Excel规则4）。
+
+    目录规则：output/{业务模块}/{date}/{filename}
+        业务模块名 = 文件名去掉 "_{date}.xlsx" 后缀的主体
+        （如 搜索流量_2026-07-29.xlsx → 业务模块"搜索流量"）
+    例：output/搜索流量/2026-07-29/搜索流量_2026-07-29.xlsx
+
+    入参:
+        output_dir - 全局输出目录（output/）
+        filename   - 保存文件名（含 {date} 与 .xlsx 后缀）
+        date       - 查询日期（YYYY-MM-DD）
+    出参:
+        最终保存的完整路径（子目录不存在会自动创建）
+    """
+    # 提取业务模块名：去掉 "_{date}.xlsx" 后缀即为主体名
+    stem = filename
+    suffix = f"_{date}.xlsx"
+    if stem.endswith(suffix):
+        stem = stem[: -len(suffix)]
+
+    business_dir = os.path.join(output_dir, stem, date)
+    os.makedirs(business_dir, exist_ok=True)
+    return os.path.join(business_dir, filename)
+
+
 def safe_convert_numeric(df):
     """全表数值安全转换（所有报表复用，全局生效）。
 
@@ -417,6 +443,12 @@ class JDBaseRequest:
         self.cookie_str = self._read_cookie()
         self.logger = self._init_logger()
         self.logger.info(f"签名盐值: {self.SIGN_SALT}")
+
+        # 风控指纹字段 wlfstk_smdl 处理（AGENTS.md 京东接口风控相关参数归档）：
+        # 非强制必选字段 → 缺失仅输出警告日志，禁止抛异常/中断导出；
+        # 仅当出现 403/601 风控拦截时才需补齐此字段。
+        if "wlfstk_smdl" not in self.cookie_str:
+            self.logger.warning("⚠️ 缺失 wlfstk_smdl（风控指纹字段，本次导出未受影响，备用提示）")
 
         # Session
         self.session = requests.Session()
@@ -914,7 +946,8 @@ class ProductFlowAPI(JDBaseRequest):
         df = safe_convert_numeric(df)
 
         # ⑤ 写入Excel → 按列名规则设置单元格格式（日期列/订单编号@/SKU·SPU数值0位小数）
-        file_path = os.path.join(self.output_dir, filename)
+        # 输出目录规则（AGENTS.md Excel规则4）：output/{业务模块}/{date}/{filename}
+        file_path = build_business_output_path(self.output_dir, filename, date)
         df.to_excel(file_path, index=False, engine="openpyxl")
         apply_column_formats(file_path, df, date_column=date_column, date_value=date_value)
 
@@ -1335,7 +1368,8 @@ class OfflineChannelAPI(JDBaseRequest):
         df = safe_convert_numeric(df)
 
         # ⑤ 写入Excel + 单元格格式
-        file_path = os.path.join(self.output_dir, filename)
+        # 输出目录规则（AGENTS.md Excel规则4）：output/{业务模块}/{date}/{filename}
+        file_path = build_business_output_path(self.output_dir, filename, date)
         df.to_excel(file_path, index=False, engine="openpyxl")
         apply_column_formats(file_path, df, date_column=date_column, date_value=date_value)
 

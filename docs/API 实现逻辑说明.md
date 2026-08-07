@@ -195,6 +195,10 @@ run_business(["商品流量来源_搜索", "商品流量来源_推荐"], date="2
 4. 写入Excel + `apply_column_formats()`：日期列真实datetime+`yyyy/m/d`（带时间用`yyyy/m/d hh:mm:ss`）；订单编号`@`文本；SKU/SPU数值`0`位小数
 5. 保存到 output/ 目录
 
+**输出目录规则（规则4）**：按业务模块建文件夹 + 日期子文件夹
+- `output/{业务模块}/{date}/{文件名}`，如 `output/搜索流量/2026-08-01/搜索流量_2026-08-01.xlsx`
+- 业务模块名 = 文件名去掉 `_{date}.xlsx` 后缀的主体（公共函数 `build_business_output_path()` 统一构造）
+
 **落地实例（2026-08-07）**：
 - 商品明细导出（原表自带【时间】列）→ 不再插入【日期】列，仅标准化【时间】列为 `2026/7/29`
 - 店铺来源-三级渠道（原表自带【时间】列）→ 同上，消除冗余
@@ -345,7 +349,7 @@ done
 - 每次重试前切换 UA（Edge ↔ Chrome）
 
 ### 输出
-- 文件名：`店铺来源_三级渠道_YYYY-MM-DD.xlsx`（保存到 `output/`）
+- 文件名：`店铺来源_三级渠道_YYYY-MM-DD.xlsx`（保存到 `output/店铺来源_三级渠道/{date}/` 子目录，AGENTS.md Excel规则4）
 - Excel 后置处理：复用基类 `_save_flow_excel`（日期列插入 / 数值安全转换 / 单元格格式）
 
 ### 与项目1-3 的核心差异汇总
@@ -487,7 +491,7 @@ python main.py --biz_key "商品明细导出" --date "2026-08-07" --second "1234
 | 业务参数 | 12 项表单 | **7 项 query**（type/categoryType/downloadType/second/third/channel/isMonitored）|
 | 响应校验 | magic 字节 | **Content-Disposition attachment + magic 字节双重校验** |
 | 文件名 | 代码固定拼接 | **从 Content-Disposition 解析原始名** |
-| 保存目录 | output/ 根目录 | **output/商品明细/{date}/ 子目录** |
+| 保存目录 | output/店铺来源_三级渠道/{date}/ 子目录 | **output/商品明细/{date}/ 子目录** |
 | 601 处理 | 阶段4 同步修复为不重试 | **不重试（RiskControlError）** |
 
 ### 变更记录
