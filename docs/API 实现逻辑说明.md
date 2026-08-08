@@ -690,6 +690,25 @@ python main.py --list
 # 阶段4/5 才会包装成 --biz_key 一键调度
 ```
 
+### atoms-api.jd.com 备用 list 路径（2026-08-07 归档，备用未启用）
+
+⚠️ **本节为备用路径技术细节**，当前主线仍用 jzt-api list（GET，真实跑通已验证）。后续如 jzt-api 接口变更/限流，可启用 atoms-api 作为替代。
+
+| 项目 | 详情 |
+|------|------|
+| **URL** | `https://atoms-api.jd.com/api/download/common/asyn/download/reportInfo/list` |
+| **方法** | **POST**（与 jzt-api list 的 GET 不同）|
+| **请求体** | `{page, pageSize, startDay, endDay, nameLike, type}`，type=9 = 快车自定义报表 |
+| **专属头** | `loginMode=0`、`language=zh_CN`、`Origin: https://jzt.jd.com`（与 jzt-api 不同域）|
+| **响应顶层** | `code:1` + `data.datas[]`（**注意是 `datas` 不是 `data`**）+ `data.paginator{}` |
+| **状态机** | `status:2` + `statusText:"报表已生成"` + `progress:100` |
+| **下载URL** | ✅ **直接含 `downloadUrl`**（省掉 downloadById 这步）|
+| **额外字段** | `logId`（与 id 不同，jzt-api 不返回）/ `createdTime` / `errorMsg` |
+
+**为何不替换主线**：① add/downloadById/OSS 下载链路均走 jzt-api，list 统一可减少切换成本；② 真实跑通已验证 jzt-api list + downloadById 可用；③ atoms-api 虽省 downloadById 一步，但需补专属头 + `datas vs data` 字段映射差异，反而增加代码复杂度。
+
+**启用步骤（待用户决定时）**：加 `use_atoms_api: bool = False` 参数 → 加 `get_task_list_atoms()` 方法（POST + loginMode 头）→ `_handle_response` 增加 status==2+statusText+progress 多字段判定 → `download_report` 优先用返回的 downloadUrl。
+
 ### 阶段3 验证结论
 | 项 | 结果 |
 |------|------|

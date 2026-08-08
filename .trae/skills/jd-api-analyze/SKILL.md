@@ -784,12 +784,47 @@ python main.py --list
 5. **不写 uuid**：京准通域未校验 uuid 字段（已抓包确认），不要画蛇添足
 6. **payload 不要硬编码到 .env**：业务参数体量大放代码内常量更易维护，模板变更在代码内改
 
+### atoms-api.jd.com 备用 list 路径（2026-08-07 归档，备用未启用）
+
+⚠️ **本节是备用路径技术细节**，当前主线仍用 jzt-api list（避免破坏现有真实跑通链路）。后续如 jzt-api 接口变更/限流，可启用 atoms-api 作为替代。
+
+| 项目 | 详情 |
+|------|------|
+| **URL** | `https://atoms-api.jd.com/api/download/common/asyn/download/reportInfo/list` |
+| **方法** | POST（与 jzt-api 的 GET 不同） |
+| **请求体** | `{page, pageSize, startDay, endDay, nameLike, type}` |
+| **专属头** | `loginMode=0`、`language=zh_CN`（需额外添加） |
+| **type 取值** | 9 = 快车自定义报表 |
+| **响应顶层** | `code:1, data.datas[], data.paginator{}`（注意是 `datas` 不是 `data`）|
+| **状态机** | `status:2` + `statusText:"报表已生成"` + `progress:100` |
+| **下载URL** | ✅ **直接含 `downloadUrl`**（省掉 downloadById 这步） |
+| **额外字段** | `logId`（与 id 不同，jzt-api 不返回）/ `createdTime` / `errorMsg` |
+
+#### 为什么不用 atoms-api 作为主线
+- 主线 add / downloadById / OSS 下载链路都走 jzt-api，list 也统一用 jzt-api 减少切换成本
+- 真实跑通已验证 jzt-api list + downloadById 链路可工作
+- atoms-api 备用路径**省 downloadById 一步**是优点，但需补专属头（loginMode=0）+ 字段映射差异（datas vs data）反而增加代码复杂度
+
+#### 启用 atoms-api 作为备用的实施步骤（待用户决定时）
+1. 在 `JZTKuaicheAPI` 加 `use_atoms_api: bool = False` 参数
+2. 加 `get_task_list_atoms()` 方法（POST + loginMode 头）
+3. `_handle_response` 增加 status==2+statusText+progress 多字段判定
+4. `download_report` 优先用 atoms-api 返回的 downloadUrl，省掉 downloadById 调用
+
+#### 历史覆盖说明
+2026-08-07 之前跨会话记录中曾提到"list走 atoms-api、OSS 走 storage.jd.com"——这部分**已被实证推翻**：
+- 真实 jzt-api 的 list 接口（**GET**）虽字段少但能用
+- 真实 downloadById 接口返回 urlCsv（OSS预签名链接）
+- atoms-api 路径仅作为**备用**归档，**不**替换主线
+
 ---
 
 ## 八、迭代更新记录（时间倒序）
 
 | 日期 | 改动概要 |
 |------|----------|
+| 2026-08-07 | **京准通快车自定义报表项目端到端跑通（阶段8-9，commit `39a7b68`）**：① 完整链路 add→list→downloadById→GET urlCsv 真实跑通，下载成功 218054 字节 CSV 文件（468行×50列，含日期/产品线/计划/展现/点击/花费/订单等）；② 阶段8 真实发现：list 响应字段是 `id/subscribeState/data.data[]`（双层嵌套），不含 downloadUrl；③ 阶段8 新增 downloadById 接口（`GET .../downloadById?id=...&name=...&fileName=...&startDay=...&endDay=...&pin=...`），返回 JSON 含 `urlCsv`（OSS预签名链接）；④ 阶段9 真实发现 **OSS 预热延迟 ~10 秒**（前3 次 urlCsv GET 返回 404 NoSuchKey，第4 次才成功），新增重试机制：404 → 等3秒 → 重调 downloadById 拿新 urlCsv → 再试（最多 MAX_DOWNLOAD_RETRY+1=4 次）；⑤ **list 字段映射修复**：`reportId → id`、`status字符串 → subscribeState int`、`records → data`；⑥ 新增 `SUBSCRIBE_STATE_OK=0`、`SUBSCRIBE_STATE_FAIL=-1` 类常量（订阅状态码，待用户补抓包确认语义）；⑦ `_handle_response` 升级双字段判定：`success=true 且 code∈{0,1}` 视为成功（京准通 add 用 code=1）；⑧ `create_export_task()` 签名适配调度层：`def create_export_task(date=None, start_date=None, end_date=None)` 三值一致规则；⑨ `data` 字段双格式兼容：`isinstance(data, dict)` 分支（add 有时返 dict、有时返 int reportId）；⑩ **报表名紧凑格式**：`YYYYMMDD_YYYYMMDD_HHMM`（22 字符 ≤30，避开「报表名长度1-30字符」限制）+ HHMM 后缀避免重名；⑪ payload 时间戳修复：`startTime/endTime` 改 13 位毫秒戳 + `startTimeStr/endTimeStr` 保留日期字符串；⑫ `checkSum: 1114112` 硬编码 + 运行时打印 `checkSum` 值便于人工比对 + 预案注释用 page.evaluate() 提取真实值；⑬ payload 扩为完整版（caliberSettings / customDimension 5维 / customDimensionOptions 11账号 / customIndex 6大类 / customIndexOptions 元模板 / sortedKeys 全集 / timeout）；⑭ **下载链路删 CDN 403 重试旧假设**（downloadUrl 一次性签名是错的，实际是同域 API），新增 OSS 预热重试；⑮ **新增 mock 单测 41 个全过**：含毫秒戳/checkSum/双字段/报表名/404重试/双层嵌套；⑯ **🛡️ 重大安全修复**：`.gitignore` 第3 行"同注释"导致 `jzt_cookie.txt` 未被忽略（returncode=1）—注释独立行后才正确忽略（returncode=0），避免 Cookie 误提交泄露；⑰ 真实跑通产物：`output/京准通快车/22134301_download.csv`（218KB）|
+| 2026-08-07 | **`atoms-api.jd.com` 备用 list 路径确认（2026-08-07 实证抓包）**：① POST `https://atoms-api.jd.com/api/download/common/asyn/download/reportInfo/list`，body=`{page,pageSize,startDay,endDay,nameLike,type}`，type=9 表示快车自定义报表；② 响应 `code:1` + `data.datas[]`（注意是 `datas` 不是 `data`），每条记录含 `downloadUrl/status/statusText/progress/logId/createdTime/startDay/endDay/errorMsg` 等丰富元数据；③ **状态机清晰**：`status:2` + `statusText:"报表已生成"` + `progress:100`；④ **直接含 downloadUrl**（OSS 预签名链接）；⑤ 需要专属头：`loginMode=0`、`language=zh_CN`、`Origin: https://jzt.jd.com` 等（与 jzt-api 不同域）；⑥ **决策（2026-08-07）保持 jzt-api list 为主线**（避免破坏现有真实跑通链路），atoms-api 作为**备用路径归档待用**；⑦ 用户决策：补 atoms 专属头仅在备用路径启用时启用，不预先写入代码（避免无意义代码）|
 | 2026-08-07 | **京准通快车自定义报表项目上线骨架（第8 业务）**：① 新增 `JZTKuaicheAPI` 类（**不继承 JDBaseRequest**，业务模型差异大）；③ 接口 3 个：POST `/add` 创建任务 / GET `/list` 查询列表 / CDN 下载 `downloadUrl`；② Cookie 走**独立文件** `config/jzt_cookie.txt`（与商智/京麦 Cookie 不互通）；③ **h5st 通过 `__init__(h5st=...)` 外部传入**，脚本不实现 JS 签名（复杂度高）；④ payload 用类内常量 `JZT_KUAICHE_PAYLOAD_TEMPLATE`（18 字段最少版）；⑤ **不写 uuid**（京准通域抓包确认未校验）；⑥ **禁用基类 UA 切换**（UA 与 h5st 绑定）；⑦ 业务码 601 提示「请重新抓 h5st」；⑧ BUSINESS_REGISTRY 第8业务；⑨ AST 语法+类方法归属+注册表+payload 时间字段注入 5 项验证全过；⑩ SKILL.md 京准通分区填首条记录（模块定位+架构差异对照） |
 | 2026-08-07 | **商品流失分析项目上线（5 阶段交付，第 7 业务）**：① 新增 `LossProductAPI` 类（继承 `JDBaseRequest`），**POST 表单**（`sz.jd.com/sz/api/competitionAnalysis/exportLossProList.ajax`，Sec-Fetch-Site=same-origin）；② 业务参数 8 项表单（date/startDate/endDate 可变；indChannel=99/unitType=0 固定经用户确认固化）；③ 固定业务参数 `indChannel=99`、`unitType=0`；④ **首次处理 .xls 响应**：新增公共函数 `read_excel_bytes()` 按魔数自动识别 xlsx（`PK\x03\x04`，openpyxl）与 xls（`\xD0\xCF\x11\xE0`，xlrd 引擎，需 xlrd>=2.0.1）；⑤ 响应校验升级**双魔数**（xls/xlsx 任一）+ Content-Disposition attachment；⑥ 保存为 xls 读取 → 转存 .xlsx，落 `output/商品流失分析/{date}/` 子目录；⑦ **阶段5 真实导出发现 filename 为 UTF-8 字节**（charset=utf-8，非 GBK）：修复 `_parse_content_disposition_filename` 为 **UTF-8 优先 + GBK 回退**（此前按 GBK 解码产生"鍟嗗搧"乱码），4 场景验证 4/4 通过，真实导出文件名正常；⑧ 阶段4 容错与项目4/5 对齐（601 不重试 RiskControlError / success 标记 / 双魔数校验）；⑨ mock 单测 30/30 通过；⑩ 入口：`python main.py --biz_key "商品流失分析" --date "2026-08-05"` |
 | 2026-08-07 | 商智模块业务定位更新：商智域含 szgateway.jd.com（POST 接口）与 sz.jd.com（GET/POST 导出接口），统一按项目编号归档 |
