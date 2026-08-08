@@ -2352,6 +2352,610 @@ class LossProductAPI(JDBaseRequest):
 
 
 # ============================================================
+#  业务接口 5：（新业务 - 京准通快车自定义报表导出，2026-08-07 上线骨架）
+# ------------------------------------------------------------
+#  中文说明（小白必读）：
+#    京准通 jzt.jd.com 广告报表导出，与商智/京麦 Cookie 不互通，必须独立 Cookie 文件。
+#    ⚠️ 核心差异（与项目1-6对比）：
+#      - 鉴权用 h5st（请求头），不是商智域 User-mnp/uuid 体系
+#      - 三步异步：创建任务 → 轮询列表 → CDN 下载 CSV
+#      - downloadUrl 一次性签名，过期需重新轮询刷新
+#    本阶段（阶段3骨架）：
+#      - 仅 3 个接口方法，不做轮询循环/Excel 解析（阶段5再补）
+#      - 不实现 h5st 算法，__init__ 接收外部传入
+#      - 不写 uuid 字段（京准通域未校验，已抓包确认）
+# ============================================================
+
+# 京准通快车自定义报表 payload 模板（最小字段版）
+# ⚠️ 业务参数大部分固定，仅时间字段动态替换；完整模板放代码外延后迭代再引入
+JZT_KUAICHE_PAYLOAD_TEMPLATE = {
+    # 完整 payload 模板（2026-08-07 抓包实证，含 6 大模块 + 元模板）
+    # ⚠️ 注意：若接口报参数错误，可能：
+    #   1. checkSum 是页面 JS 动态计算（故障排查：用真实浏览器 page.evaluate() 提取原始 payload 比对）
+    #   2. 当前账户在 customDimensionOptions 中未勾选（默认 FYA8888 已 checked:True）
+    #   3. h5st 校验（当前 add 接口不校验，但其他接口可能校验，靠 window.ParamsSign.sign 实时生成）
+    "caliberSettings": [
+        {"checked": True, "desc": "转化周期：平台建议选择15天/30天转化周期进行数据观测", "hidden": False,
+         "key": "clickOrOrderDay",
+         "options": [
+            {"checked": False, "desc": "当天", "hidden": False, "key": "today", "value": "0"},
+            {"checked": False, "desc": "1天", "hidden": False, "key": "oneDay", "value": "1"},
+            {"checked": False, "desc": "3天", "hidden": False, "key": "threeDays", "value": "3"},
+            {"checked": False, "desc": "7天", "hidden": False, "key": "sevenDays", "value": "7"},
+            {"checked": True, "desc": "15天", "hidden": False, "key": "fifteenDays", "value": "15"},
+            {"checked": False, "desc": "30天", "hidden": False, "key": "thirtyDays", "value": "30"},
+         ]},
+        {"checked": True, "desc": "点击/下单口径", "hidden": False, "key": "clickOrOrderCaliber",
+         "options": [
+            {"checked": True, "desc": "点击", "hidden": False, "key": "click", "value": "0"},
+            {"checked": False, "desc": "下单", "hidden": False, "key": "order", "value": "1"},
+         ]},
+        {"checked": True, "desc": "含赠品/不含赠品", "hidden": False, "key": "giftFlag",
+         "options": [
+            {"checked": False, "desc": "含赠品", "hidden": False, "key": "include"},
+            {"checked": True, "desc": "不含赠品", "hidden": False, "key": "exclude", "value": "0"},
+         ]},
+        {"checked": True, "desc": "下单订单/成交订单", "hidden": False, "key": "orderStatusCategory",
+         "options": [
+            {"checked": False, "desc": "下单订单", "hidden": False, "key": "place"},
+            {"checked": True, "desc": "成交订单", "hidden": False, "key": "done"},
+         ]},
+    ],
+    # ⚠️ checkSum 用户决策 2026-08-07：现阶段硬编码 1114112；后续若接口报错可能是页面 JS 动态计算
+    "checkSum": 1114112,
+    "customDimension": [
+        {"checked": False, "desc": "基础维度", "hidden": False, "key": "basicDimension",
+         "options": [
+            {"checked": False, "desc": "账户名称", "groupLabel": "basicDimension", "hidden": False, "key": "pin"},
+            {"checked": True, "desc": "产品线", "groupLabel": "basicDimension", "hidden": False, "key": "businessType"},
+            {"checked": True, "desc": "推广计划", "groupLabel": "basicDimension", "hidden": False, "key": "campaign"},
+            {"checked": True, "desc": "推广单元/品类", "groupLabel": "basicDimension", "hidden": False, "key": "group", "tip": ""},
+            {"checked": False, "desc": "推广创意/商品", "groupLabel": "basicDimension", "hidden": False, "key": "ad", "tip": "智能投放查询的是推广商品信息；其他产品线查询的是推广创意信息"},
+         ]},
+        {"checked": False, "desc": "细分维度", "hidden": False, "key": "detailDimension",
+         "options": [
+            {"checked": True, "desc": "营销目标", "hidden": False, "key": "marketingObjectiveName"},
+            {"checked": True, "desc": "营销场景", "hidden": False, "key": "marketingScenarioTypeName"},
+            {"checked": True, "desc": "搜索词", "hidden": False, "key": "searchTerm", "tip": "搜索词查询结果明细数据"},
+            {"checked": True, "desc": "关键词", "hidden": False, "key": "keyword", "tip": "关键词查询结果明细数据"},
+            {"checked": True, "desc": "关键词购买类型", "hidden": False, "key": "targetingType"},
+            {"checked": True, "desc": "商品定向细分类型", "hidden": False, "key": "productDeliveryMatchingType", "tip": "商品定向细分类型包含：商品定向、类目定向、店铺定向、相似品定向、搭配品定向"},
+            {"checked": True, "desc": "定向目标", "hidden": False, "key": "productDeliveryTriggerSkuId", "tip": "定向目标为商品定向下触发广告的id，其触发条件可能是sku、店铺id等"},
+            {"checked": True, "desc": "广告定向方式", "hidden": False, "key": "deliveryType", "tip": "1.智能投放暂不支持关键词定向查询；2.人群定向类型指通过圈定特定人群"},
+            {"checked": True, "desc": "投放地域", "hidden": False, "key": "mappedAreaName", "tip": "投放地域是指广告实际展现的地域"},
+            {"checked": True, "desc": "跟单SKU", "hidden": False, "key": "skuDocId", "tip": "对于落地页为活动页、店铺页类广告"},
+            {"checked": True, "desc": "SPU ID", "hidden": False, "key": "spuId", "tip": "SPU维度不是广告跟单所使用维度"},
+            {"checked": False, "desc": "品牌", "hidden": False, "key": "promotedBrand", "tip": "品牌是根据推广SKU或跟单SKU关联的信息"},
+            {"checked": False, "desc": "类目", "hidden": False, "key": "promotedCid", "tip": "类目是根据推广SKU或跟单SKU关联的三级类目信息"},
+            {"checked": True, "desc": "投放位置", "hidden": False, "key": "trafficPackage", "tip": "推荐广告查询的是流量包信息"},
+            {"checked": False, "desc": "人群名称", "hidden": False, "key": "crowdDimension", "tip": "搜索快车所查询的是搜索人群明细"},
+         ]},
+    ],
+    # customDimensionOptions：账号范围 + 产品线 + 营销目标 + 广告定向类型（抓包原貌）
+    "customDimensionOptions": [
+        {"checked": False, "desc": "账号范围", "hidden": False, "key": "pin",
+         "options": [
+            {"checked": False, "desc": "自有账户", "hidden": False, "key": "subUser",
+             "options": [
+                {"checked": True, "desc": "FYA8888", "flag": True, "hidden": False, "key": "99936530475", "value": "FYA8888"},
+                {"checked": False, "desc": "FYA888888", "flag": False, "hidden": False, "key": "99936525688", "value": "FYA888888"},
+                {"checked": False, "desc": "FAY掌柜888", "flag": False, "hidden": False, "key": "99937142699", "value": "FAY掌柜888"},
+                {"checked": False, "desc": "FYA19529975351", "flag": False, "hidden": False, "key": "99938531397", "value": "FYA19529975351"},
+                {"checked": False, "desc": "fya掌柜777", "flag": False, "hidden": False, "key": "99938957251", "value": "fya掌柜777"},
+                {"checked": False, "desc": "FYA小婷", "flag": False, "hidden": False, "key": "99938963919", "value": "FYA小婷"},
+                {"checked": False, "desc": "FYA少冰", "flag": False, "hidden": False, "key": "99945916633", "value": "FYA少冰"},
+                {"checked": False, "desc": "FYA小冠", "flag": False, "hidden": False, "key": "99947097388", "value": "FYA小冠"},
+                {"checked": False, "desc": "FYA布丁", "flag": False, "hidden": False, "key": "99952884963", "value": "FYA布丁"},
+                {"checked": False, "desc": "FYA小柔", "flag": False, "hidden": False, "key": "99955522890", "value": "FYA小柔"},
+                {"checked": False, "desc": "FYA小敏", "flag": False, "hidden": False, "key": "99960125485", "value": "FYA小敏"},
+             ]},
+            {"checked": False, "desc": "授权账户", "hidden": False, "key": "authUser"},
+         ]},
+        {"checked": False, "desc": "产品线", "hidden": False, "key": "businessType",
+         "options": [
+            {"checked": False, "desc": "快车", "hidden": False, "key": "kuaiche", "value": "-4"},
+            {"checked": False, "desc": "站外广告", "hidden": False, "key": "zhitou", "tip": "站外广告数据包含原京东直投+京易投数据", "value": "256"},
+         ]},
+    ],
+    "customIndex": [
+        {"checked": False, "desc": "基础数据", "hidden": False, "key": "basicData",
+         "tip": "为广告基础投放数据，用于分析广告投放的基础表现",
+         "options": [
+            {"checked": True, "desc": "展现数", "hidden": False, "key": "impressions"},
+            {"checked": True, "desc": "点击数", "hidden": False, "key": "clicks"},
+            {"checked": True, "desc": "点击率(%)", "hidden": False, "key": "CTR"},
+            {"checked": True, "desc": "花费", "hidden": False, "key": "cost"},
+            {"checked": True, "desc": "千次展现成本", "hidden": False, "key": "CPM"},
+            {"checked": True, "desc": "平均点击成本", "hidden": False, "key": "CPC"},
+         ]},
+        {"checked": False, "desc": "转化数据", "hidden": False, "key": "resultData",
+         "tip": "为通过广告获得的用户后链路指标",
+         "options": [
+            {"checked": True, "desc": "直接订单行", "hidden": False, "key": "directOrderCnt"},
+            {"checked": True, "desc": "直接订单金额", "hidden": False, "key": "directOrderSum"},
+            {"checked": True, "desc": "间接订单行", "hidden": False, "key": "indirectOrderCnt"},
+            {"checked": True, "desc": "间接订单金额", "hidden": False, "key": "indirectOrderSum"},
+            {"checked": True, "desc": "总订单行", "hidden": False, "key": "totalOrderCnt"},
+            {"checked": True, "desc": "总订单金额", "hidden": False, "key": "totalOrderSum"},
+            {"checked": True, "desc": "直接加购数", "hidden": False, "key": "directCartCnt"},
+            {"checked": True, "desc": "间接加购数", "hidden": False, "key": "indirectCartCnt"},
+            {"checked": True, "desc": "总加购数", "hidden": False, "key": "totalCartCnt"},
+            {"checked": True, "desc": "转化率(%)", "hidden": False, "key": "orderCVS"},
+            {"checked": True, "desc": "平均订单成本", "hidden": False, "key": "orderCPA", "tip": "直投的订单行成本就是CPA"},
+            {"checked": True, "desc": "投产比", "hidden": False, "key": "orderROI"},
+            {"checked": True, "desc": "预售订单行", "hidden": False, "key": "totalPresaleOrderCnt"},
+            {"checked": True, "desc": "预售订单金额", "hidden": False, "key": "totalPresaleOrderSum"},
+         ]},
+        # 转化数据[媒]、直播数据、订单效果数据、引流数据 元模板默认未勾选，与抓包一致
+        {"checked": False, "desc": "转化数据[媒]", "hidden": False, "key": "mediaResultData",
+         "tip": "为站外广告专属指标", "options": []},
+        {"checked": False, "desc": "直播数据", "hidden": False, "key": "liveData", "options": []},
+        {"checked": False, "desc": "订单效果数据", "hidden": False, "key": "orderData", "options": []},
+        {"checked": False, "desc": "引流数据", "hidden": False, "key": "drainageData", "options": []},
+    ],
+    # customIndexOptions 元模板（与 customIndex 结构对应，用于报表展示）
+    "customIndexOptions": [
+        {"checked": False, "desc": "基础数据", "hidden": False, "key": "basicData", "isIndex": True,
+         "tip": "为广告基础投放数据", "options": [
+            {"checked": False, "desc": "展现数", "hidden": False, "key": "impressions"},
+            {"checked": False, "desc": "点击数", "hidden": False, "key": "clicks"},
+            {"checked": False, "desc": "点击率(%)", "hidden": False, "key": "CTR"},
+            {"checked": False, "desc": "花费", "hidden": False, "key": "cost"},
+            {"checked": False, "desc": "千次展现成本", "hidden": False, "key": "CPM"},
+            {"checked": False, "desc": "平均点击成本", "hidden": False, "key": "CPC"},
+         ]},
+        {"checked": False, "desc": "转化数据", "hidden": False, "key": "resultData", "isIndex": True,
+         "tip": "用户后链路指标", "options": [
+            {"checked": False, "desc": "直接订单行", "hidden": False, "key": "directOrderCnt"},
+            {"checked": False, "desc": "直接订单金额", "hidden": False, "key": "directOrderSum"},
+            {"checked": False, "desc": "间接订单行", "hidden": False, "key": "indirectOrderCnt"},
+            {"checked": False, "desc": "间接订单金额", "hidden": False, "key": "indirectOrderSum"},
+            {"checked": False, "desc": "总订单行", "hidden": False, "key": "totalOrderCnt"},
+            {"checked": False, "desc": "总订单金额", "hidden": False, "key": "totalOrderSum"},
+            {"checked": False, "desc": "直接加购数", "hidden": False, "key": "directCartCnt"},
+            {"checked": False, "desc": "间接加购数", "hidden": False, "key": "indirectCartCnt"},
+            {"checked": False, "desc": "总加购数", "hidden": False, "key": "totalCartCnt"},
+            {"checked": False, "desc": "转化率(%)", "hidden": False, "key": "orderCVS"},
+            {"checked": False, "desc": "平均订单成本", "hidden": False, "key": "orderCPA", "tip": "直投的订单行成本就是CPA"},
+            {"checked": False, "desc": "投产比", "hidden": False, "key": "orderROI"},
+            {"checked": False, "desc": "预售订单行", "hidden": False, "key": "totalPresaleOrderCnt"},
+            {"checked": False, "desc": "预售订单金额", "hidden": False, "key": "totalPresaleOrderSum"},
+         ]},
+    ],
+    "daily": 1,
+    # sortedDimensionKeys / sortedIndexKeys 全集（与抓包一致）
+    "sortedDimensionKeys": [
+        "businessType", "campaign", "group", "marketingObjectiveName", "marketingScenarioTypeName",
+        "searchTerm", "keyword", "targetingType", "productDeliveryMatchingType",
+        "productDeliveryTriggerSkuId", "deliveryType", "mappedAreaName", "skuDocId", "spuId", "trafficPackage",
+    ],
+    "sortedIndexKeys": [
+        "impressions", "clicks", "CTR", "cost", "CPM", "CPC",
+        "directOrderCnt", "directOrderSum", "indirectOrderCnt", "indirectOrderSum",
+        "totalOrderCnt", "totalOrderSum", "directCartCnt", "indirectCartCnt", "totalCartCnt",
+        "orderCVS", "orderCPA", "orderROI", "totalPresaleOrderCnt", "totalPresaleOrderSum",
+    ],
+    "timeout": False,
+    "version": "JZT_V9",
+    "indexSign": 0,
+    "cycle": None,
+    "pinIdList": [],
+    "requestFrom": 0,
+}
+
+
+class JZTKuaicheAPI:
+    """京准通快车自定义报表导出 API（基础骨架，2026-08-07 上线）。
+
+    ⚠️ 本类**不继承 JDBaseRequest**（业务模型差异大）：
+        - 鉴权体系不同（h5st + 独立 Cookie 文件，不是商智 User-mnp/uuid）
+        - 异步三步流程（创建/轮询/下载），不适合基类 30秒重试模型
+        - UA 与 h5st 绑定，禁用基类 UA 切换（会致 h5st 失效）
+
+    参数:
+        h5st       - **可选**。浏览器抓 add 接口请求头复制（如有）。项目7 抓包实测 add 接口不校验 h5st 字段
+                      （与京麦 sff.jd.com 不同），但保留参数为后续接口（如未来 list/downloadUrl）增加 h5st 校验时使用
+        cookie_path - 京准通 Cookie 文件路径，默认 config/jzt_cookie.txt（与商智 Cookie 不互通）
+    """
+
+    # ---- 类常量（业务固定参数）----
+    BASE_URL = "https://jzt-api.jd.com/dataCenter/customreport/v2/report"
+    ORIGIN = "https://jzt.jd.com"
+    REFERER = "https://jzt.jd.com"
+    SITE_ID = "0"
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0"
+    )
+    OUTPUT_SUBDIR = "京准通快车"  # 落 output/京准通快车/{date}/ 子目录（AGENTS.md Excel规则4）
+
+    # ---- 阶段4 容错配置（用户决策 2026-08-07：POLL_INTERVAL=3s / MAX_POLL_TIMES=15）----
+    POLL_INTERVAL = 3            # 轮询间隔（秒），报表生成等待
+    MAX_POLL_TIMES = 15          # 轮询最大次数（3s × 15 = 45s 超时）
+    MAX_DOWNLOAD_RETRY = 3       # CDN 403 重试最大次数（重刷 URL 后指数退避）
+
+    # ---- 京东业务码约定（与项目4/5/6 对齐）----
+    # code=0 成功；code=601 h5st过期（不重试）；code=-407/-402 签名错（重试）；
+    # 业务码非0 且 message/msg 含"未登录/登录" → CookieExpiredError（不重试）
+
+    def __init__(self, h5st: str = "", cookie_path: str = "config/jzt_cookie.txt"):
+        """初始化京准通 API。
+
+        参数:
+            h5st       - 浏览器F12抓 add 接口请求头的 h5st 值（手动复制，脚本不实现 JS 签名）
+            cookie_path - 京准通 Cookie 文件路径（默认 config/jzt_cookie.txt；与商智 Cookie 不互通）
+        """
+        import requests  # 本类独立按需导入，避免污染顶层 namespace
+
+        # 1. 读取 Cookie（不存在即抛错，强制用户抓包填入）
+        cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
+        if not os.path.isfile(cookie_path_abs):
+            raise FileNotFoundError(
+                f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
+                f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt.jd.com 域 Cookie 写入此文件"
+            )
+        with open(cookie_path_abs, "r", encoding="utf-8") as f:
+            self.cookie = f.read().strip()
+        if not self.cookie:
+            raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
+
+        # 2. 接收 h5st（**可选**；阶段4 抓包实测 add 接口不校验 h5st，参数保留为未来扩展）
+        self.h5st = h5st or ""
+
+        # 3. requests Session（不继承基类 UA 切换逻辑，h5st 绑定 UA）
+        self.session = requests.Session()
+        session_headers = {
+            "User-Agent": self.USER_AGENT,
+            "Origin": self.ORIGIN,
+            "Referer": self.REFERER + "/",  # 抓包带尾斜杠，对齐
+            "siteId": self.SITE_ID,
+            "Content-Type": "application/json;charset=UTF-8",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Cookie": self.cookie,
+        }
+        # h5st 非空才注入（抓包实测多数 add 请求无 h5st 字段）
+        if self.h5st:
+            session_headers["h5st"] = self.h5st
+        self.session.headers.update(session_headers)
+
+        # 4. 输出路径（按 AGENTS.md Excel规则4：业务子目录 + 日期子目录）
+        self.output_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "output", self.OUTPUT_SUBDIR,
+        )
+
+    # ---- 公共方法：组装 payload（动态注入时间）----
+
+    def _build_payload(self, start_date: str, end_date: str) -> dict:
+        """深拷贝模板并注入查询时间（用户决策 2026-08-07）。
+
+        关键转换（2026-08-07 抓包实证）：
+            - startTime / endTime 必须是**毫秒时间戳**（如 1786161600000），不是日期字符串
+            - startTimeStr / endTimeStr 是日期字符串（"YYYY-MM-DD"），用于展示
+            - tempName / reportName 是报表名（含日期时间）
+
+        参数:
+            start_date - 开始日期 YYYY-MM-DD
+            end_date   - 结束日期 YYYY-MM-DD
+        返回:
+            dict - 完整 payload（含时间戳字段）
+        """
+        import copy
+        import json
+        from datetime import datetime, timezone, timedelta
+
+        payload = copy.deepcopy(JZT_KUAICHE_PAYLOAD_TEMPLATE)
+
+        # 1. 日期字符串 → 毫秒时间戳（北京时区 00:00:00）
+        # 抓包示例：1786161600000 = 2026-08-08 16:00:00 UTC = 2026-08-09 00:00:00 +08:00
+        # 注意：用户原抓包时间戳含时分秒（不是 00:00:00），本代码默认取 00:00:00；如需时分秒请扩展入参
+        tz_beijing = timezone(timedelta(hours=8))
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=tz_beijing)
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=tz_beijing)
+        start_ts = int(start_dt.timestamp() * 1000)  # 秒 → 毫秒
+        end_ts = int(end_dt.timestamp() * 1000)
+
+        # 2. 注入时间相关字段
+        # ⚠️ 阶段6 真实跑通发现（2026-08-07）：
+        #   1. 报表名重名会被拒（msg=【操作失败】报表名重复）→ 加 HHMM 后缀确保唯一
+        #   2. 报表名长度限制 1-30 字符（msg=【参数错误】报表名长度只允许1-30个字符）→ 必须精简
+        # 当前格式：日期去掉分隔符 + HHMM = "20260807_20260807_HHMM" = 22 字符（留 8 字符冗余）
+        from datetime import datetime as _dt
+        suffix = _dt.now().strftime("%H%M")  # HHMM（4 位后缀，总长度 < 30）
+        date_compact = start_date.replace("-", "")  # 20260807
+        end_compact = end_date.replace("-", "")
+        payload["startTime"] = start_ts
+        payload["endTime"] = end_ts
+        payload["startTimeStr"] = start_date
+        payload["endTimeStr"] = end_date
+        payload["tempName"] = f"{date_compact}_{end_compact}_{suffix}"
+        payload["reportName"] = f"{date_compact}_{end_compact}_{suffix}"
+
+        # 3. 运行时日志：打印完整 payload（重点 checkSum 字段），方便人工比对抓包
+        # ⚠️ 用户决策 2026-08-07：组装完 payload 输出完整 JSON，重点打印 checkSum 字段值
+        # 故障排查方式（预案注释）：
+        #   若接口报参数错误，checkSum 可能是页面 JS 动态计算值
+        #   排查方法：使用 playwright 启动真实浏览器，F12 → Console 执行 page.evaluate()
+        #     → window.ParamsSign.sign(JSON.stringify(payload)) 获取真实 checkSum
+        #   当前硬编码 checkSum=1114112 与抓包实证一致，但京东可能不定期更新此值
+        print(f"  [payload 调试] startTime={start_ts} ({start_date} +08:00)")
+        print(f"  [payload 调试] endTime={end_ts} ({end_date} +08:00)")
+        print(f"  [payload 调试] checkSum={payload['checkSum']}（如接口报错请用 page.evaluate() 提取真实值）")
+        print(f"  [payload 调试] 完整 payload（精简打印前 800 字符）：{json.dumps(payload, ensure_ascii=False)[:800]}...")
+
+        return payload
+
+    # ---- 阶段4 容错：统一业务码识别（项目7）----
+
+    def _is_cookie_expired(self, ret: dict) -> bool:
+        """判断响应是否表示 Cookie 过期（参考项目5 文本型 601 识别）。
+
+        判定规则：
+            1. 业务码 2001（京东标准未登录码，跨域常见）
+            2. 业务码 302 且 message 含 "登录"（与项目4/5 一致）
+            3. message/msg 含 "未登录" / "登录已过期" / "请重新登录"（文本兜底）
+        """
+        code = ret.get("code")
+        msg = str(ret.get("msg", "")) + str(ret.get("message", ""))
+        if code in (2001, 302):
+            return True
+        keywords = ["未登录", "登录已过期", "请重新登录", "login required"]
+        return any(k in msg for k in keywords)
+
+    def _handle_response(self, ret: dict, op_desc: str):
+        """统一处理京准通接口响应（阶段4 容错核心 + 阶段6 适配）。
+
+        ⚠️ 关键发现（2026-08-07 真实跑通）：京准通响应**双字段判定**：
+            - `success: true` + `code: 1` + `data: reportId` → 接口成功（如 add 返回）
+            - `success: true` + `code: 0` + `data: ...`      → 标准成功（多数接口）
+            - `success: false` 或 code 非 {0,1}             → 失败
+        必须**同时**满足 success=true 且 code 在合法集合才视为成功。
+
+        参数:
+            ret     - 接口响应 dict
+            op_desc - 操作描述（用于错误信息，如 "创建任务" / "查询列表"）
+        返回:
+            dict - 原始响应（成功时透传，失败抛异常）
+        异常:
+            CookieExpiredError - Cookie 过期（不重试，立即停）
+            RuntimeError       - 业务码 601（h5st 过期）/-407/-402（签名错）/其他非0
+        """
+        code = ret.get("code")
+        success = ret.get("success", True)  # 缺省视为 True（兼容旧响应）
+
+        # 1. 成功判定：success=True 且 code 在 {0, 1}（京东业务码 1 通常表示有 data 返回）
+        if success and code in (0, 1):
+            return ret
+
+        # 2. Cookie 过期 → 立即停（参考项目4/5 异常抛出规则）
+        if self._is_cookie_expired(ret):
+            raise CookieExpiredError(
+                f"❌ 京准通 Cookie 过期（{op_desc}返回 code={code}）：\n"
+                f"   → 请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt.jd.com 域 Cookie 写入 config/jzt_cookie.txt"
+            )
+
+        # 3. h5st 过期（601）→ 不重试，直接抛
+        if code == 601:
+            raise RuntimeError(
+                f"❌ 京准通 h5st 过期（{op_desc}返回 code=601）：\n"
+                f"   → 请浏览器F12抓 add 接口最新 h5st 重新构造实例：api = JZTKuaicheAPI(h5st='新值')"
+            )
+
+        # 4. 签名错（-407/-402）→ 抛 RuntimeError 让外层决定重试
+        if code in (-407, -402):
+            raise RuntimeError(
+                f"❌ 京准通签名校验失败（{op_desc}返回 code={code}）：\n"
+                f"   msg={ret.get('msg')}\n"
+                f"   → 可能 h5st 不匹配当前 UA，请重新抓 add 接口最新 h5st"
+            )
+
+        # 5. 其他非0 → 完整响应回显便于排查
+        raise RuntimeError(
+            f"❌ 京准通{op_desc}失败 code={code}, msg={ret.get('msg')}\n"
+            f"   完整响应：{ret}\n"
+            f"   可能原因：payload checkSum 错 / 时间跨度>90天 / 账号权限不足"
+        )
+
+    # ---- 接口1：创建导出任务 ----
+
+    def create_export_task(self, date: str = None, start_date: str = None, end_date: str = None) -> str:
+        """创建导出任务（POST），返回 task_id。
+
+        参数（与项目1-6 调度层对齐）：
+            date        - 单日查询 YYYY-MM-DD（调度层默认传此参数；start/end 默认=date）
+            start_date  - 开始日期 YYYY-MM-DD（直接调用时可显式传区间）
+            end_date    - 结束日期 YYYY-MM-DD
+        返回:
+            str - 任务 ID（用于后续 get_task_list / download_report 关联）
+        异常:
+            CookieExpiredError - Cookie 过期（不重试）
+            RuntimeError       - 业务码 601（h5st 过期）/-407/-402（签名错）/其他非0
+        """
+        # 三值一致规则：start/end 未传时默认=date
+        if not start_date:
+            start_date = date
+        if not end_date:
+            end_date = date
+        if not date:
+            raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
+
+        url = f"{self.BASE_URL}/add?requestFrom=0&businessFrom=1"
+        payload = self._build_payload(start_date, end_date)
+
+        resp = self.session.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+        ret = resp.json()
+
+        # 阶段4 统一业务码识别
+        self._handle_response(ret, op_desc="创建导出任务")
+
+        # ⚠️ 阶段6 真实跑通发现（2026-08-07）：京准通 add 响应 data 格式不统一：
+        #   - code=0 时 data 是 dict {reportId: "..."}
+        #   - code=1 时 data 直接是 reportId int（如 22134297）
+        # 必须兼容两种格式
+        data = ret.get("data")
+        if isinstance(data, dict):
+            task_id = data["reportId"]
+        else:
+            task_id = data  # int / str 直接是 reportId
+        print(f"✅ 创建导出任务成功：task_id={task_id}")
+        return task_id
+
+    # ---- 接口2：查询任务列表 ----
+
+    def get_task_list(self) -> dict:
+        """查询任务列表（GET），返回原始 dict（含 task 状态、downloadUrl）。
+
+        返回:
+            dict - 接口响应原始 dict，调用方按 task_id 字段匹配目标任务
+        异常:
+            CookieExpiredError - Cookie 过期（不重试）
+            RuntimeError       - 业务码 601/-407/-402/其他非0
+        """
+        url = f"{self.BASE_URL}/list?requestFrom=0&businessFrom=1"
+        resp = self.session.get(url, timeout=30)
+        resp.raise_for_status()
+        ret = resp.json()
+
+        # 阶段4 统一业务码识别
+        self._handle_response(ret, op_desc="查询任务列表")
+        return ret
+
+    # ---- 阶段4 容错：轮询等待报表生成 ----
+
+    def wait_for_task_ready(self, task_id: str, expected_status: str = "报表已生成") -> dict:
+        """轮询任务列表直到 task_id 达到 expected_status（默认『报表已生成』）。
+
+        参数:
+            task_id        - 来自 create_export_task 返回的任务 ID
+            expected_status - 期望的状态字符串，默认「报表已生成」
+        返回:
+            dict - 匹配到的任务记录（含 downloadUrl 等）
+        异常:
+            TimeoutError - 轮询超过 MAX_POLL_TIMES 次仍未就绪
+            CookieExpiredError / RuntimeError - 业务码异常
+        """
+        import time
+
+        for i in range(1, self.MAX_POLL_TIMES + 1):
+            ret = self.get_task_list()  # 内部已统一异常识别
+            records = ret.get("data", {}).get("records", [])
+            match_item = None
+            for item in records:
+                if item.get("reportId") == task_id:
+                    match_item = item
+                    break
+
+            if match_item:
+                status = match_item.get("status")
+                print(f"  [轮询 {i}/{self.MAX_POLL_TIMES}] task_id={task_id} status={status!r}")
+                if status == expected_status:
+                    return match_item
+                # 「报表生成失败」立即停（无需继续等）
+                if status == "报表生成失败":
+                    raise RuntimeError(
+                        f"❌ 任务生成失败 task_id={task_id}：{match_item}\n"
+                        f"   可能原因：payload 字段错 / 账号无权限 / 数据异常"
+                    )
+            else:
+                print(f"  [轮询 {i}/{self.MAX_POLL_TIMES}] task_id={task_id} 任务未出现，继续等待...")
+
+            if i < self.MAX_POLL_TIMES:
+                time.sleep(self.POLL_INTERVAL)
+
+        raise TimeoutError(
+            f"❌ 轮询超过最大次数 {self.MAX_POLL_TIMES}（{self.POLL_INTERVAL}秒 × {self.MAX_POLL_TIMES} = {self.POLL_INTERVAL*self.MAX_POLL_TIMES}秒）"
+            f"，任务仍未就绪：task_id={task_id}\n"
+            f"   可能原因：报表数据量极大 / 平台拥堵；可调整类常量 POLL_INTERVAL / MAX_POLL_TIMES 增大超时"
+        )
+
+    # ---- 接口3：CDN 下载（阶段4：CDN 403 自动重刷 URL 重试）----
+
+    def download_report(self, task_id: str, save_filename: str) -> str:
+        """根据 task_id 轮询等待报表生成，CDN 下载并二进制保存到 output/京准通快车/。
+
+        参数:
+            task_id       - 来自 create_export_task 返回的任务 ID
+            save_filename - 保存文件名（如 "report_0807.xlsx" / "report_0807.csv"）
+        返回:
+            str - 保存的文件绝对路径
+        异常:
+            TimeoutError / CookieExpiredError / RuntimeError
+        阶段4 新增（CDN 403 容错）：
+            - CDN downloadUrl 是一次性签名链接，过期返回 403
+            - 遇 403 自动重新调 get_task_list() 刷新 downloadUrl 后重试
+            - 最多 MAX_DOWNLOAD_RETRY=3 次（指数退避 1s/2s/4s）
+        """
+        # 1. 轮询等待报表生成（阶段4 新增，自动循环 POLL_INTERVAL × MAX_POLL_TIMES）
+        match_item = self.wait_for_task_ready(task_id)
+
+        download_url = match_item.get("downloadUrl")
+        if not download_url:
+            raise RuntimeError(
+                f"❌ 任务已『报表已生成』但 downloadUrl 缺失：{match_item}\n"
+                f"   可能原因：CDN 生成失败 / 平台临时异常，请稍后再试"
+            )
+
+        # 2. CDN 下载（403 重刷 URL 重试，阶段4 新增）
+        resp = None
+        for retry in range(self.MAX_DOWNLOAD_RETRY + 1):
+            try:
+                print(
+                    f"⬇️ [第 {retry+1}/{self.MAX_DOWNLOAD_RETRY+1} 次] "
+                    f"下载 CDN 链接：{download_url[:80]}..."
+                )
+                resp = requests.get(
+                    download_url,
+                    headers={"User-Agent": self.USER_AGENT},
+                    timeout=60,
+                )
+
+                # 403 = CDN 链接过期 → 重刷 URL 重试
+                if resp.status_code == 403:
+                    if retry >= self.MAX_DOWNLOAD_RETRY:
+                        raise RuntimeError(
+                            f"❌ CDN 链接连续 {self.MAX_DOWNLOAD_RETRY+1} 次 403 过期，且重新轮询仍无效\n"
+                            f"   可能原因：downloadUrl 持续被刷新；请稍后再试"
+                        )
+                    print(
+                        f"  ⚠️ CDN 返回 403（链接过期），重新轮询刷新 downloadUrl 后重试..."
+                    )
+                    # 关键：通过 wait_for_task_ready 刷新 URL（不重复创建任务）
+                    match_item = self.wait_for_task_ready(task_id)
+                    download_url = match_item.get("downloadUrl")
+                    if not download_url:
+                        raise RuntimeError(f"❌ 重新轮询后 downloadUrl 仍缺失：{match_item}")
+                    # 指数退避
+                    import time
+                    time.sleep(2 ** retry)
+                    continue
+
+                # 其他非 200 状态码 → raise_for_status
+                resp.raise_for_status()
+                break  # 成功
+
+            except requests.exceptions.RequestException as e:
+                if retry >= self.MAX_DOWNLOAD_RETRY:
+                    raise RuntimeError(f"❌ CDN 下载失败（重试 {self.MAX_DOWNLOAD_RETRY+1} 次后）：{e}") from e
+                print(f"  ⚠️ CDN 下载异常：{e}，准备重试...")
+                import time
+                time.sleep(2 ** retry)
+
+        if resp is None or not resp.content:
+            raise RuntimeError("❌ CDN 下载响应为空")
+
+        # 3. 保存到 output/京准通快车/{save_filename}（本阶段不建日期子目录，阶段5 适配 Excel规则4）
+        os.makedirs(self.output_dir, exist_ok=True)
+        target_path = os.path.join(self.output_dir, save_filename)
+        with open(target_path, "wb") as f:
+            f.write(resp.content)
+        print(f"✅ 文件已保存：{target_path}（{len(resp.content)} 字节）")
+        return target_path
+
+
+# ============================================================
 #  业务注册中心（BUSINESS_REGISTRY）
 # ------------------------------------------------------------
 #  中文说明（小白必读）：
@@ -2448,6 +3052,19 @@ BUSINESS_REGISTRY = {
             "date": "查询日期YYYY-MM-DD（入参或config）",
             "startDate": "开始日期（默认=date）",
             "endDate": "结束日期（默认=date）",
+        },
+    },
+    # 业务：京准通快车自定义报表（2026-08-07 上线骨架，h5st鉴权，独立Cookie文件，不继承基类）
+    # ⚠️ 阶段3 骨架：仅3接口方法，不含轮询/Excel解析；调用方需手动传入 h5st
+    "京准通快车自定义报表": {
+        "api_class": JZTKuaicheAPI,
+        "method": "create_export_task",  # 仅作为入口方法占位；完整流程由调用方编排
+        "desc": "京准通快车自定义报表导出（h5st鉴权，独立Cookie，3接口骨架不含轮询）",
+        "params": {
+            "h5st": "必填，浏览器F12抓add接口请求头复制（外部传入）",
+            "start_date": "开始日期YYYY-MM-DD",
+            "end_date": "结束日期YYYY-MM-DD",
+            "cookie_path": "京准通Cookie路径（默认config/jzt_cookie.txt）",
         },
     },
 }

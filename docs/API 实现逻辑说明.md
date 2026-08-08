@@ -592,3 +592,124 @@ python main.py --biz_key "商品流失分析" --date "2026-08-05"
 | 2026-08-07 | 阶段3：LossProductAPI 完整实现（POST + xls 读取 + 业务子目录）+ BUSINESS_REGISTRY 注册（第7业务）|
 | 2026-08-07 | 阶段4：双魔数校验 + RiskControlError + success 标记 + 601 不重试 |
 | 2026-08-07 | 阶段5：真实导出发现 filename **UTF-8 编码**乱码 → `_parse_content_disposition_filename` UTF-8 优先解码 + GBK 回退；重测通过；文档归档 |
+
+---
+
+## 项目 7：京准通快车自定义报表导出（JZTKuaicheAPI）｜2026-08-07 上线骨架
+
+### 业务定位
+京准通广告投放后台（`jzt.jd.com/home`）的快车广告报表导出。**与项目1-6 商智域完全不同**——鉴权用 h5st 请求头（非商智 User-mnp/uuid），三步异步流程（创建任务→轮询列表→CDN 下载），Cookie 与商智/京麦不互通。本阶段（阶段3骨架）仅 3 个接口方法，不含轮询循环与 Excel 解析。
+
+### 接口基础信息
+| 字段 | 内容 |
+|------|------|
+| **base URL** | `https://jzt-api.jd.com/dataCenter/customreport/v2/report` |
+| **请求方式** | POST（创建任务）/ GET（任务列表、CDN 下载）|
+| **Content-Type** | `application/json;charset=UTF-8` |
+| **业务页面入口** | `https://jzt.jd.com/home`（快车-自定义报表）|
+
+### 三个核心接口
+| 序号 | 方法 | URL | 用途 |
+|------|------|-----|------|
+| 1 | `create_export_task(start_date, end_date) -> str` | `POST /add?requestFrom=0&businessFrom=1` | 创建导出任务，返回 `reportId` |
+| 2 | `get_task_list() -> dict` | `GET /list?requestFrom=0&businessFrom=1` | 查询任务列表原始 dict（含 status / downloadUrl）|
+| 3 | `download_report(task_id, save_filename) -> str` | `GET <downloadUrl>`（CDN）| 根据 task_id 查找 downloadUrl，二进制保存 |
+
+### 必带 Header（业务约束）
+```python
+ORIGIN = "https://jzt.jd.com"
+REFERER = "https://jzt.jd.com"
+siteId = "0"
+User-Agent = "<浏览器抓包 UA>"
+Content-Type = "application/json;charset=UTF-8"
+Cookie = "<jzt.jd.com 域完整 Cookie>"
+h5st = "<浏览器F12抓 add 接口请求头复制>"
+```
+- ⚠️ **不写 uuid**：京准通域未校验 uuid 字段（项目7 抓包已确认）
+- ⚠️ **UA 与 h5st 绑定**：禁用基类 UA 切换（切换会致 h5st 失效），业务内固定 UA
+
+### Cookie 与 h5st（**严禁硬编码**）
+- Cookie 文件路径：`config/jzt_cookie.txt`（**独立文件**，与 `config/cookie.txt` 商智 Cookie 不互通）
+- Cookie 文件不存在 → `FileNotFoundError`（强制用户抓包填入）
+- h5st 通过 `__init__(h5st=...)` 外部传入；脚本不实现 JS 签名（复杂度高）
+- h5st 过期（业务码 601）→ 提示用户重新抓包更新
+
+### 业务 Payload 模板（最小字段版）
+- 完整 payload 体量大，阶段3 用类内常量 `JZT_KUAICHE_PAYLOAD_TEMPLATE` 存最少字段版
+- 动态注入：`startTime` / `endTime` / `startTimeStr` / `endTimeStr` / `tempName` / `reportName`
+- 延后引入：完整 payload 抽到 `templates/*.json`（阶段迭代再做）
+
+### 业务参数关键点
+| 参数 | 决策 | 说明 |
+|------|------|------|
+| `caliberSettings` | 转化周期 15 天 + 点击 + 不含赠品 + 成交订单 | 4 项默认勾选 |
+| `customDimension` | 基础维度（产品线/计划/单元）+ 细分维度（营销目标/搜索词/关键词）| 字段最少版 |
+| `customDimensionOptions` | pin=subUser=99936530475=FYA8888 | 当前账号 |
+| `customIndex` | 基础数据（展现/点击/点击率/花费）+ 转化数据（直接订单数/金额/总订单数/金额/ROI）| 9 项核心指标 |
+| `daily=1` | 日维度 | |
+| `version="JZT_V9"` | 报表版本 | 抓包得到 |
+
+### 与现有架构的核心差异（**不继承 JDBaseRequest**）
+| 维度 | 商智域（项目1-6）| 本项目（项目7）|
+|------|----------------|--------------|
+| 鉴权参数 | Cookie + User-mnp/uuid | **Cookie + h5st**（不依赖 User-mnp）|
+| 请求方式 | 表单 / JSON | **JSON** |
+| 鉴权签名 | MD5(URL+uuid+ts+salt) | **h5st 一次性签名（外部传入）** |
+| Cookie 文件 | `config/cookie.txt` | **`config/jzt_cookie.txt`**（独立）|
+| 流程模型 | 同步请求-响应 | **异步三步：创建任务 → 轮询 → 下载** |
+| 重试模型 | 基类 30 秒间隔 + 3 次重试 | **不适配**（h5st 短期有效，重试加重风控）|
+| UA 切换 | 基类 Edge↔Chrome 切换 | **禁用**（UA 与 h5st 绑定）|
+| Excel 后置 | `safe_convert_numeric` + `apply_column_formats` | **阶段5 再补**（基础骨架不含）|
+
+### 异常抛出规则（基础骨架版，阶段4 会扩展）
+| 异常 | 触发场景 | 处理 |
+|------|----------|------|
+| `FileNotFoundError` | `config/jzt_cookie.txt` 不存在 | 立即停止，提示抓包填入 |
+| `ValueError` | h5st 为空 / Cookie 文件为空 | 立即停止 |
+| `RuntimeError` | 业务码 601（h5st 过期）/ 业务码非0 / HTTP raise_for_status | 立即停止，提示用户排查 |
+| `requests.exceptions.Timeout` | 请求超时（30s 创建/轮询，60s 下载）| **未捕获**（让调用方处理，阶段4 加入重试）|
+
+### 调用示例（写进代码注释）
+```python
+from main import JZTKuaicheAPI
+
+# h5st 从浏览器抓 add 接口获取填入
+api = JZTKuaicheAPI(h5st="抓包得到h5st字符串")
+task_id = api.create_export_task("2026-08-07", "2026-08-07")
+print(f"任务ID: {task_id}")
+task_data = api.get_task_list()  # 阶段3 骨架：调用方手动轮询
+# api.download_report(task_id, "report_0807.xlsx")
+```
+
+### 入口命令
+```bash
+# 注册已生效，可用 --list 验证
+python main.py --list
+
+# ⚠️ 阶段3 骨架不直接支持 --biz_key 入口（需手动编排 create→poll→download）
+# 阶段4/5 才会包装成 --biz_key 一键调度
+```
+
+### 阶段3 验证结论
+| 项 | 结果 |
+|------|------|
+| AST 语法校验 | ✅ 通过 |
+| 类方法归属（`__dict__` 校验，5 方法）| ✅ create_export_task / get_task_list / download_report / _build_payload / __init__ 全部在类内 |
+| BUSINESS_REGISTRY 注册 | ✅ 第8业务 `京准通快车自定义报表` 已注册 |
+| `python main.py --list` | ✅ 显示「[8] 京准通快车自定义报表」|
+| payload 时间字段注入 | ✅ 6 个时间字段正确动态填充 |
+| 模板字段体量 | 18 个顶层字段（最小字段版）|
+
+### 阶段交付承诺
+- ✅ 阶段1：需求拆解文档（已在对话中输出）
+- ✅ 阶段2：抓包确认（用户决策「不写uuid」「合并main.py」，落地为阶段3 代码骨架）
+- ✅ 阶段3：JZTKuaicheAPI 类骨架 + BUSINESS_REGISTRY 注册 + 验证全过（本文档）
+- ⏳ 阶段4：容错适配（轮询循环 / CDN 403 重刷 URL / 401 Cookie 过期 / 业务码-407/-402）
+- ⏳ 阶段5：mock 单测 → 真实跑通 → docs/SKILL.md 归档 → GitHub 推送
+
+### 变更记录
+| 日期 | 改动 |
+|------|------|
+| 2026-08-07 | 阶段1：需求拆解 + 5 阶段交付计划（与商智项目1-6 同套流程）|
+| 2026-08-07 | 阶段2：用户决策汇总（合并 main.py / 不写 uuid / payload 类内常量 / Cookie 独立文件 / 兜底 2026-08-07）|
+| 2026-08-07 | 阶段3：JZTKuaicheAPI 类骨架（不继承 JDBaseRequest，3 接口方法）+ 模板常量 JZT_KUAICHE_PAYLOAD_TEMPLATE + BUSINESS_REGISTRY 第8业务 + 验证脚本全过 |

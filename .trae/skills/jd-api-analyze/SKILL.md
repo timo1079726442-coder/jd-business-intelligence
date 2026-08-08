@@ -706,7 +706,83 @@ export.action GET 下载 {taskId}.zip
 
 # 【京准通 jzt.jd.com 模块（广告报表）】
 
-> 📝 暂无项目开发记录，待后续添加。
+### 模块业务定位（2026-08-07 吸收项目7 落地）
+- **业务范围**：京准通广告投放后台（`jzt.jd.com/home`）的快车/海投/DMP 等广告报表导出
+- **鉴权体系**：与商智/京麦**完全不同**——
+  - **h5st 请求头**：浏览器 JS 动态生成，前端强签名，**短期有效**（过期业务码 601）
+  - **Cookie**：jzt.jd.com 域 Cookie，**与商智/京麦不互通**，必须独立文件 `config/jzt_cookie.txt`
+  - **无 User-mnp / 无 uuid**：京准通域**不校验** User-mnp/uuid 字段（项目7 抓包已确认）
+- **流程模型**：异步三步流程（创建任务 → 轮询列表 → CDN 下载），与商智同步请求-响应完全不同
+- **核心风险**：
+  - downloadUrl 是一次性签名 CDN 链接，**过期 403 需重新轮询刷新**
+  - h5st 与 UA 绑定，**禁用基类 UA 切换**（切换会致 h5st 失效）
+  - 不适用基类 30 秒间隔 + 3 次重试模型（h5st 短期有效，重试加重风控）
+- **配置规则**：h5st 通过 `__init__(h5st=...)` 外部传入；脚本不实现 JS 签名（复杂度高）
+
+### 与商智域的架构差异对照
+| 维度 | 商智域（项目1-6）| 京准通域（项目7+）|
+|------|----------------|------------------|
+| 鉴权参数 | Cookie + User-mnp/uuid | **Cookie + h5st** |
+| 鉴权签名 | MD5(URL+uuid+ts+salt) | **h5st 一次性签名（外部传入）** |
+| Cookie 文件 | `config/cookie.txt` | **`config/jzt_cookie.txt`**（独立）|
+| 请求方式 | 表单 / JSON | **JSON** |
+| 流程模型 | 同步请求-响应 | **异步三步：创建 → 轮询 → 下载** |
+| 重试模型 | 基类 30s 间隔 + 3 次重试 | **不适配**（h5st 短期有效）|
+| UA 切换 | 基类 Edge↔Chrome | **禁用**（UA 与 h5st 绑定）|
+| Excel 后置 | `safe_convert_numeric` + `apply_column_formats` | 复用（阶段5 补）|
+
+---
+
+## 项目7：京准通快车自定义报表导出（基础骨架，2026-08-07 上线）
+
+### 业务说明
+- **业务名**：`京准通快车自定义报表`
+- **接口**：`https://jzt-api.jd.com/dataCenter/customreport/v2/report`（base URL）
+  - POST `/add?requestFrom=0&businessFrom=1`（创建任务，返回 reportId）
+  - GET `/list?requestFrom=0&businessFrom=1`（查询任务列表）
+  - GET `<downloadUrl>`（CDN 下载，一次性签名链接）
+- **页面入口**：`https://jzt.jd.com/home`（快车-自定义报表）
+- **业务类**：`JZTKuaicheAPI`（**不继承 JDBaseRequest**，业务模型差异大）
+- **BUSINESS_REGISTRY**：第8 业务
+
+### 关键实现点
+1. **Cookie 独立读取**：类内自实现 `__init__()` 读 `config/jzt_cookie.txt`，不存在抛 `FileNotFoundError` 强制抓包
+2. **h5st 外部传入**：`__init__(h5st: str)`，脚本不实现 JS 签名
+3. **payload 模板类内常量**：`JZT_KUAICHE_PAYLOAD_TEMPLATE`（18 个顶层字段，最小字段版）；完整版延后抽 `templates/*.json`
+4. **三步异步流程骨架**：仅 3 个接口方法，**不含轮询循环**（阶段4 容错适配补充）
+5. **基础异常识别**：业务码 601 → h5st 过期提示；业务码非0 → 完整响应回显便于排查
+6. **禁用基类 UA 切换**：业务内固定 UA（与 h5st 绑定）
+
+### 业务参数（payload 最少字段版）
+- `caliberSettings`：转化周期 15 天 + 点击 + 不含赠品 + 成交订单
+- `customDimension`：基础维度（产品线/计划/单元）+ 细分维度（营销目标/搜索词/关键词）
+- `customDimensionOptions`：pin=subUser=99936530475=FYA8888
+- `customIndex`：9 项核心指标（展现/点击/点击率/花费 + 直接/总订单数/金额/ROI）
+- `daily=1` / `version="JZT_V9"`
+
+### 阶段交付承诺
+- ✅ 阶段1：需求拆解 + 与商智架构差异分析
+- ✅ 阶段2：抓包确认（不写 uuid / 合并 main.py / payload 类内常量）
+- ✅ 阶段3：JZTKuaicheAPI 类骨架 + BUSINESS_REGISTRY 注册 + 验证全过
+- ⏳ 阶段4：容错适配（轮询循环 / CDN 403 重刷 URL / 401 Cookie 过期）
+- ⏳ 阶段5：mock 单测 → 真实跑通 → docs/SKILL.md 归档 → GitHub 推送
+
+### 入口命令
+```bash
+# 阶段3 骨架已注册，可用 --list 验证
+python main.py --list
+
+# 阶段3 骨架不直接支持 --biz_key 入口（需手动编排 create→poll→download）
+# 阶段4/5 才会包装成 --biz_key 一键调度
+```
+
+### 踩坑要点（阶段3 预防）
+1. **Cookie 不互通**：jzt.jd.com 域 Cookie 不能复用商智/京麦 Cookie，必须独立抓
+2. **h5st 短期有效**：抓包值几分钟到几十分钟过期，业务码 601 时必须重新抓
+3. **downloadUrl 一次性**：CDN 链接过期 403，必须重新调 `/list` 刷新
+4. **禁用 UA 切换**：基类 UA 切换机制与 h5st 绑定会失效，业务内固定 UA
+5. **不写 uuid**：京准通域未校验 uuid 字段（已抓包确认），不要画蛇添足
+6. **payload 不要硬编码到 .env**：业务参数体量大放代码内常量更易维护，模板变更在代码内改
 
 ---
 
@@ -714,6 +790,7 @@ export.action GET 下载 {taskId}.zip
 
 | 日期 | 改动概要 |
 |------|----------|
+| 2026-08-07 | **京准通快车自定义报表项目上线骨架（第8 业务）**：① 新增 `JZTKuaicheAPI` 类（**不继承 JDBaseRequest**，业务模型差异大）；③ 接口 3 个：POST `/add` 创建任务 / GET `/list` 查询列表 / CDN 下载 `downloadUrl`；② Cookie 走**独立文件** `config/jzt_cookie.txt`（与商智/京麦 Cookie 不互通）；③ **h5st 通过 `__init__(h5st=...)` 外部传入**，脚本不实现 JS 签名（复杂度高）；④ payload 用类内常量 `JZT_KUAICHE_PAYLOAD_TEMPLATE`（18 字段最少版）；⑤ **不写 uuid**（京准通域抓包确认未校验）；⑥ **禁用基类 UA 切换**（UA 与 h5st 绑定）；⑦ 业务码 601 提示「请重新抓 h5st」；⑧ BUSINESS_REGISTRY 第8业务；⑨ AST 语法+类方法归属+注册表+payload 时间字段注入 5 项验证全过；⑩ SKILL.md 京准通分区填首条记录（模块定位+架构差异对照） |
 | 2026-08-07 | **商品流失分析项目上线（5 阶段交付，第 7 业务）**：① 新增 `LossProductAPI` 类（继承 `JDBaseRequest`），**POST 表单**（`sz.jd.com/sz/api/competitionAnalysis/exportLossProList.ajax`，Sec-Fetch-Site=same-origin）；② 业务参数 8 项表单（date/startDate/endDate 可变；indChannel=99/unitType=0 固定经用户确认固化）；③ 固定业务参数 `indChannel=99`、`unitType=0`；④ **首次处理 .xls 响应**：新增公共函数 `read_excel_bytes()` 按魔数自动识别 xlsx（`PK\x03\x04`，openpyxl）与 xls（`\xD0\xCF\x11\xE0`，xlrd 引擎，需 xlrd>=2.0.1）；⑤ 响应校验升级**双魔数**（xls/xlsx 任一）+ Content-Disposition attachment；⑥ 保存为 xls 读取 → 转存 .xlsx，落 `output/商品流失分析/{date}/` 子目录；⑦ **阶段5 真实导出发现 filename 为 UTF-8 字节**（charset=utf-8，非 GBK）：修复 `_parse_content_disposition_filename` 为 **UTF-8 优先 + GBK 回退**（此前按 GBK 解码产生"鍟嗗搧"乱码），4 场景验证 4/4 通过，真实导出文件名正常；⑧ 阶段4 容错与项目4/5 对齐（601 不重试 RiskControlError / success 标记 / 双魔数校验）；⑨ mock 单测 30/30 通过；⑩ 入口：`python main.py --biz_key "商品流失分析" --date "2026-08-05"` |
 | 2026-08-07 | 商智模块业务定位更新：商智域含 szgateway.jd.com（POST 接口）与 sz.jd.com（GET/POST 导出接口），统一按项目编号归档 |
 | 2026-08-04 | 初始化项目，破解京东风控签名，API测试成功，创建规范文档 |
