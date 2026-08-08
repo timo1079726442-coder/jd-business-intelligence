@@ -2825,36 +2825,54 @@ class JZTKuaicheAPI:
 
     # ---- 阶段4 容错：轮询等待报表生成 ----
 
-    def wait_for_task_ready(self, task_id: str, expected_status: str = "报表已生成") -> dict:
-        """轮询任务列表直到 task_id 达到 expected_status（默认『报表已生成』）。
+    # 任务状态映射（2026-08-07 真实 list 响应实证）
+    # 京准通实际状态字段是 subscribeState（int），含义待抓包确认（list 返回所有记录都是 0）
+    # 兼容 expected_status 参数同时支持字符串（"报表已生成"）和整数（0/1/2...）
+    SUBSCRIBE_STATE_OK = 0   # 暂定 0=已完成（待用户补 list 抓包确认）
+    SUBSCRIBE_STATE_FAIL = -1  # 暂定 -1=失败（占位）
+
+    def wait_for_task_ready(self, task_id, expected_status=None) -> dict:
+        """轮询任务列表直到 task_id 达到 expected_status（默认 SUBSCRIBE_STATE_OK）。
+
+        ⚠️ 阶段8 真实响应字段变更（2026-08-07 list 响应）：
+            - 任务 ID 字段：`reportId` → `id`
+            - 状态字段：`status`（字符串『报表已生成』）→ `subscribeState`（int，待补抓包确认语义）
+            - 列表字段：`records` → `data`（双层 data 嵌套：`data.data[]`）
+            - **响应中没有 downloadUrl/ossUrl 字段**（用户承诺补抓包，含已完成任务下载URL）
 
         参数:
-            task_id        - 来自 create_export_task 返回的任务 ID
-            expected_status - 期望的状态字符串，默认「报表已生成」
+            task_id        - 来自 create_export_task 返回的任务 ID（int 或 str 都接受）
+            expected_status - 期望的状态值，None 时默认 SUBSCRIBE_STATE_OK
         返回:
-            dict - 匹配到的任务记录（含 downloadUrl 等）
+            dict - 匹配到的任务记录（**不**含 downloadUrl，需另调下载接口）
         异常:
             TimeoutError - 轮询超过 MAX_POLL_TIMES 次仍未就绪
             CookieExpiredError / RuntimeError - 业务码异常
         """
         import time
 
+        if expected_status is None:
+            expected_status = self.SUBSCRIBE_STATE_OK
+
         for i in range(1, self.MAX_POLL_TIMES + 1):
             ret = self.get_task_list()  # 内部已统一异常识别
-            records = ret.get("data", {}).get("records", [])
+            # ⚠️ 真实响应：list 数据是 data.data[]（双层 data 嵌套）
+            records = ret.get("data", {}).get("data", [])
             match_item = None
             for item in records:
-                if item.get("reportId") == task_id:
+                # 兼容 int/str 两种 task_id
+                if str(item.get("id")) == str(task_id):
                     match_item = item
                     break
 
             if match_item:
-                status = match_item.get("status")
-                print(f"  [轮询 {i}/{self.MAX_POLL_TIMES}] task_id={task_id} status={status!r}")
-                if status == expected_status:
+                state = match_item.get("subscribeState")
+                print(f"  [轮询 {i}/{self.MAX_POLL_TIMES}] task_id={task_id} subscribeState={state!r}")
+                if state == expected_status:
+                    print(f"  ✅ 任务已就绪（subscribeState={state}）")
                     return match_item
-                # 「报表生成失败」立即停（无需继续等）
-                if status == "报表生成失败":
+                # 失败状态立即停
+                if state == self.SUBSCRIBE_STATE_FAIL:
                     raise RuntimeError(
                         f"❌ 任务生成失败 task_id={task_id}：{match_item}\n"
                         f"   可能原因：payload 字段错 / 账号无权限 / 数据异常"
@@ -2874,84 +2892,128 @@ class JZTKuaicheAPI:
     # ---- 接口3：CDN 下载（阶段4：CDN 403 自动重刷 URL 重试）----
 
     def download_report(self, task_id: str, save_filename: str) -> str:
-        """根据 task_id 轮询等待报表生成，CDN 下载并二进制保存到 output/京准通快车/。
+        """根据 task_id 轮询等待报表生成，调 downloadById 拿 urlCsv，再 GET urlCsv 下载 CSV 流。
+
+        ⚠️ 阶段8 真实实现（2026-08-07 抓包实证）：
+            1. list 不返回下载 URL
+            2. downloadById 返回 JSON（含 urlCsv，是 storage.jd.com 的 OSS 预签名链接）
+            3. urlCsv 是 OSS 预签名链接，**带 Expires 过期时间**（实测 10 分钟有效）
+            4. 必须**链式调用**：downloadById 拿到 urlCsv 立即 GET，否则会 404 NoSuchKey
+            5. GET urlCsv 不需要 Cookie（OSS 自带签名），纯 requests.get 即可
 
         参数:
             task_id       - 来自 create_export_task 返回的任务 ID
-            save_filename - 保存文件名（如 "report_0807.xlsx" / "report_0807.csv"）
+            save_filename - 保存文件名（如 "report_0807.csv"）
         返回:
             str - 保存的文件绝对路径
         异常:
             TimeoutError / CookieExpiredError / RuntimeError
-        阶段4 新增（CDN 403 容错）：
-            - CDN downloadUrl 是一次性签名链接，过期返回 403
-            - 遇 403 自动重新调 get_task_list() 刷新 downloadUrl 后重试
-            - 最多 MAX_DOWNLOAD_RETRY=3 次（指数退避 1s/2s/4s）
         """
-        # 1. 轮询等待报表生成（阶段4 新增，自动循环 POLL_INTERVAL × MAX_POLL_TIMES）
+        # 1. 轮询等待报表生成（subscribeState=0 即完成）
         match_item = self.wait_for_task_ready(task_id)
 
-        download_url = match_item.get("downloadUrl")
-        if not download_url:
+        # 2. 提取下载所需参数
+        file_name = match_item.get("reportName") or match_item.get("tempName")
+        if not file_name:
+            raise RuntimeError(f"❌ 任务已就绪但 reportName 缺失，无法下载：{match_item}")
+        start_day = match_item.get("startTimeStr", "")
+        end_day = match_item.get("endTimeStr", "")
+        pin = match_item.get("pin", "")
+
+        # 3. 调 downloadById（同域 API）拿 urlCsv
+        downloadbyid_url = (
+            f"{self.BASE_URL}/downloadById"
+            f"?id={task_id}"
+            f"&name={file_name}"
+            f"&startDay={start_day}"
+            f"&endDay={end_day}"
+            f"&pin={pin}"
+            f"&fileName={file_name}"
+            f"&requestFrom=0&businessFrom=1"
+        )
+        print(f"⬇️ 调 downloadById 拿 urlCsv: task_id={task_id}")
+
+        try:
+            resp_byid = self.session.get(downloadbyid_url, timeout=60)
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"❌ downloadById 请求失败：{e}") from e
+
+        # 4. HTTP 状态码 + 业务码识别
+        if resp_byid.status_code in (401, 403):
+            raise CookieExpiredError(
+                f"❌ downloadById 返回 {resp_byid.status_code}（Cookie 过期/账号限制）：\n"
+                f"   → 请浏览器重新登录 https://jzt.jd.com/home，F12 抓 Cookie 写入 config/jzt_cookie.txt"
+            )
+        resp_byid.raise_for_status()
+
+        ret_byid = resp_byid.json()
+        # 业务码校验（success=true 且 code∈{0,1} 视为成功）
+        self._handle_response(ret_byid, op_desc="downloadById")
+
+        url_csv = ret_byid.get("data", {}).get("urlCsv")
+        if not url_csv:
             raise RuntimeError(
-                f"❌ 任务已『报表已生成』但 downloadUrl 缺失：{match_item}\n"
-                f"   可能原因：CDN 生成失败 / 平台临时异常，请稍后再试"
+                f"❌ downloadById 响应中 urlCsv 缺失：{ret_byid}\n"
+                f"   可能原因：报表还没真正生成 / 接口字段名变更"
             )
 
-        # 2. CDN 下载（403 重刷 URL 重试，阶段4 新增）
-        resp = None
+        # 5. 立即 GET urlCsv（OSS 预签名链接，阶段9 发现 ~10 秒"预热延迟"会先返回 404）
+        # 必须"重试+重新拿 urlCsv"循环（因为旧 urlCsv 不会自动变可下载）
+        print(f"⬇️ 下载 urlCsv（OSS 预签名链接；前几次可能 404 NoSuchKey 需重试）")
+        print(f"  URL 前 80 字符: {url_csv[:80]}...")
+
+        resp_csv = None
+        last_error = None
         for retry in range(self.MAX_DOWNLOAD_RETRY + 1):
             try:
-                print(
-                    f"⬇️ [第 {retry+1}/{self.MAX_DOWNLOAD_RETRY+1} 次] "
-                    f"下载 CDN 链接：{download_url[:80]}..."
-                )
-                resp = requests.get(
-                    download_url,
+                resp_csv = requests.get(
+                    url_csv,
                     headers={"User-Agent": self.USER_AGENT},
                     timeout=60,
                 )
-
-                # 403 = CDN 链接过期 → 重刷 URL 重试
-                if resp.status_code == 403:
-                    if retry >= self.MAX_DOWNLOAD_RETRY:
-                        raise RuntimeError(
-                            f"❌ CDN 链接连续 {self.MAX_DOWNLOAD_RETRY+1} 次 403 过期，且重新轮询仍无效\n"
-                            f"   可能原因：downloadUrl 持续被刷新；请稍后再试"
-                        )
+                # 200 成功
+                if resp_csv.status_code == 200:
+                    break
+                # 404 NoSuchKey（OSS 链接"预热中"或已过期）→ 重新拿 urlCsv
+                if resp_csv.status_code == 404 and retry < self.MAX_DOWNLOAD_RETRY:
                     print(
-                        f"  ⚠️ CDN 返回 403（链接过期），重新轮询刷新 downloadUrl 后重试..."
+                        f"  ⚠️ 第 {retry+1}/{self.MAX_DOWNLOAD_RETRY+1} 次 urlCsv 404 NoSuchKey"
+                        f"，重新调 downloadById 拿新 urlCsv..."
                     )
-                    # 关键：通过 wait_for_task_ready 刷新 URL（不重复创建任务）
-                    match_item = self.wait_for_task_ready(task_id)
-                    download_url = match_item.get("downloadUrl")
-                    if not download_url:
-                        raise RuntimeError(f"❌ 重新轮询后 downloadUrl 仍缺失：{match_item}")
-                    # 指数退避
-                    import time
-                    time.sleep(2 ** retry)
+                    import time as _time
+                    _time.sleep(3)  # 等 3 秒让 OSS 完成预热
+                    # 重新调 downloadById
+                    resp_byid_retry = self.session.get(downloadbyid_url, timeout=60)
+                    resp_byid_retry.raise_for_status()
+                    ret_byid_retry = resp_byid_retry.json()
+                    new_url = ret_byid_retry.get("data", {}).get("urlCsv")
+                    if not new_url:
+                        raise RuntimeError(f"❌ 重试 downloadById 响应无 urlCsv：{ret_byid_retry}")
+                    url_csv = new_url
                     continue
-
-                # 其他非 200 状态码 → raise_for_status
-                resp.raise_for_status()
-                break  # 成功
-
+                # 其他非 200
+                resp_csv.raise_for_status()
             except requests.exceptions.RequestException as e:
+                last_error = e
                 if retry >= self.MAX_DOWNLOAD_RETRY:
-                    raise RuntimeError(f"❌ CDN 下载失败（重试 {self.MAX_DOWNLOAD_RETRY+1} 次后）：{e}") from e
-                print(f"  ⚠️ CDN 下载异常：{e}，准备重试...")
-                import time
-                time.sleep(2 ** retry)
+                    raise RuntimeError(f"❌ urlCsv 下载失败（重试 {self.MAX_DOWNLOAD_RETRY+1} 次后）：{e}") from e
+                print(f"  ⚠️ urlCsv 下载异常：{e}，重试中...")
 
-        if resp is None or not resp.content:
-            raise RuntimeError("❌ CDN 下载响应为空")
+        if resp_csv is None or resp_csv.status_code != 200:
+            raise RuntimeError(
+                f"❌ urlCsv 连续 {self.MAX_DOWNLOAD_RETRY+1} 次未成功：{last_error}\n"
+                f"   可能原因：报表生成尚未完成 / OSS 预热延迟超出预期"
+            )
 
-        # 3. 保存到 output/京准通快车/{save_filename}（本阶段不建日期子目录，阶段5 适配 Excel规则4）
+        # 6. 保存到 output/京准通快车/{save_filename}
         os.makedirs(self.output_dir, exist_ok=True)
         target_path = os.path.join(self.output_dir, save_filename)
         with open(target_path, "wb") as f:
-            f.write(resp.content)
-        print(f"✅ 文件已保存：{target_path}（{len(resp.content)} 字节）")
+            f.write(resp_csv.content)
+        print(
+            f"✅ 文件已保存：{target_path}"
+            f"（{len(resp_csv.content)} 字节，Content-Type={resp_csv.headers.get('Content-Type', '无')}）"
+        )
         return target_path
 
 
