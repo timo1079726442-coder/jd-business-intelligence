@@ -214,17 +214,21 @@ with sync_playwright() as p:
 
 | 优先级 | 项 | 状态 |
 |---|---|---|
-| P0 | 常量 `SUBSCRIBE_STATE_OK=2` | ✅ 已修正 |
+| P0 | 常量 `SUBSCRIBE_STATE_OK=2`（后修正为**纯探针策略**）| ✅ 已修正 |
 | P0 | 封装完整三步流程 | ✅ 已加 `run_full_export` |
 | P0 | OSS 404 重试 3-10s 随机退避 | ✅ 已实现 |
 | P1 | 调度器接入 | ✅ 已加 `callable` 注册方式 |
 | P2 | 本文档 | ✅ 已写 |
-| P3 | jd_cdp_capture.py 抓包指引 | ⏳ 待补 |
+| P3 | jd_cdp_capture.py 抓包指引 | ✅ 已补（2026-08-09）|
 | P4 | payload 店铺 ID 动态化 | 📋 暂不实现中期优化，仅文档标注 |
-| P5 | checkSum 风险预案 | ⏳ 待 Playwright 验证 |
-| P6 | 单元测试 | 📋 暂未交付 |
-| - | 任务失败/取消 subscribeState 枚举采集 | ⏳ 待运行日志采集 |
-| - | 大报表是否超时 | ⏳ 实际业务观察 |
+| P5 | checkSum 风险预案 | ✅ 预案已写（本SKILL.md 第八章），待 Playwright 实际触发验证 |
+| P6 | 单元测试 | ✅ `_test_jzt_kuaiche.py` 10/10 通过（不入仓，.gitignore 排除）|
+| - | 任务失败/取消 subscribeState 枚举采集 | ⏳ 待运行日志采集（已知 0/2 含义，-1 占位失败）|
+| - | 大报表是否超时 | ⏳ 实际业务观察（MAX_POLL_TIMES=15×3s=45s）|
+| - | 项目8响应判定 bug 修复 | ✅ str(code) 兼容字符串"1" |
+| - | Excel 后置处理 | ✅ 日期/数值/格式三规则已对齐 |
+| - | 项目9 全站营销单品计划上线 | ✅ 同步两步流程跑通 |
+| - | Cookie 管理规则 | ✅ 已写入 AGENTS.md |
 
 ---
 
@@ -238,6 +242,12 @@ with sync_playwright() as p:
 | 2026-08-07 | 阶段8 | downloadById 链路打通（拿 urlCsv） |
 | 2026-08-07 | 阶段9 | OSS 404 预热延迟重试（固定 3s）|
 | 2026-08-07 | 阶段10 | **完整流程封装** `run_full_export` + 调度器 callable 接入 + SUBSCRIBE_STATE_OK=2 修正 + OSS 重试改 3-10s 随机退避 + 本文档 |
+| 2026-08-09 | 阶段11 | **真实跑通 8/6 数据**——发现 subscribeState=0 长期不变但报表已生成，弃用状态字段改用**纯 downloadById 探针策略**；修复 OSS 404 重试「同 urlCsv 退避」不再重调 downloadById；`_random` → `random` |
+| 2026-08-09 | 阶段12 | **Excel 后置处理接入**——新增 `_post_process_csv_to_xlsx`（复用 `prepare_date_columns` / `safe_convert_numeric` / `apply_column_formats`）；OUTPUT_SUBDIR 改为「京准通快车效果自定义」；扩展 `_col_matches` 支持「商品定向SKU ID」类含空格的列名；新增 `METRIC_BLOCKLIST` 防止「SKU金额」被误套 0 位小数格式 |
+| 2026-08-09 | 阶段13 | **项目8 京准通快车订单效果明细上线**——新接口 `POST /reweb/msa/effect/order/download`（同步两步）；新增 `JZTKuaicheOrderEffectAPI`；输出 `output/京准通快车订单效果明细/{date}/`；修复 `str(code)` 兼容字符串"1"的隐藏 bug |
+| 2026-08-09 | 阶段14 | **项目9 京准通全站营销单品计划上线**——新接口 `POST /reweb/swa/account/campaign/download`；新增 `JZTQuanZhanCampaignAPI`；字段类型严格匹配抓包（giftFlag 等用字符串""，campaignTypes 是列表）；输出 `output/京准通全站营销单品计划/{date}/` |
+| 2026-08-09 | 阶段15 | **Cookie 管理规则写入 AGENTS.md**——默认保留本地 Cookie，仅 601/切账号/分享时才删 |
+| 2026-08-09 | 阶段16 | **代码提交 GitHub**——commit `c678c16`（3业务+规则+Excel扩展）+ `3fac25c`（.gitignore 补 `_test_*.py` 排除）|
 
 ---
 
