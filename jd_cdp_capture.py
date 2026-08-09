@@ -355,3 +355,45 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ============================================================
+# 📌 京准通快车自定义报表｜抓包指引（不参与自动化，纯粹手抓参考）
+# ============================================================
+# 业务背景：
+#     本脚本（jd_cdp_capture.py）目前只挂了"京麦 seller-v10"抓包过滤器，
+#     京准通 jzt.jd.com 的 3 个接口（add / list / downloadById）的请求特征不同，
+#     暂未在本脚本内增加独立过滤器。下面给出**手抓参考**，按需操作。
+#
+# 🔧 抓包步骤（京准通快车自定义报表，2026-08-07 实证）：
+#
+#   步骤 1：抓 Cookie（独立文件，不与商智/京麦互通）
+#     1. 浏览器登录 https://jzt.jd.com/home
+#     2. F12 → Network → 任意 jzt-api.jd.com 请求 → Request Headers
+#     3. 复制 Cookie 整段 → 写入 config/jzt_cookie.txt
+#     ⚠️ 不要从 sz.jd.com / seller-v10.shop.jd.com 抓 Cookie，**域不互通**
+#
+#   步骤 2：抓 h5st（一次性签名，会过期）
+#     1. 进入"自定义报表"页 → 配置维度/指标/日期 → 点"导出"
+#     2. F12 → Network → 找 POST /dataCenter/customreport/v2/report/add?...
+#     3. Request Headers → 找 "h5st" 字段 → 复制值
+#     4. 传入 run_business(h5st="xxx", ...)
+#     ⚠️ h5st 会过期（几小时-几天），每次跑任务前最好重新抓
+#     ⚠️ h5st 与 UA 绑定，**禁止切换 UA**（会立即失效）
+#
+#   步骤 3：观察 list 响应（采集 subscribeState 枚举）
+#     1. add 接口返回 task_id 后，在 Network 看 list 接口的响应
+#     2. 关注 data.data[] 里每条任务的 "subscribeState" 字段
+#     3. 已确认：0=排队中、2=完成
+#     4. 待补：失败/取消对应的数字（运行日志采集）
+#
+# ⚠️ 风险点：
+#   - h5st 过期：京准通返回 code=601（不重试）
+#   - Cookie 过期：返回 2001/302 或 message 含"未登录"（不重试，立即停）
+#   - checkSum 错误：payload 里硬编码 1114112，京东若更新 JS 算法会失败
+#     → 预案：Playwright page.evaluate() 提取 window.ParamsSign.sign() 真实值
+#
+# 📂 关联文件：
+#   - 主代码：main.py → class JZTKuaicheAPI（行 2547-3079）
+#   - 业务沉淀：docs/JZT_KUAICHE_SKILL.md
+#   - 抓包脚本（过滤器扩展预留）：本文件 CDPCapture 类（待按需扩展 jzt-api 关键词）

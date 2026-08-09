@@ -96,18 +96,42 @@ class BusinessNotFoundError(Exception):
 TEXT_FORCE_COLUMNS = {"订单编号"}
 # ⚠️ 整数0位小数白名单：命中列允许转为数字；写入Excel单元格格式为 0（数值、0位小数、无千分位）。
 INTEGER_ZERO_DECIMAL_COLUMNS = {"SKU", "SPU"}
+# ⚠️ 指标词黑名单（2026-08-09 订单明细接入后扩展）：
+#    列名同时含「指标词」的，不应命中 INTEGER_ZERO_DECIMAL_COLUMNS 等数值格式白名单
+#    例如「SKU金额」含"SKU"但其实是金额指标，应该保留默认 2 位小数格式
+#    例如「SKU数量」含"SKU"但是数量指标，应该保留默认 General 格式
+METRIC_BLOCKLIST = {"金额", "数量", "名称", "类型", "状态", "城市", "省份", "市", "省"}
 
 
 def _col_matches(col_name, name_set):
     """判断列名是否命中规则集合。
 
-    匹配规则：列名精确等于集合元素，或以集合元素结尾。
-    举例：列名"商品SKU"命中"SKU"（以SKU结尾）；而"成交金额（SPU）"不命中"SPU"（以）结尾），
-          避免把带（SPU）后缀的金额/客户数等指标列误套格式。
+    匹配规则（2026-08-09 京准通接入后扩展）：
+        ① 列名精确等于集合元素
+        ② 或以集合元素结尾（如 "商品SKU" → 命中 "SKU"）
+        ③ 或以集合元素+空格结尾（如 "商品定向SKU ID" → 命中 "SKU"）
+        ④ 或列名中包含集合元素+空格（如 "商品定向SKU ID" → 命中 "SKU"）
+
+    说明：
+        - 旧版仅 endswith，对"商品定向SKU ID"/"SPU ID"这种中间含空格的列名漏匹配
+        - 京准通快车表大量使用"商品定向SKU ID/跟单SKU ID/SPU ID"等列名规则
+        - 仍避开"成交金额（SPU）"型后缀——通过「关键词+空格/=」边界保护
+        - ⚠️ 2026-08-09 加 METRIC_BLOCKLIST：列名含指标词（金额/数量/名称/类型/状态/省/市）
+          的列不命中数值格式白名单，避免把 "SKU金额" 列误套 0 位小数格式
     """
     if col_name in name_set:
         return True
-    return any(col_name.endswith(name) for name in name_set)
+    # ⚠️ 含指标词的列不命中数值格式白名单
+    if any(metric in col_name for metric in METRIC_BLOCKLIST):
+        return False
+    for name in name_set:
+        # ① 严格结尾：XXXSKU（无空格干扰）
+        if col_name.endswith(name):
+            return True
+        # ② 列名中含「{name} 」+ 内容（如"商品定向SKU ID"）
+        if f"{name} " in col_name or f"{name}ID" in col_name:
+            return True
+    return False
 
 
 def convert_date_format(date_str):
@@ -2567,12 +2591,12 @@ class JZTKuaicheAPI:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0"
     )
-    OUTPUT_SUBDIR = "京准通快车"  # 落 output/京准通快车/{date}/ 子目录（AGENTS.md Excel规则4）
+    OUTPUT_SUBDIR = "京准通快车效果自定义"  # 落 output/京准通快车效果自定义/{date}/ 子目录（AGENTS.md Excel规则4）
 
     # ---- 阶段4 容错配置（用户决策 2026-08-07：POLL_INTERVAL=3s / MAX_POLL_TIMES=15）----
     POLL_INTERVAL = 3            # 轮询间隔（秒），报表生成等待
     MAX_POLL_TIMES = 15          # 轮询最大次数（3s × 15 = 45s 超时）
-    MAX_DOWNLOAD_RETRY = 3       # CDN 403 重试最大次数（重刷 URL 后指数退避）
+    MAX_DOWNLOAD_RETRY = 3       # CDN 404 重试最大次数（重刷 URL 后随机退避 3-10s）
 
     # ---- 京东业务码约定（与项目4/5/6 对齐）----
     # code=0 成功；code=601 h5st过期（不重试）；code=-407/-402 签名错（重试）；
@@ -2586,6 +2610,7 @@ class JZTKuaicheAPI:
             cookie_path - 京准通 Cookie 文件路径（默认 config/jzt_cookie.txt；与商智 Cookie 不互通）
         """
         import requests  # 本类独立按需导入，避免污染顶层 namespace
+        # random 模块已在 main.py 顶层 import，此处可直接使用 random.uniform()
 
         # 1. 读取 Cookie（不存在即抛错，强制用户抓包填入）
         cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
@@ -2825,69 +2850,122 @@ class JZTKuaicheAPI:
 
     # ---- 阶段4 容错：轮询等待报表生成 ----
 
-    # 任务状态映射（2026-08-07 真实 list 响应实证）
-    # 京准通实际状态字段是 subscribeState（int），含义待抓包确认（list 返回所有记录都是 0）
+    # 任务状态映射（2026-08-07 真实 list 响应实证 + atoms-api 对照修正）
+    # 京准通实际状态字段是 subscribeState（int）。
+    # ⚠️ 修正：旧版 SUBSCRIBE_STATE_OK=0 是错误推测；0 实际表示"排队处理中"。
+    #      抓包 atoms-api status=2 与 jzt-api subscribeState=2 一致 → 2=报表生成完成。
     # 兼容 expected_status 参数同时支持字符串（"报表已生成"）和整数（0/1/2...）
-    SUBSCRIBE_STATE_OK = 0   # 暂定 0=已完成（待用户补 list 抓包确认）
-    SUBSCRIBE_STATE_FAIL = -1  # 暂定 -1=失败（占位）
+    # ⚠️ 2026-08-09 真实跑通发现（task 22141980）：
+    #   旧推测「2=完成」是错的！实际 subscribeState 长期保持 0，但报表已生成好（downloadById 能拿到 urlCsv）
+    #   推测：subscribeState 字段含义不是"是否完成"，可能是"订阅/计划状态"等其他语义
+    #   **改用 downloadById 探针判定**（能拿到 urlCsv 即视为完成），subscribeState 仅作辅助
+    SUBSCRIBE_STATE_QUEUED = 1   # 占位（待确认）
+    SUBSCRIBE_STATE_OK = 0       # 暂定 0（但不可靠，请用 _probe_download_ready 替代）
+    SUBSCRIBE_STATE_FAIL = -1    # 暂定 -1=失败（占位）
 
     def wait_for_task_ready(self, task_id, expected_status=None) -> dict:
-        """轮询任务列表直到 task_id 达到 expected_status（默认 SUBSCRIBE_STATE_OK）。
+        """轮询任务列表直到任务可下载（纯探针策略）。
 
-        ⚠️ 阶段8 真实响应字段变更（2026-08-07 list 响应）：
-            - 任务 ID 字段：`reportId` → `id`
-            - 状态字段：`status`（字符串『报表已生成』）→ `subscribeState`（int，待补抓包确认语义）
-            - 列表字段：`records` → `data`（双层 data 嵌套：`data.data[]`）
-            - **响应中没有 downloadUrl/ossUrl 字段**（用户承诺补抓包，含已完成任务下载URL）
+        ⚠️ 2026-08-09 第二次修正（基于 task 22141984 真实跑通）：
+            subscribeState 字段语义**完全不可靠**——有时=0 是已完成，有时=0 是还没开始。
+            决定放弃 subscribeState 判定，改用**纯 downloadById 探针**：
+              - 每次轮询都调 downloadById，能拿到 urlCsv（且 OSS GET 200）即视为完成
+              - 探针失败 → 继续等
+              - 这样不依赖任何状态字段语义，跨京东版本兼容
 
         参数:
             task_id        - 来自 create_export_task 返回的任务 ID（int 或 str 都接受）
-            expected_status - 期望的状态值，None 时默认 SUBSCRIBE_STATE_OK
+            expected_status - 保留兼容参数，不再使用
         返回:
-            dict - 匹配到的任务记录（**不**含 downloadUrl，需另调下载接口）
+            dict - 任务记录（含 reportName/tempName 等用于下载）
         异常:
-            TimeoutError - 轮询超过 MAX_POLL_TIMES 次仍未就绪
+            TimeoutError - 探针仍失败
             CookieExpiredError / RuntimeError - 业务码异常
         """
         import time
 
         if expected_status is None:
-            expected_status = self.SUBSCRIBE_STATE_OK
+            expected_status = self.SUBSCRIBE_STATE_OK  # 保留兼容
+
+        first_iteration = True
 
         for i in range(1, self.MAX_POLL_TIMES + 1):
-            ret = self.get_task_list()  # 内部已统一异常识别
-            # ⚠️ 真实响应：list 数据是 data.data[]（双层 data 嵌套）
+            ret = self.get_task_list()
             records = ret.get("data", {}).get("data", [])
-            match_item = None
-            for item in records:
-                # 兼容 int/str 两种 task_id
-                if str(item.get("id")) == str(task_id):
-                    match_item = item
-                    break
+            match_item = next(
+                (item for item in records if str(item.get("id")) == str(task_id)),
+                None,
+            )
 
-            if match_item:
-                state = match_item.get("subscribeState")
-                print(f"  [轮询 {i}/{self.MAX_POLL_TIMES}] task_id={task_id} subscribeState={state!r}")
-                if state == expected_status:
-                    print(f"  ✅ 任务已就绪（subscribeState={state}）")
-                    return match_item
-                # 失败状态立即停
-                if state == self.SUBSCRIBE_STATE_FAIL:
-                    raise RuntimeError(
-                        f"❌ 任务生成失败 task_id={task_id}：{match_item}\n"
-                        f"   可能原因：payload 字段错 / 账号无权限 / 数据异常"
-                    )
-            else:
+            if not match_item:
                 print(f"  [轮询 {i}/{self.MAX_POLL_TIMES}] task_id={task_id} 任务未出现，继续等待...")
+                if i < self.MAX_POLL_TIMES:
+                    time.sleep(self.POLL_INTERVAL)
+                continue
+
+            state = match_item.get("subscribeState")
+            print(f"  [轮询 {i}/{self.MAX_POLL_TIMES}] task_id={task_id} subscribeState={state!r}（仅供参考）")
+
+            # 失败状态立即停（这是 list 唯一可信的判定）
+            if state == self.SUBSCRIBE_STATE_FAIL:
+                raise RuntimeError(
+                    f"❌ 任务生成失败 task_id={task_id}：{match_item}\n"
+                    f"   可能原因：payload 字段错 / 账号无权限 / 数据异常"
+                )
+
+            # ⚠️ 纯 downloadById 探针（每次轮询都跑，不依赖状态字段）
+            # 首次等待略长一些（避免无效探针）
+            if first_iteration:
+                first_iteration = False
+                print(f"  ⏳ 首次等待 {self.POLL_INTERVAL*2:.0f} 秒后再探针（避免无效请求）...")
+                time.sleep(self.POLL_INTERVAL * 2)
+                continue
+
+            probe_result = self._probe_download_ready(task_id, match_item)
+            if probe_result:
+                print(f"  ✅ 探针成功，任务已就绪（downloadById 能拿到 urlCsv）")
+                return match_item
 
             if i < self.MAX_POLL_TIMES:
                 time.sleep(self.POLL_INTERVAL)
 
         raise TimeoutError(
-            f"❌ 轮询超过最大次数 {self.MAX_POLL_TIMES}（{self.POLL_INTERVAL}秒 × {self.MAX_POLL_TIMES} = {self.POLL_INTERVAL*self.MAX_POLL_TIMES}秒）"
-            f"，任务仍未就绪：task_id={task_id}\n"
-            f"   可能原因：报表数据量极大 / 平台拥堵；可调整类常量 POLL_INTERVAL / MAX_POLL_TIMES 增大超时"
+            f"❌ 轮询超过最大次数 {self.MAX_POLL_TIMES}，downloadById 探针始终无法拿到 urlCsv\n"
+            f"   task_id={task_id}，可能原因：账号权限不足 / 数据异常 / 接口变更\n"
+            f"   可手动浏览器登录 https://jzt.jd.com 查看任务状态"
         )
+
+    def _probe_download_ready(self, task_id: str, match_item: dict) -> bool:
+        """探针：调 downloadById 看能否拿到 urlCsv（不实际下载）。
+
+        返回:
+            bool - True=报表已就绪可下载，False=还没生成
+        """
+        file_name = match_item.get("reportName") or match_item.get("tempName")
+        start_day = match_item.get("startTimeStr", "")
+        end_day = match_item.get("endTimeStr", "")
+        pin = match_item.get("pin", "")
+        if not file_name:
+            return False
+        try:
+            url = (
+                f"{self.BASE_URL}/downloadById"
+                f"?id={task_id}&name={file_name}"
+                f"&startDay={start_day}&endDay={end_day}"
+                f"&pin={pin}&fileName={file_name}"
+                f"&requestFrom=0&businessFrom=1"
+            )
+            resp = self.session.get(url, timeout=30)
+            if resp.status_code != 200:
+                return False
+            ret = resp.json()
+            # 成功判定：success=true + code∈{0,1} 且 data.urlCsv 非空
+            if ret.get("success", True) and ret.get("code") in (0, 1):
+                url_csv = ret.get("data", {}).get("urlCsv")
+                return bool(url_csv)
+            return False
+        except Exception:
+            return False
 
     # ---- 接口3：CDN 下载（阶段4：CDN 403 自动重刷 URL 重试）----
 
@@ -2909,7 +2987,7 @@ class JZTKuaicheAPI:
         异常:
             TimeoutError / CookieExpiredError / RuntimeError
         """
-        # 1. 轮询等待报表生成（subscribeState=0 即完成）
+        # 1. 轮询等待报表生成（subscribeState=2 即完成；0=排队中）
         match_item = self.wait_for_task_ready(task_id)
 
         # 2. 提取下载所需参数
@@ -2957,9 +3035,12 @@ class JZTKuaicheAPI:
                 f"   可能原因：报表还没真正生成 / 接口字段名变更"
             )
 
-        # 5. 立即 GET urlCsv（OSS 预签名链接，阶段9 发现 ~10 秒"预热延迟"会先返回 404）
-        # 必须"重试+重新拿 urlCsv"循环（因为旧 urlCsv 不会自动变可下载）
-        print(f"⬇️ 下载 urlCsv（OSS 预签名链接；前几次可能 404 NoSuchKey 需重试）")
+        # 5. 立即 GET urlCsv（OSS 预签名链接）
+        # ⚠️ 2026-08-09 修正：单纯 GET 同 URL 重试即可（OSS链接有效期内稳定）
+        #   旧版"每次失败重调 downloadById 拿新 urlCsv"是错的：
+        #   - 新 urlCsv 是新 OSS 文件路径，新文件可能还没生成
+        #   - 京东 OSS 是异步生成，旧 urlCsv 对应的文件**正在生成中**，多等几次就 200
+        print(f"⬇️ 下载 urlCsv（OSS 预签名链接；首次可能 404 等几秒重试）")
         print(f"  URL 前 80 字符: {url_csv[:80]}...")
 
         resp_csv = None
@@ -2974,23 +3055,17 @@ class JZTKuaicheAPI:
                 # 200 成功
                 if resp_csv.status_code == 200:
                     break
-                # 404 NoSuchKey（OSS 链接"预热中"或已过期）→ 重新拿 urlCsv
+                # 404 NoSuchKey（OSS 文件还在生成中）→ 同一 urlCsv 退避重试
                 if resp_csv.status_code == 404 and retry < self.MAX_DOWNLOAD_RETRY:
+                    import time as _time
+                    # ⚠️ 随机退避 3-10 秒（避免固定间隔被风控识别；同时给 OSS 足够预热时间）
+                    backoff = random.uniform(3, 10)
                     print(
                         f"  ⚠️ 第 {retry+1}/{self.MAX_DOWNLOAD_RETRY+1} 次 urlCsv 404 NoSuchKey"
-                        f"，重新调 downloadById 拿新 urlCsv..."
+                        f"，随机退避 {backoff:.1f} 秒后重试（同一 urlCsv）..."
                     )
-                    import time as _time
-                    _time.sleep(3)  # 等 3 秒让 OSS 完成预热
-                    # 重新调 downloadById
-                    resp_byid_retry = self.session.get(downloadbyid_url, timeout=60)
-                    resp_byid_retry.raise_for_status()
-                    ret_byid_retry = resp_byid_retry.json()
-                    new_url = ret_byid_retry.get("data", {}).get("urlCsv")
-                    if not new_url:
-                        raise RuntimeError(f"❌ 重试 downloadById 响应无 urlCsv：{ret_byid_retry}")
-                    url_csv = new_url
-                    continue
+                    _time.sleep(backoff)
+                    continue  # 注意：不重新调 downloadById，同一 urlCsv 继续 GET
                 # 其他非 200
                 resp_csv.raise_for_status()
             except requests.exceptions.RequestException as e:
@@ -3005,14 +3080,439 @@ class JZTKuaicheAPI:
                 f"   可能原因：报表生成尚未完成 / OSS 预热延迟超出预期"
             )
 
-        # 6. 保存到 output/京准通快车/{save_filename}
-        os.makedirs(self.output_dir, exist_ok=True)
-        target_path = os.path.join(self.output_dir, save_filename)
-        with open(target_path, "wb") as f:
-            f.write(resp_csv.content)
+        # 6. 落盘 + Excel 后置处理（2026-08-09 对齐 AGENTS.md Excel 报表统一规则）
+        #    流程：raw CSV → pandas 读取(dtype=str) → prepare_date_columns →
+        #          safe_convert_numeric → 转存为 .xlsx + apply_column_formats
+        #    输出路径遵循 AGENTS.md Excel规则4：output/京准通快车效果自定义/{date}/业务名_日期.xlsx
+        return self._post_process_csv_to_xlsx(resp_csv.content, task_id)
+
+    # ---- Excel 后置处理：CSV → xlsx ----
+
+    def _post_process_csv_to_xlsx(self, csv_bytes: bytes, task_id) -> str:
+        """把京东 OSS 返回的 raw CSV 字节流 → 标准 Excel 后置处理 → 保存为 xlsx。
+
+        流程（对齐 AGENTS.md Excel 报表统一规则 + 商品流失分析项目6 模式）：
+            ① pandas.read_csv(dtype=str, na_filter=False) → 防精度丢失
+            ② prepare_date_columns(df, date) → 日期列智能处理（公共规则1+2）
+            ③ safe_convert_numeric(df) → 数值安全转换（公共规则3）
+            ④ 转存为 .xlsx + apply_column_formats 设置单元格格式（SKU/SPU 0位小数、订单编号@）
+            ⑤ 落盘路径：output/京准通快车效果自定义/{date}/京准通快车效果自定义_{date}.xlsx
+
+        参数:
+            csv_bytes - OSS 下载的原始 CSV 字节流（含 UTF-8 BOM）
+            task_id   - 任务 ID（用于日志关联）
+        返回:
+            str - 保存的 .xlsx 绝对路径
+        异常:
+            RuntimeError - CSV 解析失败
+        """
+        import io
+        import pandas as pd
+
+        # ⚠️ 京准通 OSS 返回的 CSV 文件名通常带"下载.csv"等中文，这里从任务获取干净文件名
+        match_item = self._find_task_in_list(task_id)
+        clean_date = match_item.get("startTimeStr", "") if match_item else ""
+        if not clean_date:
+            # 兜底：从 list 找、或用今天
+            from datetime import datetime as _dt
+            clean_date = _dt.now().strftime("%Y-%m-%d")
+
+        # 1. 读取 CSV（dtype=str 防长数字精度丢失；na_filter=False 防 "0" 被当 NaN）
+        try:
+            df = pd.read_csv(
+                io.BytesIO(csv_bytes),
+                dtype=str,
+                na_filter=False,
+                encoding="utf-8-sig",  # 兼容 BOM
+                keep_default_na=False,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"❌ CSV 解析失败：{e}\n"
+                f"   任务 task_id={task_id}，请检查 OSS 返回内容是否正常"
+            ) from e
+
+        if df.empty:
+            raise RuntimeError(f"❌ CSV 数据为空：task_id={task_id}")
+
+        # 2. 日期列智能处理（公共规则1+2）
+        date_column, date_value = prepare_date_columns(df, clean_date)
+
+        # 3. 数值安全转换（公共规则3）
+        df = safe_convert_numeric(df)
+
+        # 4. 构造输出路径：output/京准通快车效果自定义/{date}/京准通快车效果自定义_{date}.xlsx
+        date_subdir = os.path.join(self.output_dir, clean_date)
+        os.makedirs(date_subdir, exist_ok=True)
+        save_filename = f"京准通快车效果自定义_{clean_date}.xlsx"
+        target_path = os.path.join(date_subdir, save_filename)
+
+        # 5. 写 xlsx + 设置单元格格式
+        df.to_excel(target_path, index=False, engine="openpyxl")
+        apply_column_formats(target_path, df, date_column=date_column, date_value=date_value)
+
         print(
             f"✅ 文件已保存：{target_path}"
-            f"（{len(resp_csv.content)} 字节，Content-Type={resp_csv.headers.get('Content-Type', '无')}）"
+            f"\n   （CSV→xlsx 转存 + 日期列 + 数值转换 + 单元格格式，{os.path.getsize(target_path)}字节，{len(df)}行 × {len(df.columns)}列）"
+        )
+        return target_path
+
+    def _find_task_in_list(self, task_id) -> dict:
+        """从 list 接口获取目标任务信息（用于提取日期等参数）。"""
+        try:
+            ret = self.get_task_list()
+            records = ret.get("data", {}).get("data", [])
+            for item in records:
+                if str(item.get("id")) == str(task_id):
+                    return item
+        except Exception:
+            pass
+        return {}
+
+    # ---- 阶段10 完整流程封装（一键跑通）----
+
+    def run_full_export(
+        self,
+        start_date: str = None,
+        end_date: str = None,
+        date: str = None,
+        save_filename: str = None,
+    ) -> str:
+        """一键跑通：创建任务 → 内部轮询等待 → downloadById 拿 urlCsv → OSS 下载落盘。
+
+        ⚠️ 推荐对外调用入口：外部不需要手工编排多步，本方法封装完整三步异步流程。
+        设计动机：原 BUSINESS_REGISTRY 仅挂 create_export_task，需要外部手动调 download_report。
+                    现统一为 run_full_export 一步到位，调度器只需要注册这一个方法。
+
+        参数:
+            start_date    - 开始日期 YYYY-MM-DD（默认 = date）
+            end_date      - 结束日期 YYYY-MM-DD（默认 = date）
+            date          - 单日查询 YYYY-MM-DD（start/end 默认 = date）
+            save_filename - 保存文件名（如 "快车_2026-08-07.csv"）；None 时按日期+时间戳自动命名
+        返回:
+            str - 保存的文件绝对路径
+        异常:
+            CookieExpiredError / TimeoutError / RuntimeError
+        """
+        # 1. 三值一致规则（与项目1-6 调度层对齐）
+        if date is None and start_date is None and end_date is None:
+            raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
+        if start_date is None:
+            start_date = date
+        if end_date is None:
+            end_date = date
+
+        # 2. 默认文件名：含日期范围 + 时间戳，避免重复覆盖
+        if save_filename is None:
+            from datetime import datetime as _dt
+            ts = _dt.now().strftime("%H%M%S")
+            save_filename = f"快车_{start_date}_{end_date}_{ts}.csv"
+
+        # 3. 完整链路
+        print(f"🚀 [JZT快车] 启动完整导出：{start_date} ~ {end_date}")
+        print(f"   └─ Step 1/3: 创建导出任务...")
+        task_id = self.create_export_task(date=date, start_date=start_date, end_date=end_date)
+        print(f"   └─ Step 2/3: 轮询等待任务就绪（subscribeState=2）...")
+        print(f"   └─ Step 3/3: 下载并落盘...")
+        return self.download_report(task_id, save_filename)
+
+
+# ============================================================
+#  业务接口 6：（新业务 - 京准通快车订单效果明细报表，2026-08-09 上线）
+# ------------------------------------------------------------
+#  中文说明（小白必读）：
+#    京东快车订单效果明细报表（reweb/msa/effect/order/download）
+#    与"业务接口5"自定义报表**完全不同的接口**：本接口是**同步返回下载链接**，
+#    调一次 POST 就直接拿到 downloadUrlCsv，不需要轮询 list 接口等异步任务。
+#
+#  ⚠️ 核心差异（与项目7对比）：
+#    - 接口 URL 不同：reweb/msa/effect/order/download（不是 /dataCenter/customreport/v2/report/add）
+#    - 流程：POST 同步返回下载链接 → 立即 GET urlCsv → 落盘
+#    - 无 h5st：抓包请求头无 h5st 字段，与项目7一致
+#    - 报表名：必须传 reportName 字段（决定下载文件名）；无重名检测要求（待验证）
+#    - 数据维度：订单明细（订单号 / SKU ID / 金额 / 时间 / 地域 / 订单类型）
+#
+#  参数说明（2026-08-09 抓包实证）：
+#    业务固定参数（类常量，不变）：
+#      clickOrOrderCaliber=0   # 点击/下单口径：0=点击
+#      clickOrOrderDay=15       # 转化周期：15天
+#      giftFlag=0               # 含赠品：0=不含
+#      orderStatusCategory=1    # 下单/成交订单：1=成交订单
+#      orderType="1,3"          # 订单类型（抓包值，含义待补）
+#      orderStatuses=[]         # 订单状态列表（空）
+#    日期参数（每次可变）：
+#      startDay / endDay → 优先用入参
+#    报表名（动态）：
+#      reportName 格式：{pin}_{固定描述}_{startDay}_{endDay} → 例：
+#        "FYA8888_报表中心_订单_15天_点击_不含赠品_20260807_20260807"
+# ============================================================
+
+class JZTKuaicheOrderEffectAPI:
+    """京准通快车订单效果明细报表导出 API（2026-08-09 上线骨架）。
+
+    ⚠️ 本类**不继承 JDBaseRequest**（与项目7 同样的原因）：
+        - 鉴权体系：仅 Cookie（与项目7 同一文件 config/jzt_cookie.txt）
+        - 流程：同步两步（POST → 立即 GET OSS），不需要基类的 30 秒间隔/重试模型
+        - UA：禁止切换（h5st 与 UA 绑定；本接口无 h5st 但保留习惯）
+    """
+
+    # ---- 类常量（业务固定参数）----
+    BASE_URL = "https://jzt-api.jd.com/reweb/msa/effect/order/download"
+    ORIGIN = "https://jzt.jd.com"
+    REFERER = "https://jzt.jd.com/"
+    SITE_ID = "0"
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
+    )
+    OUTPUT_SUBDIR = "京准通快车订单效果明细"  # output/京准通快车订单效果明细/{date}/
+
+    # 业务固定参数（抓包值，2026-08-09 实证）
+    CLICK_OR_ORDER_CALIBER = 0      # 0=点击
+    CLICK_OR_ORDER_DAY = 15         # 转化周期：15 天
+    GIFT_FLAG = 0                   # 0=不含赠品
+    ORDER_STATUS_CATEGORY = 1       # 1=成交订单
+    ORDER_TYPE = "1,3"              # 订单类型（含义待补查）
+    PIN_ID = "FYA8888"
+
+    def __init__(self, cookie_path: str = "config/jzt_cookie.txt"):
+        import requests
+
+        # 读 Cookie（与项目7 互通 jzt_cookie.txt）
+        cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
+        if not os.path.isfile(cookie_path_abs):
+            raise FileNotFoundError(
+                f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
+                f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入此文件"
+            )
+        with open(cookie_path_abs, "r", encoding="utf-8") as f:
+            self.cookie = f.read().strip()
+        if not self.cookie:
+            raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": self.USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Content-Type": "application/json",
+            "Origin": self.ORIGIN,
+            "Referer": self.REFERER,
+            "language": "zh_CN",
+            "siteid": self.SITE_ID,
+            "sec-ch-ua": '"Not=A?Brand";v="99", "Microsoft Edge";v="151", "Chromium";v="151"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "Cookie": self.cookie,
+        })
+
+        # 输出目录（按 AGENTS.md Excel规则4）
+        self.output_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "output", self.OUTPUT_SUBDIR,
+        )
+
+    # ---- 业务参数组装 ----
+    def _build_payload(self, start_day: str, end_day: str) -> dict:
+        """组装请求 payload（抓包实证 + 动态日期）。"""
+        from datetime import datetime as _dt
+
+        # 报表名：FYA8888_报表中心_订单_15天_点击_不含赠品_{startDay}_{endDay}
+        # 注意：长度需 < 30 字符（实测安全），加日期足够区分
+        # 抓包原始长度：FYA8888_报表中心_订单_15天_点击_不含赠品_20260807_20260807 ≈ 46 字符
+        #   ⚠️ 超过 30 字符，但实测能跑通；如需严格 < 30 再压缩
+        report_name = (
+            f"{self.PIN_ID}_报表中心_订单_{self.CLICK_OR_ORDER_DAY}天_"
+            f"{'点击' if self.CLICK_OR_ORDER_CALIBER == 0 else '下单'}_"
+            f"{'不含赠品' if self.GIFT_FLAG == 0 else '含赠品'}_"
+            f"{start_day}_{end_day}"
+        )
+        return {
+            "startDay": start_day,
+            "endDay": end_day,
+            "clickOrOrderCaliber": self.CLICK_OR_ORDER_CALIBER,
+            "clickOrOrderDay": self.CLICK_OR_ORDER_DAY,
+            "giftFlag": self.GIFT_FLAG,
+            "orderStatusCategory": self.ORDER_STATUS_CATEGORY,
+            "orderType": self.ORDER_TYPE,
+            "orderStatuses": [],
+            "reportName": report_name,
+        }
+
+    def _handle_response(self, ret: dict, op_desc: str):
+        """统一处理响应（与项目7 同样的双字段判定）。
+
+        京东快车订单接口的判定：
+            - success=true
+            - code=1（数字）
+            - data.code == "RC_SUCCESS"（字符串）
+            - data.downloadUrlCsv 非空
+        """
+        if not ret.get("success", True):
+            msg = ret.get("msg", "未知错误")
+            code = ret.get("code")
+            if code in (2001, 302) or "未登录" in msg or "登录已过期" in msg:
+                raise CookieExpiredError(
+                    f"❌ 京准通 Cookie 过期（{op_desc}返回 code={code}）：\n"
+                    f"   → 请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入 config/jzt_cookie.txt"
+                )
+            if code == 601:
+                raise RuntimeError(
+                    f"❌ 京准通 订单接口 限流 code=601：{msg}\n"
+                    f"   → 30-120 分钟冷却，避免重试加重风控"
+                )
+            raise RuntimeError(
+                f"❌ 京准通{op_desc}失败：code={code}, msg={msg}, 完整响应={ret}"
+            )
+        code = ret.get("code")
+        data_code = ret.get("data", {}).get("code")
+        # ⚠️ 2026-08-09 项目9 全站营销接口探针发现：code 可能是字符串 "1" 而非数字 1
+        # 兼容写法：str(code) 后再判
+        if str(code) not in ("0", "1") or data_code != "RC_SUCCESS":
+            raise RuntimeError(
+                f"❌ 京准通{op_desc}业务失败：code={code}, data.code={data_code}\n"
+                f"   完整响应：{ret}"
+            )
+        return ret
+
+    # ---- 一步：同步 POST 拿 downloadUrlCsv ----
+    def _post_for_csv(self, start_day: str, end_day: str) -> str:
+        """POST 同步返回 downloadUrlCsv。
+
+        返回:
+            str - OSS 预签名链接（10 分钟有效）
+        异常:
+            CookieExpiredError / RuntimeError
+        """
+        payload = self._build_payload(start_day, end_day)
+        print(f"🚀 [JZT快车订单明细] POST {self.BASE_URL}")
+        print(f"   Body: {json.dumps(payload, ensure_ascii=False)}")
+
+        resp = self.session.post(self.BASE_URL, json=payload, timeout=60)
+        resp.raise_for_status()
+        ret = resp.json()
+        self._handle_response(ret, op_desc="导出订单明细")
+
+        download_url = ret.get("data", {}).get("downloadUrlCsv")
+        if not download_url:
+            raise RuntimeError(f"❌ 响应中 downloadUrlCsv 缺失：{ret}")
+        download_id = ret.get("data", {}).get("downloadId")
+        print(f"✅ 拿到 downloadId={download_id}, downloadUrlCsv（前80字符）: {download_url[:80]}...")
+        return download_url
+
+    # ---- 二步：GET OSS 下载 CSV 字节流 ----
+    def _download_csv(self, url_csv: str) -> bytes:
+        """GET OSS 链接，下载 CSV 字节流（带 404 随机退避重试）。
+
+        OSS 链接 10 分钟有效，但首次可能 404 NoSuchKey（异步生成）。
+        """
+        last_error = None
+        for retry in range(4):  # 最多 4 次
+            try:
+                resp = requests.get(
+                    url_csv,
+                    headers={"User-Agent": self.USER_AGENT},
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    return resp.content
+                if resp.status_code == 404:
+                    backoff = random.uniform(3, 10)
+                    print(
+                        f"  ⚠️ 第 {retry+1}/4 次 urlCsv 404 NoSuchKey，"
+                        f"随机退避 {backoff:.1f} 秒后重试..."
+                    )
+                    time.sleep(backoff)
+                    continue
+                resp.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                last_error = e
+                print(f"  ⚠️ urlCsv 下载异常：{e}，重试中...")
+                time.sleep(random.uniform(3, 10))
+        raise RuntimeError(
+            f"❌ urlCsv 下载失败（重试 4 次后）：{last_error}\n"
+            f"   URL: {url_csv[:120]}"
+        )
+
+    # ---- 一键封装（推荐对外入口）----
+    def run_full_export(
+        self,
+        start_date: str = None,
+        end_date: str = None,
+        date: str = None,
+    ) -> str:
+        """一键跑通：POST 同步拿 urlCsv → GET OSS 下载 → Excel 后置处理 → 落盘。
+
+        参数:
+            start_date - 开始日期 YYYY-MM-DD（默认 = date）
+            end_date   - 结束日期 YYYY-MM-DD（默认 = date）
+            date       - 单日查询 YYYY-MM-DD
+        返回:
+            str - 保存的 .xlsx 绝对路径
+        """
+        if date is None and start_date is None and end_date is None:
+            raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
+        if start_date is None:
+            start_date = date
+        if end_date is None:
+            end_date = date
+
+        print(f"🚀 [JZT快车订单明细] 启动完整导出：{start_date} ~ {end_date}")
+        print(f"   └─ Step 1/2: POST 同步拿 downloadUrlCsv...")
+        url_csv = self._post_for_csv(start_date, end_date)
+        print(f"   └─ Step 2/2: GET OSS 下载并落盘为 xlsx...")
+        csv_bytes = self._download_csv(url_csv)
+
+        # 复用项目7 的 Excel 后置处理（日期/数值/格式）
+        return self._post_process_csv_to_xlsx(csv_bytes, start_date)
+
+    def _post_process_csv_to_xlsx(self, csv_bytes: bytes, clean_date: str) -> str:
+        """把 OSS 下载的 raw CSV → 标准 Excel 后置处理 → 保存为 xlsx。
+
+        与项目7 共用同样的 prepare_date_columns / safe_convert_numeric / apply_column_formats。
+        """
+        import io
+        import pandas as pd
+
+        # 1. 读取 CSV（dtype=str 防精度丢失；UTF-8-sig 兼容 BOM）
+        try:
+            df = pd.read_csv(
+                io.BytesIO(csv_bytes),
+                dtype=str,
+                na_filter=False,
+                encoding="utf-8-sig",
+                keep_default_na=False,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"❌ CSV 解析失败：{e}\n"
+                f"   请检查 OSS 返回内容是否正常（可能含 BOM 或格式变化）"
+            ) from e
+
+        if df.empty:
+            raise RuntimeError("❌ CSV 数据为空")
+
+        # 2. 日期列智能处理（公共规则1+2）
+        #    本报表自带"点击时间"/"下单时间"列 → 不会插入新日期列，只做格式标准化
+        date_column, date_value = prepare_date_columns(df, clean_date)
+
+        # 3. 数值安全转换（公共规则3）—— 订单编号强制文本，SKU 转数字 0 位小数
+        df = safe_convert_numeric(df)
+
+        # 4. 构造输出路径：output/京准通快车订单效果明细/{date}/业务名_{date}.xlsx
+        date_subdir = os.path.join(self.output_dir, clean_date)
+        os.makedirs(date_subdir, exist_ok=True)
+        save_filename = f"京准通快车订单效果明细_{clean_date}.xlsx"
+        target_path = os.path.join(date_subdir, save_filename)
+
+        # 5. 写 xlsx + 单元格格式
+        df.to_excel(target_path, index=False, engine="openpyxl")
+        apply_column_formats(target_path, df, date_column=date_column, date_value=date_value)
+
+        print(
+            f"✅ 文件已保存：{target_path}"
+            f"\n   （CSV→xlsx 转存 + 日期列 + 数值转换 + 单元格格式，{os.path.getsize(target_path)}字节，{len(df)}行 × {len(df.columns)}列）"
         )
         return target_path
 
@@ -3116,20 +3616,446 @@ BUSINESS_REGISTRY = {
             "endDate": "结束日期（默认=date）",
         },
     },
-    # 业务：京准通快车自定义报表（2026-08-07 上线骨架，h5st鉴权，独立Cookie文件，不继承基类）
-    # ⚠️ 阶段3 骨架：仅3接口方法，不含轮询/Excel解析；调用方需手动传入 h5st
+    # 业务：京准通快车自定义报表（阶段10：完整三步流程接入调度器）
+    # ⚠️ 调度器支持两种注册方式：
+    #   1. 标准方式：api_class + method（基类方法自动实例化）
+    #   2. callable 方式：本业务因 h5st/cookie_path 需动态注入，采用自定义函数直接注册
+    #   get_business_handler() 检测到 info.get("callable") 时优先返回该函数
     "京准通快车自定义报表": {
-        "api_class": JZTKuaicheAPI,
-        "method": "create_export_task",  # 仅作为入口方法占位；完整流程由调用方编排
-        "desc": "京准通快车自定义报表导出（h5st鉴权，独立Cookie，3接口骨架不含轮询）",
+        "api_class": JZTKuaicheAPI,  # 兼容老调用；实际调度走 callable
+        "method": "run_full_export",  # 实例化后也支持直调
+        "callable": None,  # 占位：下方 _run_jzt_kuaiche_full 函数定义后注入（避免前向引用错误）
+        "desc": "京准通快车自定义报表导出（h5st鉴权，独立Cookie，三步异步：add→轮询→CDN下载）",
         "params": {
             "h5st": "必填，浏览器F12抓add接口请求头复制（外部传入）",
             "start_date": "开始日期YYYY-MM-DD",
             "end_date": "结束日期YYYY-MM-DD",
-            "cookie_path": "京准通Cookie路径（默认config/jzt_cookie.txt）",
+            "cookie_path": "京准通Cookie路径（默认config/jzt_cookie.txt，可选）",
+        },
+    },
+    # 业务：京准通快车订单效果明细（2026-08-09 上线，同步两步流程）
+    #   同步接口：POST /reweb/msa/effect/order/download 直接返回 downloadUrlCsv
+    #   无 h5st（抓包实证）；复用 jzt_cookie.txt；输出到 output/京准通快车订单效果明细/{date}/
+    "京准通快车订单效果明细": {
+        "api_class": JZTKuaicheOrderEffectAPI,
+        "method": "run_full_export",
+        "callable": None,  # 占位：下方 _run_jzt_order_effect_full 函数定义后注入
+        "desc": "京准通快车订单效果明细导出（同步两步：POST拿urlCsv→GET下载）",
+        "params": {
+            "date": "查询日期YYYY-MM-DD（单日查询）",
+            "start_date": "开始日期YYYY-MM-DD（区间查询，可选）",
+            "end_date": "结束日期YYYY-MM-DD（区间查询，可选）",
+            "cookie_path": "京准通Cookie路径（默认config/jzt_cookie.txt，可选）",
+        },
+    },
+    # 业务：京准通全站营销单品计划（2026-08-09 上线，同步两步流程）
+    #   同步接口：POST /reweb/swa/account/campaign/download 直接返回 downloadUrlCsv
+    #   字段差异：giftFlag/orderStatus/sxuId/obys/province 是字符串""；campaignTypes 是列表
+    #   输出到 output/京准通全站营销单品计划/{date}/
+    "京准通全站营销单品计划": {
+        "api_class": None,  # 占位：下方 JZTQuanZhanCampaignAPI 类定义后注入
+        "method": "run_full_export",
+        "callable": None,  # 占位：下方 _run_jzt_quanzhan_campaign_full 函数定义后注入
+        "desc": "京准通全站营销单品计划报表导出（同步两步：POST拿urlCsv→GET下载）",
+        "params": {
+            "date": "查询日期YYYY-MM-DD（单日查询）",
+            "start_date": "开始日期YYYY-MM-DD（区间查询，可选）",
+            "end_date": "结束日期YYYY-MM-DD（区间查询，可选）",
+            "cookie_path": "京准通Cookie路径（默认config/jzt_cookie.txt，可选）",
         },
     },
 }
+
+
+def _run_jzt_kuaiche_full(**kwargs) -> str:
+    """调度器专用的京准通快车完整流程函数。
+
+    ⚠️ 注册到 BUSINESS_REGISTRY["京准通快车自定义报表"]["callable"]，
+       get_business_handler 检测到 callable 字段时优先返回本函数。
+    设计动机：JZTKuaicheAPI.__init__ 需要 h5st 和 cookie_path 参数，
+              而基类的标准调度路径只支持无参 __init__ → 实例化 → 调方法，
+              无法透传这两个值。本函数手动构造实例并调用 run_full_export。
+
+    参数:
+        kwargs - 来自 run_business 的透传参数：
+            h5st       (str): 必填，浏览器F12抓 add 接口请求头的 h5st 值
+            start_date (str): 开始日期 YYYY-MM-DD
+            end_date   (str): 结束日期 YYYY-MM-DD
+            date       (str): 单日查询（start/end 默认=date）
+            cookie_path(str): 可选，默认 config/jzt_cookie.txt
+            save_filename(str): 可选，默认按日期+时间戳自动命名
+    返回:
+        str - 保存的文件绝对路径
+    异常:
+        ValueError - 缺 h5st 或日期参数时
+        CookieExpiredError / TimeoutError / RuntimeError
+    """
+    # ⚠️ h5st **可选**（2026-08-07 抓包实证：add 接口不校验 h5st）
+    #   - 不传 h5st：可跑通 add/list/downloadById 三步（最常见情况）
+    #   - 传 h5st：增强未来接口升级风控时的兼容性
+    #   - 何时需要：若 list/downloadById 返回 code=601 "操作频繁"，说明接口开始校验 h5st，
+    #                此时浏览器F12抓 add 接口请求头的 h5st 值传入即可
+    h5st = kwargs.get("h5st", "")
+    # 不再强制必传，但给个温和提醒
+    if not h5st:
+        print("ℹ️  未传 h5st（add 接口抓包实测不校验，可正常跑；若报 601 请浏览器F12抓 add 接口的 h5st 重试）")
+
+    # 提取透传给 run_full_export 的参数
+    forward_kwargs = {
+        k: kwargs[k] for k in ("start_date", "end_date", "date", "save_filename")
+        if k in kwargs
+    }
+
+    api = JZTKuaicheAPI(h5st=h5st, cookie_path=kwargs.get("cookie_path", "config/jzt_cookie.txt"))
+    return api.run_full_export(**forward_kwargs)
+
+
+def _run_jzt_order_effect_full(**kwargs) -> str:
+    """调度器专用的京准通快车订单效果明细完整流程函数（2026-08-09 上线）。
+
+    ⚠️ 注册到 BUSINESS_REGISTRY["京准通快车订单效果明细"]["callable"]。
+    设计动机：JZTKuaicheOrderEffectAPI.__init__ 需要 cookie_path，
+              标准调度路径不支持构造参数注入，本函数手动构造实例并调用 run_full_export。
+
+    参数:
+        kwargs - 来自 run_business 的透传参数：
+            date       (str): 单日查询 YYYY-MM-DD
+            start_date (str): 开始日期 YYYY-MM-DD（区间查询）
+            end_date   (str): 结束日期 YYYY-MM-DD
+            cookie_path(str): 可选，默认 config/jzt_cookie.txt
+    返回:
+        str - 保存的文件绝对路径
+    异常:
+        ValueError - 缺日期参数时
+        CookieExpiredError / RuntimeError
+    """
+    forward_kwargs = {
+        k: kwargs[k] for k in ("start_date", "end_date", "date")
+        if k in kwargs
+    }
+    api = JZTKuaicheOrderEffectAPI(cookie_path=kwargs.get("cookie_path", "config/jzt_cookie.txt"))
+    return api.run_full_export(**forward_kwargs)
+
+
+def _run_jzt_quanzhan_campaign_full(**kwargs) -> str:
+    """调度器专用的京准通全站营销单品计划完整流程函数（2026-08-09 上线）。
+
+    ⚠️ 注册到 BUSINESS_REGISTRY["京准通全站营销单品计划"]["callable"]。
+    设计动机：与 _run_jzt_order_effect_full 同——本类 __init__ 需要 cookie_path。
+
+    参数:
+        kwargs - 来自 run_business 的透传参数：
+            date       (str): 单日查询 YYYY-MM-DD
+            start_date (str): 开始日期 YYYY-MM-DD（区间查询）
+            end_date   (str): 结束日期 YYYY-MM-DD
+            cookie_path(str): 可选，默认 config/jzt_cookie.txt
+    返回:
+        str - 保存的文件绝对路径
+    异常:
+        ValueError - 缺日期参数时
+        CookieExpiredError / RuntimeError
+    """
+    forward_kwargs = {
+        k: kwargs[k] for k in ("start_date", "end_date", "date")
+        if k in kwargs
+    }
+    api = JZTQuanZhanCampaignAPI(cookie_path=kwargs.get("cookie_path", "config/jzt_cookie.txt"))
+    return api.run_full_export(**forward_kwargs)
+
+
+# ============================================================
+#  业务接口 7：（新业务 - 京准通-全站营销单品计划报表，2026-08-09 上线）
+# ------------------------------------------------------------
+#  中文说明（小白必读）：
+#    京准通-全站营销（reweb/swa/account/campaign/download）下的「单品计划报表」，
+#    与"业务接口6"订单效果明细**几乎同模式**：同步两步返回下载链接。
+#
+#  ⚠️ 核心差异（与项目8对比）：
+#    - 接口 URL 不同：reweb/swa/account/campaign/download（不是 reweb/msa/effect/order/download）
+#    - 路径含义：swa=全站营销（Search Whole-site Advertising） / account=账户 / campaign=计划
+#    - payload 字段更多：dateValues[]（日期数组）/isDaily（日报标志）/campaignTypes[]（业务类型）
+#    - 字段类型不同：giftFlag 是字符串 ""（不是数字 0）；其他空字段也是字符串
+#    - 报表名格式：{pin}_全站营销_单品计划报表_{startDay}_{endDay}
+#    - 数据维度：商品计划 / 投放类型 / 花费 / 全站投产比 / 订单行 / 智能补贴券
+#
+#  参数说明（2026-08-09 抓包实证）：
+#    业务固定参数（类常量，不变）：
+#      platform=""                 # 平台（空=不限）
+#      campaignTypes=[101]         # 业务类型：101=京东快车（推测）
+#      province=""                 # 省份过滤（空=全国）
+#      clickOrOrderDay=15          # 转化周期：15天
+#      clickOrOrderCaliber=0       # 0=点击
+#      isDaily=True                # 日报标志
+#      orderStatusCategory=1       # 1=成交订单
+#      orderStatus=""              # 订单状态过滤（空）
+#      giftFlag=""                 # 含赠品（字符串空）
+#      sxuId=""                    # SKU 过滤（空）
+#      obys=""                     # 对象过滤（空）
+#    日期参数：
+#      startDay / endDay          # 顶层
+#      dateValues=[{startDay,endDay}]  # 同时要传
+#    报表名（动态）：
+#      reportName 格式：{pin}_全站营销_单品计划报表_{startDay}_{endDay}
+# ============================================================
+
+class JZTQuanZhanCampaignAPI:
+    """京准通-全站营销单品计划报表导出 API（2026-08-09 上线骨架）。
+
+    ⚠️ 本类**不继承 JDBaseRequest**（与项目7/8 同样的原因）：
+        - 鉴权体系：仅 Cookie（与项目7/8 同一文件 config/jzt_cookie.txt）
+        - 流程：同步两步（POST → 立即 GET OSS），不需要基类的 30 秒间隔/重试模型
+        - UA：禁止切换（h5st 与 UA 绑定；本接口无 h5st 但保留习惯）
+    """
+
+    # ---- 类常量（业务固定参数）----
+    BASE_URL = "https://jzt-api.jd.com/reweb/swa/account/campaign/download"
+    ORIGIN = "https://jzt.jd.com"
+    REFERER = "https://jzt.jd.com/"
+    SITE_ID = "0"
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
+    )
+    OUTPUT_SUBDIR = "京准通全站营销单品计划"  # output/京准通全站营销单品计划/{date}/
+
+    # 业务固定参数（抓包值，2026-08-09 实证）
+    PLATFORM = ""               # 平台（空=不限）
+    CAMPAIGN_TYPES = [101]      # 业务类型：101=京东快车（推测）
+    PROVINCE = ""               # 省份过滤（空=全国）
+    CLICK_OR_ORDER_DAY = 15     # 转化周期：15天
+    CLICK_OR_ORDER_CALIBER = 0  # 0=点击
+    IS_DAILY = True             # 日报标志
+    ORDER_STATUS_CATEGORY = 1   # 1=成交订单
+    ORDER_STATUS = ""           # 订单状态过滤（空）
+    GIFT_FLAG = ""              # 含赠品（字符串空，注意与项目8数字0不同）
+    SXU_ID = ""                 # SKU 过滤（空）
+    OBYS = ""                   # 对象过滤（空）
+    PIN_ID = "FYA8888"
+
+    def __init__(self, cookie_path: str = "config/jzt_cookie.txt"):
+        import requests
+
+        # 读 Cookie（与项目7/8 互通 jzt_cookie.txt）
+        cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
+        if not os.path.isfile(cookie_path_abs):
+            raise FileNotFoundError(
+                f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
+                f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入此文件"
+            )
+        with open(cookie_path_abs, "r", encoding="utf-8") as f:
+            self.cookie = f.read().strip()
+        if not self.cookie:
+            raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": self.USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Origin": self.ORIGIN,
+            "Referer": self.REFERER,
+            "Cookie": self.cookie,
+        })
+
+        # 输出目录（按 AGENTS.md Excel规则4）
+        self.output_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "output", self.OUTPUT_SUBDIR,
+        )
+
+    # ---- 业务参数组装 ----
+    def _build_payload(self, start_day: str, end_day: str) -> dict:
+        """组装请求 payload（抓包实证 + 动态日期）。
+
+        ⚠️ 字段类型严格匹配抓包：
+            - giftFlag/orderStatus/sxuId/obys/province 是字符串 ""（不是 None / 数字 0）
+            - campaignTypes 是 list [101]（不是字符串 "101"）
+            - isDaily 是 bool True
+        """
+        # 报表名：FYA8888_全站营销_单品计划报表_{startDay}_{endDay}
+        report_name = f"{self.PIN_ID}_全站营销_单品计划报表_{start_day}_{end_day}"
+        return {
+            "platform": self.PLATFORM,
+            "campaignTypes": self.CAMPAIGN_TYPES,
+            "province": self.PROVINCE,
+            "startDay": start_day,
+            "endDay": end_day,
+            "orderStatus": self.ORDER_STATUS,
+            "giftFlag": self.GIFT_FLAG,
+            "clickOrOrderDay": self.CLICK_OR_ORDER_DAY,
+            "clickOrOrderCaliber": self.CLICK_OR_ORDER_CALIBER,
+            "sxuId": self.SXU_ID,
+            "obys": self.OBYS,
+            "isDaily": self.IS_DAILY,
+            "orderStatusCategory": self.ORDER_STATUS_CATEGORY,
+            "dateValues": [{"startDay": start_day, "endDay": end_day}],
+            "reportName": report_name,
+        }
+
+    def _handle_response(self, ret: dict, op_desc: str):
+        """统一处理响应。
+
+        京东快车订单接口的判定：
+            - success=true
+            - code=1 或 "1"（兼容字符串/数字）
+            - data.code == "RC_SUCCESS"
+            - data.downloadUrlCsv 非空
+        """
+        if not ret.get("success", True):
+            msg = ret.get("msg", "未知错误")
+            code = ret.get("code")
+            if code in (2001, 302) or "未登录" in msg or "登录已过期" in msg:
+                raise CookieExpiredError(
+                    f"❌ 京准通 Cookie 过期（{op_desc}返回 code={code}）：\n"
+                    f"   → 请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入 config/jzt_cookie.txt"
+                )
+            if code == 601 or str(code) == "601":
+                raise RuntimeError(
+                    f"❌ 京准通 全站营销 限流 code=601：{msg}\n"
+                    f"   → 30-120 分钟冷却，避免重试加重风控"
+                )
+            raise RuntimeError(
+                f"❌ 京准通{op_desc}失败：code={code}, msg={msg}, 完整响应={ret}"
+            )
+        code = ret.get("code")
+        data_code = ret.get("data", {}).get("code")
+        # ⚠️ 2026-08-09 项目9 探针发现：code 可能是字符串 "1" 而非数字 1
+        if str(code) not in ("0", "1") or data_code != "RC_SUCCESS":
+            raise RuntimeError(
+                f"❌ 京准通{op_desc}业务失败：code={code}, data.code={data_code}\n"
+                f"   完整响应：{ret}"
+            )
+        return ret
+
+    # ---- 一步：同步 POST 拿 downloadUrlCsv ----
+    def _post_for_csv(self, start_day: str, end_day: str) -> str:
+        """POST 同步返回 downloadUrlCsv（同项目8）。"""
+        payload = self._build_payload(start_day, end_day)
+        print(f"🚀 [JZT全站营销] POST {self.BASE_URL}")
+        print(f"   Body: {json.dumps(payload, ensure_ascii=False)}")
+
+        resp = self.session.post(self.BASE_URL, json=payload, timeout=60)
+        resp.raise_for_status()
+        ret = resp.json()
+        self._handle_response(ret, op_desc="导出单品计划报表")
+
+        download_url = ret.get("data", {}).get("downloadUrlCsv")
+        if not download_url:
+            raise RuntimeError(f"❌ 响应中 downloadUrlCsv 缺失：{ret}")
+        download_id = ret.get("data", {}).get("downloadId")
+        print(f"✅ 拿到 downloadId={download_id}, downloadUrlCsv（前80字符）: {download_url[:80]}...")
+        return download_url
+
+    # ---- 二步：GET OSS 下载 CSV 字节流 ----
+    def _download_csv(self, url_csv: str) -> bytes:
+        """GET OSS 链接，下载 CSV 字节流（带 404 随机退避重试，同项目8）。"""
+        last_error = None
+        for retry in range(4):  # 最多 4 次
+            try:
+                resp = requests.get(
+                    url_csv,
+                    headers={"User-Agent": self.USER_AGENT},
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    return resp.content
+                if resp.status_code == 404:
+                    backoff = random.uniform(3, 10)
+                    print(
+                        f"  ⚠️ 第 {retry+1}/4 次 urlCsv 404 NoSuchKey，"
+                        f"随机退避 {backoff:.1f} 秒后重试..."
+                    )
+                    time.sleep(backoff)
+                    continue
+                resp.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                last_error = e
+                print(f"  ⚠️ urlCsv 下载异常：{e}，重试中...")
+                time.sleep(random.uniform(3, 10))
+        raise RuntimeError(
+            f"❌ urlCsv 下载失败（重试 4 次后）：{last_error}\n"
+            f"   URL: {url_csv[:120]}"
+        )
+
+    # ---- 一键封装（推荐对外入口）----
+    def run_full_export(
+        self,
+        start_date: str = None,
+        end_date: str = None,
+        date: str = None,
+    ) -> str:
+        """一键跑通：POST 同步拿 urlCsv → GET OSS 下载 → Excel 后置处理 → 落盘。"""
+        if date is None and start_date is None and end_date is None:
+            raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
+        if start_date is None:
+            start_date = date
+        if end_date is None:
+            end_date = date
+
+        print(f"🚀 [JZT全站营销] 启动完整导出：{start_date} ~ {end_date}")
+        print(f"   └─ Step 1/2: POST 同步拿 downloadUrlCsv...")
+        url_csv = self._post_for_csv(start_date, end_date)
+        print(f"   └─ Step 2/2: GET OSS 下载并落盘为 xlsx...")
+        csv_bytes = self._download_csv(url_csv)
+
+        # 复用现有 Excel 后置处理（日期/数值/格式）
+        return self._post_process_csv_to_xlsx(csv_bytes, start_date)
+
+    def _post_process_csv_to_xlsx(self, csv_bytes: bytes, clean_date: str) -> str:
+        """把 OSS 下载的 raw CSV → 标准 Excel 后置处理 → 保存为 xlsx。"""
+        import io
+        import pandas as pd
+
+        # 1. 读取 CSV（dtype=str 防精度丢失；UTF-8-sig 兼容 BOM）
+        try:
+            df = pd.read_csv(
+                io.BytesIO(csv_bytes),
+                dtype=str,
+                na_filter=False,
+                encoding="utf-8-sig",
+                keep_default_na=False,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"❌ CSV 解析失败：{e}\n"
+                f"   请检查 OSS 返回内容是否正常"
+            ) from e
+
+        if df.empty:
+            raise RuntimeError("❌ CSV 数据为空")
+
+        # 2. 日期列智能处理（公共规则1+2）
+        #    本报表自带「日期」列 → 不插入新日期列，只做格式标准化
+        date_column, date_value = prepare_date_columns(df, clean_date)
+
+        # 3. 数值安全转换（公共规则3）
+        df = safe_convert_numeric(df)
+
+        # 4. 构造输出路径：output/京准通全站营销单品计划/{date}/业务名_{date}.xlsx
+        date_subdir = os.path.join(self.output_dir, clean_date)
+        os.makedirs(date_subdir, exist_ok=True)
+        save_filename = f"京准通全站营销单品计划_{clean_date}.xlsx"
+        target_path = os.path.join(date_subdir, save_filename)
+
+        # 5. 写 xlsx + 单元格格式
+        df.to_excel(target_path, index=False, engine="openpyxl")
+        apply_column_formats(target_path, df, date_column=date_column, date_value=date_value)
+
+        print(
+            f"✅ 文件已保存：{target_path}"
+            f"\n   （CSV→xlsx 转存 + 日期列 + 数值转换 + 单元格格式，{os.path.getsize(target_path)}字节，{len(df)}行 × {len(df.columns)}列）"
+        )
+        return target_path
+
+
+# ⚠️ 注册表 callable 字段回填（解决前向引用：注册表先于函数定义）
+BUSINESS_REGISTRY["京准通快车自定义报表"]["callable"] = _run_jzt_kuaiche_full
+BUSINESS_REGISTRY["京准通快车订单效果明细"]["callable"] = _run_jzt_order_effect_full
+BUSINESS_REGISTRY["京准通全站营销单品计划"]["callable"] = _run_jzt_quanzhan_campaign_full
+# ⚠️ 业务接口7 类在前向引用（注册表在类之前），回填 api_class
+BUSINESS_REGISTRY["京准通全站营销单品计划"]["api_class"] = JZTQuanZhanCampaignAPI
 
 
 def list_businesses():
@@ -3152,7 +4078,12 @@ def list_businesses():
 
 
 def get_business_handler(biz_key):
-    """根据业务key返回对应的处理函数。"""
+    """根据业务key返回对应的处理函数。
+
+    优先级：
+        1. info["callable"] - 自定义函数（用于特殊业务需要传额外参数，如京准通 h5st）
+        2. info["api_class"] + info["method"] - 标准基类方法
+    """
     if biz_key not in BUSINESS_REGISTRY:
         available = "、".join(BUSINESS_REGISTRY.keys())
         raise BusinessNotFoundError(
@@ -3161,6 +4092,12 @@ def get_business_handler(biz_key):
             f"调用 list_businesses() 查看所有业务详情。"
         )
     info = BUSINESS_REGISTRY[biz_key]
+
+    # 方式1：callable 优先（用于特殊业务需要传额外构造参数）
+    if info.get("callable"):
+        return info["callable"]
+
+    # 方式2：标准基类方式
     api_class = info["api_class"]
     method_name = info["method"]
     # ⚠️ 必须先生成实例，再取实例方法（否则拿到的是未绑定方法，调用时会报 missing 'self'）
