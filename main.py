@@ -95,7 +95,8 @@ class BusinessNotFoundError(Exception):
 #    命中列整列跳过数值转换，强制保留原始文本字符串，彻底规避订单号科学计数法/末尾数字变0。
 TEXT_FORCE_COLUMNS = {"订单编号"}
 # ⚠️ 整数0位小数白名单：命中列允许转为数字；写入Excel单元格格式为 0（数值、0位小数、无千分位）。
-INTEGER_ZERO_DECIMAL_COLUMNS = {"SKU", "SPU"}
+#   2026-08-10 用户决策扩展：新增「商品ID」（服务端导出时常以科学计数法显示 1E+13，整数无小数）
+INTEGER_ZERO_DECIMAL_COLUMNS = {"SKU", "SPU", "商品ID"}
 # ⚠️ 指标词黑名单（2026-08-09 订单明细接入后扩展）：
 #    列名同时含「指标词」的，不应命中 INTEGER_ZERO_DECIMAL_COLUMNS 等数值格式白名单
 #    例如「SKU金额」含"SKU"但其实是金额指标，应该保留默认 2 位小数格式
@@ -278,6 +279,39 @@ def read_excel_bytes(content):
     raise ValueError(f"无法识别的Excel格式（magic={magic!r}）")
 
 
+def drop_total_rows(df):
+    """去除服务端默认加的「合计/总计/汇总」行（所有报表复用，全局生效）。
+
+    ⚠️ 2026-08-10 用户决策：服务端导出的报表里配置的合计/总计/汇总行，整行剔除。
+    检测规则：任一单元格的值（含表头和数据）含「合计」「总计」「汇总」任一关键词，
+    整行 drop（inplace）。
+
+    入参:
+        df - pandas.DataFrame
+    出参:
+        处理后的DataFrame（原地修改并返回）
+    """
+    if df is None or df.empty:
+        return df
+    # 关键词集合（用户决策 2026-08-10）
+    total_keywords = ("合计", "总计", "汇总")
+    # 遍历每行：任一单元格含关键词 → 标记删除
+    mask_to_drop = df.apply(
+        lambda row: any(
+            isinstance(v, str) and any(kw in v for kw in total_keywords)
+            for v in row.tolist()
+        ),
+        axis=1,
+    )
+    drop_count = int(mask_to_drop.sum())
+    if drop_count > 0:
+        df.drop(df[mask_to_drop].index, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        # ⚠️ 调试日志：让用户能确认剔除行数
+        print(f"   ├─ [drop_total_rows] 剔除服务端合计/总计/汇总行：{drop_count} 行")
+    return df
+
+
 def safe_convert_numeric(df):
     """全表数值安全转换（所有报表复用，全局生效）。
 
@@ -288,13 +322,16 @@ def safe_convert_numeric(df):
             0. 【强制文本黑名单】列名命中 TEXT_FORCE_COLUMNS（如"订单编号"）
                → 整列完全跳过数值转换，强制保留原始文本字符串（不依赖长度判断）；
             1. 其他字符串且为纯数字（可含小数点/负号）且数字位数≤15位 → 转成数值（int/float）；
-               其中列名命中 INTEGER_ZERO_DECIMAL_COLUMNS（如"SKU"/"SPU"）时单元格格式为 0（0位小数无千分位）；
+               其中列名命中 INTEGER_ZERO_DECIMAL_COLUMNS（如"SKU"/"SPU"/"商品ID"）时单元格格式为 0（0位小数无千分位）；
             2. 纯数字但数字位数>15位 → 保留原始文本，杜绝精度丢失（兜底防护，全局保留）；
             3. 非纯数字（日期/含字母/空值/已是数值类型） → 保留原值；转换失败同样保留原值。
     注意:
         ⚠️ 调用前请先把日期列用 convert_date_format() 处理好，否则"20260729"这类
            8位纯数字日期会被误当成普通数字转换（商品流量来源流程已保证先转日期再转数值）。
+        ⚠️ 2026-08-10：内部先调用 drop_total_rows() 剔除合计行（用户决策），全局生效。
     """
+    # ⚠️ 2026-08-10 用户决策：先剔除合计/总计/汇总行（封装在内部，全局生效，避免调用方遗漏）
+    drop_total_rows(df)
     for col in df.columns:
         # ⚠️ 强制文本黑名单：命中列整列跳过数值转换，保留原始文本（订单编号等长ID）
         if _col_matches(col, TEXT_FORCE_COLUMNS):
@@ -407,6 +444,13 @@ def apply_column_formats(file_path, df, date_column="日期", date_value=None):
             if fmt == "0" and not isinstance(cell.value, (int, float)):
                 continue
             cell.number_format = fmt
+
+    # ③ 冻结首列 + 表头行（2026-08-10 用户决策）
+    #   含义：openpyxl freeze_panes="B2" 表示冻结 A 列 + 第 1 行（表头）
+    #   - 左侧冻结：滚动时 A 列（时间/商品ID 等首列）始终可见
+    #   - 顶部冻结：滚动时表头行（第 1 行）始终可见
+    #   全局生效：所有报表复用本函数，自动应用
+    ws.freeze_panes = "B2"
 
     wb.save(file_path)
     wb.close()
