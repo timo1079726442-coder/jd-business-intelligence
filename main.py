@@ -3883,6 +3883,22 @@ BUSINESS_REGISTRY = {
             "spu_id": "SPU过滤（可选，默认\"\"=不过滤）",
         },
     },
+    # 业务：商智关键词分析导出（2026-08-10 上线，表单格式同步 xlsx 流）
+    #   同步接口：POST /szpaas/szajax/keyword/analysis/shopOut/downTable.ajax
+    #   鉴权：Cookie + User-mup/uuid/User-mnp（UUID 完全随机）
+    #   输出：output/商智关键词分析/{YYYY-MM-DD}/商智关键词分析_{YYYY-MM-DD}_{day|month}.xlsx
+    "商智关键词分析": {
+        "api_class": None,  # 占位：KeywordAnalysisAPI 类在下方，模块末尾回填
+        "method": "run_full_export",
+        "callable": None,  # 占位：下方 _run_keyword_analysis_full 函数定义后注入
+        "desc": "商智关键词分析导出（同步xlsx流+UUID完全随机+day/month双粒度）",
+        "params": {
+            "date": "查询日期YYYY-MM-DD（单日查询，与 granularity='day' 配套）",
+            "start_date": "开始日期YYYY-MM-DD（区间查询，与 granularity='month' 配套）",
+            "end_date": "结束日期YYYY-MM-DD（区间查询，与 granularity='month' 配套）",
+            "granularity": "聚合粒度：'day' / 'month'（默认 'day'）",
+        },
+    },
 }
 
 
@@ -5601,6 +5617,354 @@ def _run_jzt_quanzhan_effect_full(**kwargs) -> str:
 # ⚠️ 注册表 callable 字段回填（项目10，2026-08-10 上线）
 BUSINESS_REGISTRY["京准通全站营销单品推广效果"]["callable"] = _run_jzt_quanzhan_effect_full
 BUSINESS_REGISTRY["京准通全站营销单品推广效果"]["api_class"] = JZTQuanZhanEffectAPI
+
+
+def _run_keyword_analysis_full(**kwargs) -> str:
+    """调度器专用的商智关键词分析完整流程函数（2026-08-10 上线）。
+
+    ⚠️ 注册到 BUSINESS_REGISTRY["商智关键词分析"]["callable"]。
+    设计动机：基类 JDBaseRequest.__init__ 无参可走标准调度路径，
+              所以 callable 可以直接转发参数。
+
+    参数:
+        kwargs - 来自 run_business 的透传参数：
+            date       (str): 单日查询 YYYY-MM-DD（与 granularity='day' 配套）
+            start_date (str): 区间开始 YYYY-MM-DD
+            end_date   (str): 区间结束 YYYY-MM-DD
+            granularity(str): 'day' / 'month'（默认 'day'）
+    返回:
+        str - 保存的 xlsx 绝对路径
+    异常:
+        ValueError - 缺日期参数
+        CookieExpiredError / RuntimeError
+    """
+    forward_kwargs = {
+        k: kwargs[k] for k in ("date", "start_date", "end_date", "granularity")
+        if k in kwargs
+    }
+    api = KeywordAnalysisAPI()
+    return api.run_full_export(**forward_kwargs)
+
+
+# ⚠️ 项目13 注册表回填（商智关键词分析，2026-08-10 上线）
+# ⚠️ api_class 在类定义之后回填（解决前向引用：KeywordAnalysisAPI 类在 5676 行）
+BUSINESS_REGISTRY["商智关键词分析"]["callable"] = _run_keyword_analysis_full
+# api_class 占位为 None，待下方类定义完成后回填
+
+
+# ============================================================
+#  业务接口 13：（新业务 - 商智关键词分析导出，2026-08-10 上线）
+# ------------------------------------------------------------
+#  中文说明（小白必读）：
+#    商智"关键词分析"报表导出接口（downTable.ajax），
+#    输出按搜索词聚合的 FYA 关键词数据（访客数/成交/转化率等）。
+#
+#  ⚠️ 核心特征（与项目1-6 的区别）：
+#    - 表单格式：application/x-www-form-urlencoded（不是 JSON）
+#    - 同步返回：直接返回 xlsx 字节流，无 taskId，无需轮询
+#    - 支持日期区间聚合：dateType+interval 配套，month+MONTH（按月）或 day+DAY（按日）
+#    - 不需要逐日循环（服务端已聚合）
+#    - 原生 Excel 无时间列：pandas 读取后手动插入时间区间列
+#    - 鉴权：Cookie + User-mup/uuid/User-mnp 风控三元组（UUID 完全随机）
+#
+#  ⚠️ 与项目1-6 关键差异：
+#    - URL 路径：keyword/analysis/shopOut（项目1-6 是 source/* 或 keyword/* 不同页面）
+#    - Referer：viewflow/shopKeywordsVNew.html（项目4 是 viewSourcesVNew.html）
+#    - groupType=lastSrcPageSearchKeyword（项目1-6 是 lastSrcChannelId2/3 等）
+#    - sortField=jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src（按浏览量排序）
+# ============================================================
+
+class KeywordAnalysisAPI(JDBaseRequest):
+    """商智-关键词分析导出 API（2026-08-10 上线骨架）。
+
+    父类复用：
+        - JDBaseRequest 提供：
+            * Cookie 读取（config/cookie.txt）
+            * 风控签名（UUID 完全随机 + MD5 哈希）
+            * 自动 30 秒间隔（_wait_interval）
+            * 自动重试 + UA 切换
+            * 日志
+
+    自实现部分：
+        - _gen_uuid_random / _gen_risk_params_random：UUID 完全随机（不依赖 UUID_PREFIX）
+        - 业务参数组装：_build_form_payload 含 dateType/interval 互斥逻辑
+        - run_full_export 支持 day/month 双粒度
+        - xlsx 后置处理：插入时间区间列 + Excel 通用后置（日期/数值/格式）
+    """
+
+    # 接口 URL（业务约束，固定）
+    API_URL = "https://szgateway.jd.com/szpaas/szajax/keyword/analysis/shopOut/downTable.ajax"
+
+    # 必带请求头（业务约束，固定）
+    # ⚠️ 与项目4 的 viewSourcesVNew.html 不同（这里是关键词分析页）
+    ORIGIN = "https://sz.jd.com"
+    REFERER = "https://sz.jd.com/szweb/sz/view/viewflow/shopKeywordsVNew.html"
+
+    # 固定业务参数（抓包值 2026-08-10 固化，不读 config）
+    FIXED_BIZ_PARAMS = {
+        "method": "POST",
+        "target": "_self",
+        "groupType": "lastSrcPageSearchKeyword",
+        "attributes": "lastSrcPageSearchKeyword",
+        "limit": "300",
+        "sortField": "jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src",
+        "sortType": "desc",
+    }
+
+    # 可变业务参数（从 config 读取，缺省用兜底值）
+    VARIABLE_BIZ_PARAMS = {
+        "platformCate1": "",  # 平台品类 1：空字符串=全品类
+    }
+
+    # 两种聚合粒度（互斥，不可混用）
+    GRANULARITY_DAY = {"dateType": "day", "interval": "DAY"}
+    GRANULARITY_MONTH = {"dateType": "month", "interval": "MONTH"}
+
+    OUTPUT_SUBDIR = "商智关键词分析"
+
+    # ---------- UUID 完全随机生成器（与项目4 OfflineChannelAPI 同源）----------
+
+    def _gen_uuid_random(self):
+        """完全随机 UUID（16hex-10hex）。
+
+        ⚠️ 与基类 UUID_PREFIX 的区别：
+            关键词分析页面（用户抓包）UUID 完全随机，不带固定前缀。
+            使用 secrets 模块生成密码学级随机 hex。
+        """
+        import secrets
+        prefix = secrets.token_hex(8)   # 8 字节 = 16 hex
+        suffix = secrets.token_hex(5)   # 5 字节 = 10 hex
+        return f"{prefix}-{suffix}"
+
+    def _gen_risk_params_random(self, url):
+        """生成风控三元组：UUID 完全随机。
+
+        算法：User-mnp = MD5(URL路径 + uuid + 时间戳 + SIGN_SALT)
+        """
+        from urllib.parse import urlparse
+        timestamp = int(time.time() * 1000)
+        uuid_str = self._gen_uuid_random()
+        parsed = urlparse(url)
+        url_path = parsed.path
+
+        sign_str = f"{url_path}{uuid_str}{timestamp}{self.SIGN_SALT}"
+        user_mnp = hashlib.md5(sign_str.encode("utf-8")).hexdigest()
+
+        return {
+            "User-mup": str(timestamp),
+            "User-mnp": user_mnp,
+            "uuid": uuid_str,
+        }
+
+    # ---------- 日期参数解析（兼容项目1-6 的 _get_date_params 模式）----------
+
+    def _get_date_params(self, date=None, start_date=None, end_date=None, granularity="day"):
+        """根据粒度生成 date / startDate / endDate / dateType / interval。
+
+        ⚠️ 规则（用户 2026-08-10 强调）：
+            - dateType 与 interval 必须配套：day+DAY 或 month+MONTH（不能混用）
+            - 不需要在客户端拆日期循环（服务端已聚合）
+            - 单日查询时 date=startDate=endDate
+        """
+        if date is None and start_date is None and end_date is None:
+            raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
+        if start_date is None:
+            start_date = date
+        if end_date is None:
+            end_date = date
+
+        # date 字段格式（2026-08-10 抓包实证）：
+            #   - month 粒度：YYYYMM（如 202607），紧凑无分隔符
+            #   - day 粒度：YYYY-MM-DD（如 2026-07-30），带分隔符完整日期
+        if granularity == "month":
+            date_compact = start_date.replace("-", "")[:6]  # YYYYMM（紧凑）
+        else:
+            date_compact = start_date                       # YYYY-MM-DD（带分隔符）
+
+        # dateType/interval 配套（day+DAY 或 month+MONTH，不可混用）
+        if granularity == "day":
+            date_type = "day"
+            interval = "DAY"
+        else:
+            date_type = "month"
+            interval = "MONTH"
+
+        return {
+            "date": date_compact,
+            "startDate": start_date,
+            "endDate": end_date,
+            # ⚠️ 字段顺序按抓包实证（2026-08-10）：
+            #   month 抓包: dateType=month, interval=MONTH（dateType 在前）
+            #   day 抓包  : interval=DAY, dateType=day（interval 在前）
+            # Python 3.7+ dict 保留插入顺序，所以**两个粒度各起一段**保证字段顺序精确匹配抓包
+            **({"dateType": date_type, "interval": interval} if granularity == "month"
+               else {"interval": interval, "dateType": date_type}),
+        }
+
+    # ---------- 表单参数组装 ----------
+
+    def _build_form_payload(self, date=None, start_date=None, end_date=None, granularity="day"):
+        """组装完整表单参数（含固定+可变+日期+风控）。"""
+        date_params = self._get_date_params(date, start_date, end_date, granularity)
+        return {
+            **self.FIXED_BIZ_PARAMS,
+            **self.VARIABLE_BIZ_PARAMS,
+            **date_params,
+        }
+
+    # ---------- 一步：POST 拿 xlsx 字节流 ----------
+
+    def _post_for_xlsx(self, form_data):
+        """POST 同步返回 xlsx 字节流（无 taskId）。
+
+        返回:
+            bytes - xlsx 文件字节流
+        异常:
+            CookieExpiredError / RuntimeError
+        """
+        # 间隔控制（基类自带）
+        self._wait_interval()
+
+        # 生成风控三元组
+        risk_params = self._gen_risk_params_random(self.API_URL)
+        full_data = {**form_data, **risk_params}
+
+        ua_name = "Edge" if self._current_ua_index == 0 else "Chrome"
+        self.logger.info(f"[关键词分析] POST {self.API_URL} (UA={ua_name})")
+        self.logger.debug(f"表单参数: {json.dumps(full_data, ensure_ascii=False)[:500]}")
+
+        # 记录请求时间（基类处理）
+        JDBaseRequest._last_request_time = time.time()
+
+        response = self.session.post(
+            self.API_URL,
+            data=full_data,
+            timeout=self.REQUEST_TIMEOUT,
+        )
+
+        # 业务码判定
+        content_type = response.headers.get("Content-Type", "")
+        if "spreadsheetml" not in content_type:
+            # 不是 xlsx 流（可能被风控拦截 / Cookie 过期）
+            snippet = response.text[:500] if response.text else "(空响应)"
+            if response.status_code in (401, 403):
+                raise CookieExpiredError(
+                    f"❌ 关键词分析 Cookie 过期（HTTP {response.status_code}）\n"
+                    f"   → 请浏览器重新登录 https://sz.jd.com/szweb/sz/view/viewflow/shopKeywordsVNew.html\n"
+                    f"   → F12 抓 szgateway.jd.com 域 Cookie 写入 config/cookie.txt"
+                )
+            raise RuntimeError(
+                f"❌ 关键词分析响应不是 xlsx 流（HTTP {response.status_code}, Content-Type={content_type}）\n"
+                f"   响应片段：{snippet}"
+            )
+
+        filename = response.headers.get("Content-Disposition", "").split("filename=")[-1].strip('" ')
+        self.logger.info(f"✅ 拿到 xlsx 流（{len(response.content)} 字节）文件名={filename}")
+        return response.content, filename
+
+    # ---------- 一步封装：完整导出 ----------
+
+    def run_full_export(
+        self,
+        date: str = None,
+        start_date: str = None,
+        end_date: str = None,
+        granularity: str = "day",
+    ) -> str:
+        """一键跑通：POST 拿 xlsx → 落盘 + Excel 后置处理 + 插入时间区间列。
+
+        参数:
+            date       - 查询日期 YYYY-MM-DD（单日查询，day粒度）
+            start_date - 开始日期 YYYY-MM-DD
+            end_date   - 结束日期 YYYY-MM-DD
+            granularity- 聚合粒度："day" / "month"（默认 day）
+        返回:
+            str - 保存的 xlsx 绝对路径
+        """
+        if granularity not in ("day", "month"):
+            raise ValueError(f"❌ granularity 必须是 'day' 或 'month'，当前：{granularity}")
+
+        # 1. 构造表单参数
+        form_data = self._build_form_payload(date, start_date, end_date, granularity)
+        self.logger.info(
+            f"🚀 [关键词分析] 启动导出：{form_data['startDate']} ~ {form_data['endDate']}（{granularity}）"
+        )
+
+        # 2. POST 拿 xlsx 字节流
+        xlsx_bytes, orig_filename = self._post_for_xlsx(form_data)
+
+        # 3. 落盘 + Excel 后置处理 + 插入时间区间列
+        return self._post_process_xlsx(
+            xlsx_bytes,
+            clean_date=form_data["startDate"],
+            end_date=form_data["endDate"],
+            granularity=granularity,
+        )
+
+    # ---------- Excel 后置处理 + 时间区间列插入 ----------
+
+    def _post_process_xlsx(self, xlsx_bytes: bytes, clean_date: str, end_date: str, granularity: str) -> str:
+        """读取 xlsx → 插入时间区间列 → Excel 通用后置 → 保存。
+
+        ⚠️ 用户 2026-08-10 要求：原生 Excel 无时间字段，需手动插入时间区间列。
+            - day 粒度：插入「日期」列（YYYY/M/D 格式）
+            - month 粒度：插入「日期范围」列（YYYY/M/D ~ YYYY/M/D）
+        """
+        import io
+        import pandas as pd
+
+        # 1. 读取 xlsx（dtype=str 防精度丢失）
+        try:
+            df = pd.read_excel(
+                io.BytesIO(xlsx_bytes),
+                dtype=str,
+                na_filter=False,
+                keep_default_na=False,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"❌ xlsx 解析失败：{e}\n"
+                f"   请检查响应是否合法 xlsx"
+            ) from e
+
+        if df.empty:
+            # ⚠️ 空数据是合法情况（如某天没流量），不能抛错
+            self.logger.warning("⚠️ xlsx 数据为空（该时段可能无数据），仍保存空表")
+
+        # 2. 插入时间区间列
+        if granularity == "day":
+            # 单日：天报表，插入「日期」列（自动格式化 yyyy/m/d）
+            df.insert(0, "日期", clean_date)
+            date_column, date_value = prepare_date_columns(df, clean_date)
+        else:
+            # 月报：插入「日期范围」列（"YYYY/M/D ~ YYYY/M/D"）
+            range_str = f"{convert_date_format(clean_date)} ~ {convert_date_format(end_date)}"
+            df.insert(0, "日期范围", range_str)
+            date_column = "日期范围"
+            date_value = range_str
+
+        # 3. Excel 通用后置（数值安全转换）
+        df = safe_convert_numeric(df)
+
+        # 4. 构造输出路径：output/商智关键词分析/{YYYY-MM-DD}/{业务名}_{YYYY-MM-DD}_{granularity}.xlsx
+        date_subdir = os.path.join(self.output_dir, self.OUTPUT_SUBDIR, clean_date)
+        os.makedirs(date_subdir, exist_ok=True)
+        save_filename = f"商智关键词分析_{clean_date}_{granularity}.xlsx"
+        target_path = os.path.join(date_subdir, save_filename)
+
+        # 5. 写 xlsx + 单元格格式
+        df.to_excel(target_path, index=False, engine="openpyxl")
+        apply_column_formats(target_path, df, date_column=date_column, date_value=date_value)
+
+        self.logger.info(
+            f"✅ 文件已保存：{target_path}\n"
+            f"   （{os.path.getsize(target_path)}字节，{len(df)}行 × {len(df.columns)}列，{granularity}粒度）"
+        )
+        return target_path
+
+
+# ⚠️ 项目13 KeywordAnalysisAPI 类前向引用回填（解决注册表在前、类在后）
+BUSINESS_REGISTRY["商智关键词分析"]["api_class"] = KeywordAnalysisAPI
 
 
 def list_businesses():
