@@ -937,6 +937,134 @@ python main.py --biz_key "京准通全站营销单品计划" --date "2026-08-07"
 
 ---
 
+## 项目 12：京准通全站营销**全店推广效果报表**导出（JZTQuanZhanEffectAllStoreAPI）｜2026-08-10 上线
+
+### 业务定位
+京准通「全站营销-全店推广效果」报表导出。**与项目10 同 URL 同流程（同步两步），靠 `campaignTypes=[118]` 区分业务**（项目10 是 `[101]`）。最显著差异：报表名后缀「**全店推广**」（项目10 是「单品推广」）。
+
+### 接口基础信息
+| 字段 | 内容 |
+|------|------|
+| **URL** | `https://jzt-api.jd.com/reweb/swa/effect/order/download`（与项目10 完全相同）|
+| **方法** | **POST（JSON）** + 响应 OSS urlZip/csv 后 GET 下载 |
+| **Content-Type** | `application/json;charset=UTF-8` |
+| **业务页面入口** | `https://jzt.jd.com/home`（全站营销-全店推广效果）|
+
+### 同步两步流程
+| 步骤 | 调用 | 返回 |
+|------|------|------|
+| 1 | POST `/reweb/swa/effect/order/download`（JSON payload） | `data.downloadUrlZip` + `data.downloadUrlCsv`（**csv 优先**）+ `data.downloadId` |
+| 2 | GET 优先 `downloadUrlCsv` | csv 字节流（裸流）|
+| 2-alt | 降级 GET `downloadUrlZip` | zip 字节流（解压取第一个 csv）|
+
+### Payload（13 项）
+```python
+{
+  "platform": "",               # 字符串 ""（空=不限）
+  "campaignTypes": [118],        # 列表 [118]（**与项目10 [101] / 项目11 [118但路径不同）区分**）
+  "startDay": "2026-07-07",
+  "endDay": "2026-07-07",
+  "orderStatus": "1",            # 字符串 "1"（成交订单，与项目10 默认一致）
+  "giftFlag": "",                # 字符串 ""（含赠品）
+  "clickOrOrderDay": 15,         # 转化周期15天
+  "clickOrOrderCaliber": 0,      # 0=点击
+  "skuId": "",                   # 字符串 ""（SKU过滤）
+  "spuId": "",                   # 字符串 ""（SPU过滤）
+  "isDaily": false,              # 布尔 false（**非日报**，与项目10 默认一致）
+  "orderStatusCategory": 1,      # 1=成交订单
+  "reportName": "FYA8888_全站营销_效果报表_全店推广_{startDay}_{endDay}"
+}
+```
+
+### 业务固定参数（用户 2026-08-10 确认固化）
+| 常量 | 值 | 类型 | 说明 |
+|------|-----|------|------|
+| `PLATFORM` | "" | 字符串 | 平台（空=不限）|
+| `CAMPAIGN_TYPES` | [118] | **列表** | 业务类型（疑似全店推广效果）|
+| `CLICK_OR_ORDER_DAY` | 15 | int | 转化周期 |
+| `CLICK_OR_ORDER_CALIBER` | 0 | int | 点击 |
+| `IS_DAILY` | False | **bool**（与项目10 一致）| 非日报标志 |
+| `ORDER_STATUS_CATEGORY` | 1 | int | 成交订单 |
+| `ORDER_STATUS` | "1" | 字符串 | **成交订单**（与项目10 默认一致）|
+| `GIFT_FLAG` | "" | 字符串 | 含赠品 |
+| `PIN_ID` | "FYA8888" | 字符串 | 账号 PIN |
+
+### 开放入参（用户决策 2026-08-10：与项目10/11 一致）
+| 入参 | 默认值 | 入参可覆盖 | 说明 |
+|------|--------|-----------|------|
+| `order_status` | `"1"`（成交）| `""`（不限）/ 其他字符串 | 业务订单状态过滤 |
+| `is_daily` | `False`（非日报）| `True`（日报）| 日报开关 |
+| `sku_id` | `""`（不过滤）| 具体 SKU ID | SKU 维度过滤 |
+| `spu_id` | `""`（不过滤）| 具体 SPU ID | SPU 维度过滤 |
+
+### 响应判定（同项目10/11）
+```
+- success=true
+- code == 1 或 "1"
+- data.code == "RC_SUCCESS"
+- data.downloadUrlZip 或 data.downloadUrlCsv 非空
+```
+
+### ⚠️ 用户决策 2026-08-10（继承项目10）：csv 优先，zip 降级
+```
+有 downloadUrlCsv → 用 csv（**模拟浏览器行为**，浏览器 GET 的是 .csv 直链）
+无 csv 但有 zip  → 降级用 zip（解压取第一个 csv）
+两者都缺失      → RuntimeError
+```
+
+### 与现有架构的核心差异（**不继承 JDBaseRequest**）
+| 维度 | 项目10（单品推广效果）| 本项目（全店推广效果）|
+|------|-----------------------|------------------------|
+| URL | `/swa/effect/order/download` | ⚠️ **完全相同** |
+| `campaignTypes` | `[101]` | **`[118]`** |
+| 报表名 | `_效果报表_单品推广_` | **`_效果报表_全店推广_`** |
+| 字段 | 13 项 | 13 项（**完全一致**）|
+| 默认 orderStatus | `"1"` | `"1"`（一致）|
+| 默认 isDaily | `False` | `False`（一致）|
+
+### Cookie 与 h5st
+- Cookie：`config/jzt_cookie.txt`（与项目7-11 互通）
+- h5st：**不需要**
+- UA：**沿用项目10 的 v=151**（保证与 jzt_cookie.txt 会话一致）
+
+### 输出目录
+```
+output/京准通全站营销全店推广效果/{date}/京准通全站营销全店推广效果_{date}.xlsx
+```
+
+### 后置处理（**复用项目10/11 模式 + 2026-08-10 Excel 增强全局生效**）
+1. URL 后缀智能识别：`.zip` → 解压取第一个 csv；否则裸流 csv
+2. 复用 `prepare_date_columns` / `safe_convert_numeric` / `apply_column_formats`
+3. **空 CSV 不抛错**（继承项目10/11：业务无数据视为成功，写入空 xlsx）
+4. **OSS 404 8 次重试**（继承项目10：覆盖跨日归档延迟）
+5. **严重告警日志**（继承项目10：失败时打印累计等待 + 诊断建议）
+6. **合计行去除 + 商品ID 整数 0 位小数 + 首列冻结**（2026-08-10 全局 Excel 增强）
+
+### 入口命令
+```bash
+# 单日查询（默认成交+非日报）
+python main.py --biz_key "京准通全站营销全店推广效果" --date "2026-07-07"
+
+# 日报模式 + 区间查询 + SKU 过滤
+python main.py --biz_key "京准通全站营销全店推广效果" \
+    --start_date "2026-07-01" --end_date "2026-07-31" \
+    --is_daily True --sku_id "123456789"
+```
+
+### 阶段交付承诺
+- ✅ 阶段1：需求拆解（已确认用户决策：新建项目 12 / 与项目10 4 项开放入参一致 / campaignTypes=[118] 不固化含义）
+- ✅ 阶段2：抓包确认（2026-08-10 实证：URL 与项目10 相同，campaignTypes 不同）
+- ✅ 阶段3：JZTQuanZhanEffectAllStoreAPI 类骨架 + BUSINESS_REGISTRY 第13业务 + 13业务注册全过
+- ✅ 阶段4：容错适配（OSS 8 次重试 / CookieExpiredError / 601 限流 / zip 解压 / 空数据视为成功）
+- ✅ 阶段5：mock 单测 **20/20 全过** + docs/SKILL.md 归档 + GitHub 推送
+
+### 变更记录
+| 日期 | 改动 |
+|------|------|
+| 2026-08-10 | **项目 12：京准通全站营销全店推广效果导出（JZTQuanZhanEffectAllStoreAPI）上线**：① **URL 与项目10 完全相同** `POST /reweb/swa/effect/order/download`，**靠 campaignTypes=[118] 区分业务**（项目10 是 [101]）；② payload **13 项**（与项目10 字段结构完全一致：字符串/列表/bool 字段类型严格）；③ 报表名 `FYA8888_全站营销_效果报表_全店推广_{startDay}_{endDay}`（与项目10 `_效果报表_单品推广_` 后缀不同）；④ 响应同时含 downloadUrlZip + downloadUrlCsv；⑤ 复用项目10 的 csv 优先策略 + 8 次重试上限 + 空 CSV 不抛错 + 严重告警日志 + Excel 增强（合计行去除/商品ID 0位小数/首列冻结）；⑥ 4 项开放入参与项目10/11 一致；⑦ Cookie 复用 `config/jzt_cookie.txt`（与项目7-11 互通）；⑧ UA 沿用 v=151（项目10 一致）；⑨ 输出 `output/京准通全站营销全店推广效果/{date}/`；⑩ `BUSINESS_REGISTRY` 第13业务，callable 注入 `_run_jzt_quanzhan_effect_all_store_full`；⑪ mock 单测 **20/20 全过**（tests/jzt_quanzhan_effect_all_store_unittest.py）|
+
+---
+
 ## 项目 11：京准通全站营销**全店计划报表**导出（JZTQuanZhanCampaignAllStoreAPI）｜2026-08-10 上线
 
 ### 业务定位
