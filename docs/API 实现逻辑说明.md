@@ -726,9 +726,216 @@ python main.py --list
 - ⏳ 阶段4：容错适配（轮询循环 / CDN 403 重刷 URL / 401 Cookie 过期 / 业务码-407/-402）
 - ⏳ 阶段5：mock 单测 → 真实跑通 → docs/SKILL.md 归档 → GitHub 推送
 
-### 变更记录
+## 项目 8：京准通快车订单效果明细导出（JZTKuaicheOrderEffectAPI）｜2026-08-09 上线
+
+### 业务定位
+京准通快车广告后台「订单效果明细」报表导出。**与项目7 同一域（jzt-api.jd.com）+ 同一 Cookie 文件**，但流程**完全不同**：项目7 是三步异步（add→轮询→下载），本项目是**同步两步**（POST 立即返回 OSS urlCsv → GET 下载）。无 h5st（抓包实证）。
+
+### 接口基础信息
+| 字段 | 内容 |
+|------|------|
+| **URL** | `https://jzt-api.jd.com/reweb/msa/effect/order/download` |
+| **方法** | **POST（JSON）** + 响应 OSS urlCsv 后 GET 下载 |
+| **Content-Type** | `application/json` |
+| **业务页面入口** | `https://jzt.jd.com/home`（快车-订单效果明细）|
+
+### 同步两步流程
+| 步骤 | 调用 | 返回 |
+|------|------|------|
+| 1 | POST `/reweb/msa/effect/order/download`（JSON payload） | `data.downloadUrlCsv`（OSS 预签名链接，10 分钟有效）+ `data.downloadId` |
+| 2 | GET `downloadUrlCsv` | CSV 字节流 |
+
+### Payload（9 项，2 日期 + 7 固定）
+```python
+{
+  "startDay": "2026-08-07",
+  "endDay": "2026-08-07",
+  "clickOrOrderCaliber": 0,    # 0=点击（固定）
+  "clickOrOrderDay": 15,        # 转化周期15天（固定）
+  "giftFlag": 0,                # 0=不含赠品（固定）
+  "orderStatusCategory": 1,     # 1=成交订单（固定）
+  "orderType": "1,3",           # 订单类型（含义待补查，固定）
+  "orderStatuses": [],          # 空列表（固定）
+  "reportName": "FYA8888_报表中心_订单_15天_点击_不含赠品_{startDay}_{endDay}"
+}
+```
+
+### 业务固定参数（用户 2026-08-09 确认固化）
+| 常量 | 值 | 说明 |
+|------|-----|------|
+| `CLICK_OR_ORDER_CALIBER` | 0 | 点击口径（点击 / 下单）|
+| `CLICK_OR_ORDER_DAY` | 15 | 转化周期 15 天 |
+| `GIFT_FLAG` | 0 | 不含赠品 |
+| `ORDER_STATUS_CATEGORY` | 1 | 成交订单 |
+| `ORDER_TYPE` | "1,3" | 订单类型（待补查）|
+| `PIN_ID` | "FYA8888" | 账号 PIN |
+
+### 响应判定（双字段 + 字符串兼容）
+```
+- success=true（默认 True，无则跳过）
+- code == 1 或 "1"（字符串兼容）
+- data.code == "RC_SUCCESS"
+- data.downloadUrlCsv 非空
+```
+- ⚠️ **code 可能是字符串 "1"**（项目 9 探针发现）：`_handle_response` 统一 `str(code) in ("0","1")` 兼容
+- code=2001/302 / 包含「未登录」「登录已过期」 → `CookieExpiredError`
+- code=601 → 直接抛 RuntimeError 提示冷却 30-120 分钟（**不重试**）
+
+### 与现有架构的核心差异（**不继承 JDBaseRequest**）
+| 维度 | 项目7（异步三步）| 本项目（同步两步）|
+|------|----------------|-----------------|
+| 鉴权 | Cookie + 可选 h5st | **仅 Cookie**（无 h5st）|
+| 流程 | add → 轮询 → downloadById → GET OSS | **POST 直接拿 urlCsv → GET OSS** |
+| 业务码 | code=1 | code=1/"1" + data.code="RC_SUCCESS"（双层）|
+| 重试 | OSS 预热 ~10s（downloadById 重调）| **OSS 404 随机退避 3-10s ×4 次** |
+
+### Cookie 与 h5st
+- Cookie：`config/jzt_cookie.txt`（**与项目7 同一文件**，互通）
+- h5st：**不需要**（抓包实证）
+- Cookie 缺失/空 → `FileNotFoundError` / `ValueError`
+
+### 输出目录
+```
+output/京准通快车订单效果明细/{date}/京准通快车订单效果明细_{date}.xlsx
+```
+
+### Excel 后置处理
+- 复用 `prepare_date_columns` / `safe_convert_numeric` / `apply_column_formats`
+- 报表自带「点击时间」「下单时间」列 → 只做格式标准化，不重复插入
+
+### 入口命令
+```bash
+# 单日查询
+python main.py --biz_key "京准通快车订单效果明细" --date "2026-08-07"
+
+# 区间查询
+python main.py --biz_key "京准通快车订单效果明细" --start_date "2026-08-01" --end_date "2026-08-07"
+```
+
+### 与项目7 的核心差异汇总
+| 维度 | 项目7 | 项目8 |
+|------|------|------|
+| 接口路径 | `/dataCenter/customreport/v2/report/add` + `/list` + `/downloadById` | `/reweb/msa/effect/order/download` |
+| 异步 | 三步 | 同步两步 |
+| h5st | 可选 | **不需要** |
+| Cookie | `config/jzt_cookie.txt` | 同左（互通）|
+| 输出目录 | `output/京准通快车/{date}/` | `output/京准通快车订单效果明细/{date}/` |
+
+---
+
+## 项目 9：京准通全站营销单品计划报表导出（JZTQuanZhanCampaignAPI）｜2026-08-09 上线
+
+### 业务定位
+京准通「全站营销-单品计划」报表导出。**与项目8 同一流程模型（同步两步）**，但 payload 字段类型差异显著：**字符串 ""** 与 **列表 [101]** 严格匹配抓包。本项目「字段类型严格性」是 7/8/9 三项目里最高的，错传 None/数字 0 会导致接口拒绝。
+
+### 接口基础信息
+| 字段 | 内容 |
+|------|------|
+| **URL** | `https://jzt-api.jd.com/reweb/swa/account/campaign/download` |
+| **方法** | **POST（JSON）** + 响应 OSS urlCsv 后 GET 下载 |
+| **Content-Type** | `application/json;charset=UTF-8` |
+| **业务页面入口** | `https://jzt.jd.com/home`（全站营销-单品计划）|
+
+### 同步两步流程
+| 步骤 | 调用 | 返回 |
+|------|------|------|
+| 1 | POST `/reweb/swa/account/campaign/download`（JSON payload） | `data.downloadUrlCsv`（OSS 预签名链接，10 分钟有效）+ `data.downloadId` |
+| 2 | GET `downloadUrlCsv` | CSV 字节流 |
+
+### Payload（15 项，含日期列表 dateValues）
+```python
+{
+  "platform": "",               # 字符串 ""（空=不限）
+  "campaignTypes": [101],        # 列表 [101]（101=京东快车，推测）
+  "province": "",                # 字符串 ""（空=全国）
+  "startDay": "2026-08-07",
+  "endDay": "2026-08-07",
+  "orderStatus": "",             # 字符串 ""
+  "giftFlag": "",                # 字符串 ""（注意！项目8 是数字 0）
+  "clickOrOrderDay": 15,         # 转化周期15天
+  "clickOrOrderCaliber": 0,      # 0=点击
+  "sxuId": "",                   # 字符串 ""
+  "obys": "",                    # 字符串 ""
+  "isDaily": True,               # 布尔 true
+  "orderStatusCategory": 1,      # 1=成交订单
+  "dateValues": [{"startDay": "2026-08-07", "endDay": "2026-08-07"}],  # 列表嵌套
+  "reportName": "FYA8888_全站营销_单品计划报表_{startDay}_{endDay}"
+}
+```
+
+### 业务固定参数（用户 2026-08-09 确认固化）
+| 常量 | 值 | 类型 | 说明 |
+|------|-----|------|------|
+| `PLATFORM` | "" | 字符串 | 平台（空=不限）|
+| `CAMPAIGN_TYPES` | [101] | **列表** | 业务类型（101=京东快车）|
+| `PROVINCE` | "" | 字符串 | 省份过滤（空=全国）|
+| `CLICK_OR_ORDER_DAY` | 15 | int | 转化周期 |
+| `CLICK_OR_ORDER_CALIBER` | 0 | int | 点击 |
+| `IS_DAILY` | True | **bool** | 日报标志 |
+| `ORDER_STATUS_CATEGORY` | 1 | int | 成交订单 |
+| `ORDER_STATUS` | "" | 字符串 | 订单状态过滤 |
+| `GIFT_FLAG` | "" | **字符串**（与项目8数字0不同）| 含赠品 |
+| `SXU_ID` | "" | 字符串 | SKU 过滤 |
+| `OBYS` | "" | 字符串 | 对象过滤 |
+| `PIN_ID` | "FYA8888" | 字符串 | 账号 PIN |
+
+### 字段类型严格性（**与项目8 核心差异**）
+⚠️ **以下字段传错类型会被接口拒绝**：
+- `giftFlag`：**字符串 `""`**（项目8 是**数字 0**）
+- `orderStatus`：**字符串 `""`**（不能 None）
+- `sxuId` / `obys` / `province`：**字符串 `""`**（不能 None）
+- `campaignTypes`：**列表 `[101]`**（不能字符串 `"101"`）
+- `isDaily`：**布尔 `True`**（不能数字 `1`）
+- `dateValues`：**列表嵌套 `[{startDay, endDay}]`**（不能省略）
+
+### 响应判定（同项目8）
+```
+- success=true
+- code == 1 或 "1"
+- data.code == "RC_SUCCESS"
+- data.downloadUrlCsv 非空
+```
+
+### 与现有架构的核心差异（**不继承 JDBaseRequest**）
+- 同项目8 同样的 4 点差异（鉴权/流程/业务码/重试）
+- 唯一额外差异：**payload 字段类型严格性**（字符串 "" / 列表 [int] / bool / 嵌套列表）
+
+### Cookie 与 h5st
+- Cookie：`config/jzt_cookie.txt`（与项目7/8 互通）
+- h5st：**不需要**
+
+### 输出目录
+```
+output/京准通全站营销单品计划/{date}/京准通全站营销单品计划_{date}.xlsx
+```
+
+### Excel 后置处理
+- 报表自带「日期」列 → 只做格式标准化
+- 复用 `prepare_date_columns` / `safe_convert_numeric` / `apply_column_formats`
+
+### 入口命令
+```bash
+python main.py --biz_key "京准通全站营销单品计划" --date "2026-08-07"
+```
+
+### 与项目8 的核心差异汇总
+| 维度 | 项目8 | 项目9 |
+|------|------|------|
+| URL | `/reweb/msa/effect/order/download` | `/reweb/swa/account/campaign/download` |
+| giftFlag 类型 | int `0` | **str `""`** |
+| campaignTypes | 无此字段 | **list `[101]`** |
+| isDaily | 无此字段 | **bool `True`** |
+| dateValues | 无此字段 | **list 嵌套** |
+| 业务类型 | 快车订单效果 | 全站营销单品计划 |
+
+---
+
+## 变更记录（项目7/8/9 合并区）
 | 日期 | 改动 |
 |------|------|
+| 2026-08-09 | **项目 9：京准通全站营销单品计划导出（JZTQuanZhanCampaignAPI）上线**：① 同步两步（POST `/reweb/swa/account/campaign/download` → GET OSS urlCsv）；② payload 15 项（**字段类型严格**：giftFlag/orderStatus/sxuId/obys/province 字符串 ""，campaignTypes 列表 [101]，isDaily bool True，dateValues 嵌套列表）；③ 响应判定同项目 8（code=1/"1" + data.code="RC_SUCCESS"）；④ OSS 404 随机退避 3-10s ×4 次重试；⑤ Cookie 复用 `config/jzt_cookie.txt`；⑥ 输出 `output/京准通全站营销单品计划/{date}/`；⑦ `BUSINESS_REGISTRY` 第10业务，callable 注入 `_run_jzt_quanzhan_campaign_full`；⑧ 与项目 8 共用代码骨架（__init__ / _post_for_csv / _download_csv / run_full_export） |
+| 2026-08-09 | **项目 8：京准通快车订单效果明细导出（JZTKuaicheOrderEffectAPI）上线**：① 同步两步（POST `/reweb/msa/effect/order/download` → GET OSS urlCsv）；② 无 h5st（抓包实证）；③ payload 9 项（clickOrOrderCaliber=0, clickOrOrderDay=15, giftFlag=0, orderStatusCategory=1, orderType="1,3", orderStatuses=[] 固定；startDay/endDay/reportName 动态）；④ 响应判定双字段（code=1 + data.code="RC_SUCCESS"）；⑤ OSS 404 随机退避 3-10s ×4 次；⑥ Cookie 复用 `config/jzt_cookie.txt`（与项目7互通）；⑦ 输出 `output/京准通快车订单效果明细/{date}/`；⑧ `BUSINESS_REGISTRY` 第9业务，callable 注入 `_run_jzt_order_effect_full` |
+| 2026-08-07 | 阶段8-9：真实跑通 add→list→downloadById→GET urlCsv 链路（CSV 218KB），OSS 预热延迟重试，list 字段映射修复（id/subscribeState/data 双层），报表名紧凑格式，.gitignore 安全修复 |
+| 2026-08-07 | **atoms-api 备用 list 路径完整归档**：POST `https://atoms-api.jd.com/api/download/common/asyn/download/reportInfo/list`，body `{page,pageSize,startDay,endDay,nameLike,type}`，type=9=快车自定义报表；响应 `code:1`+`data.datas[]`（注意 datas 非 data）；每记录含 `downloadUrl/status/statusText/progress/logId/createdTime/startDay/endDay/errorMsg`；状态机 `status:2`+`statusText:"报表已生成"`+`progress:100`；**直接含 downloadUrl**（省 downloadById 一步）；需专属头 `loginMode=0`、`language=zh_CN`；系统字段含 `atomsLoginMode:0`、`businessFrom:"JZT_PC"`、`requestDomain:"http://atoms-api.jd.com"`；**决策：保持 jzt-api list 主线不动，atoms-api 仅备用归档** |
 | 2026-08-07 | 阶段1：需求拆解 + 5 阶段交付计划（与商智项目1-6 同套流程）|
 | 2026-08-07 | 阶段2：用户决策汇总（合并 main.py / 不写 uuid / payload 类内常量 / Cookie 独立文件 / 兜底 2026-08-07）|
-| 2026-08-07 | 阶段3：JZTKuaicheAPI 类骨架（不继承 JDBaseRequest，3 接口方法）+ 模板常量 JZT_KUAICHE_PAYLOAD_TEMPLATE + BUSINESS_REGISTRY 第8业务 + 验证脚本全过 |
