@@ -4247,23 +4247,29 @@ class JZTQuanZhanEffectAPI:
         return ret
 
     def _pick_download_url(self, ret: dict) -> str:
-        """⚠️ 用户决策 2026-08-10：优先 downloadUrlZip，降级 downloadUrlCsv。
+        """⚠️ 用户决策 2026-08-10（**第二次调整**）：**csv 优先，zip 降级**。
+
+        变更动机：模拟浏览器行为（抓包证实浏览器 GET 的是 .csv 直链而非 .zip），
+                  若 OSS 写 csv 比写 zip 早，csv 优先可缩短跨日归档延迟。
+        历史：
+            - 2026-08-10 阶段5：zip 优先（用户决策）
+            - 2026-08-10 阶段6+：改为 csv 优先（用户决策），zip 作为完整包备份
 
         返回:
-            str - OSS 预签名链接（zip 优先，csv 降级）
+            str - OSS 预签名链接（csv 优先，zip 降级）
         异常:
             RuntimeError - 两者都缺失时
         """
         data = ret.get("data", {})
-        download_zip = data.get("downloadUrlZip")
         download_csv = data.get("downloadUrlCsv")
-        if download_zip:
-            print(f"   ├─ 优先使用 downloadUrlZip（zip 压缩包，更完整）")
-            return download_zip
+        download_zip = data.get("downloadUrlZip")
         if download_csv:
-            print(f"   ├─ downloadUrlZip 缺失，降级使用 downloadUrlCsv")
+            print(f"   ├─ 优先使用 downloadUrlCsv（**模拟浏览器行为**，csv 比 zip 早写）")
             return download_csv
-        raise RuntimeError(f"❌ 响应中 downloadUrlZip/downloadUrlCsv 都缺失：{ret}")
+        if download_zip:
+            print(f"   ├─ downloadUrlCsv 缺失，降级使用 downloadUrlZip（完整压缩包）")
+            return download_zip
+        raise RuntimeError(f"❌ 响应中 downloadUrlCsv/downloadUrlZip 都缺失：{ret}")
 
     # ---- 一步：同步 POST 拿 downloadUrl（zip 优先）----
     def _post_for_csv(
@@ -4309,14 +4315,25 @@ class JZTQuanZhanEffectAPI:
         return download_url
 
     # ---- 二步：GET OSS 下载文件字节流（zip/csv 通用）----
+    # ⚠️ 用户决策 2026-08-10：MAX_DOWNLOAD_RETRY 4→8（覆盖跨日归档延迟场景）
+    #   - 京东 OSS 异步生成报表可能需 30-120 秒（POST 返回 URL 但对象未生成）
+    #   - 重试上限 8 次 + 退避 3-10s ≈ 累计 60-80 秒，可覆盖一般跨日归档
+    #   - 仍失败 → 抛 RuntimeError（不静默放弃，避免掩盖真实问题）
+    MAX_DOWNLOAD_RETRY = 8
+
     def _download_file(self, url_oss: str) -> bytes:
-        """GET OSS 链接，下载文件字节流（带 404 随机退避重试）。
+        """GET OSS 链接，下载文件字节流（带 404 随机退避重试，最多 8 次）。
 
         OSS 链接 10 分钟有效，但首次可能 404 NoSuchKey（异步生成）。
-        与项目8/9 同样的重试策略：最多 4 次，3-10s 随机退避。
+        重试策略：最多 MAX_DOWNLOAD_RETRY=8 次，3-10s 随机退避，累计 ~60-80 秒。
+
+        告警日志：
+            - 每次 404：打印重试进度
+            - 重试用尽：打印严重告警 + 累计等待时间 + URL 前缀（便于人工排查）
         """
         last_error = None
-        for retry in range(4):  # 最多 4 次
+        total_wait = 0.0  # 累计等待时间（秒）
+        for retry in range(self.MAX_DOWNLOAD_RETRY):
             try:
                 resp = requests.get(
                     url_oss,
@@ -4324,12 +4341,18 @@ class JZTQuanZhanEffectAPI:
                     timeout=60,
                 )
                 if resp.status_code == 200:
+                    if retry > 0:
+                        print(
+                            f"  ✅ 第 {retry+1}/{self.MAX_DOWNLOAD_RETRY} 次重试成功"
+                            f"（累计等待 {total_wait:.1f} 秒）"
+                        )
                     return resp.content
                 if resp.status_code == 404:
                     backoff = random.uniform(3, 10)
+                    total_wait += backoff
                     print(
-                        f"  ⚠️ 第 {retry+1}/4 次 url 404 NoSuchKey，"
-                        f"随机退避 {backoff:.1f} 秒后重试..."
+                        f"  ⚠️ 第 {retry+1}/{self.MAX_DOWNLOAD_RETRY} 次 url 404 NoSuchKey，"
+                        f"随机退避 {backoff:.1f} 秒后重试...（累计 {total_wait:.1f} 秒）"
                     )
                     time.sleep(backoff)
                     continue
@@ -4338,8 +4361,20 @@ class JZTQuanZhanEffectAPI:
                 last_error = e
                 print(f"  ⚠️ url 下载异常：{e}，重试中...")
                 time.sleep(random.uniform(3, 10))
+                total_wait += 3  # 粗略累计
+        # 全部失败 → 严重告警日志
+        print(
+            f"  🔴 [严重告警] url 下载失败，已重试 {self.MAX_DOWNLOAD_RETRY} 次仍未成功\n"
+            f"     ├─ 累计等待时间：{total_wait:.1f} 秒\n"
+            f"     ├─ OSS 域：storage.jd.com\n"
+            f"     ├─ 诊断建议：\n"
+            f"     │   ① 京东 OSS 异步生成延迟（跨日归档常见）→ 手动 GET 该 URL 验证\n"
+            f"     │   ② URL 签名是否过期 → 检查 URL 中 Expires 时间\n"
+            f"     │   ③ 调 atoms-api list 查报表 status（_poll_report_status_atoms）\n"
+            f"     └─ URL: {url_oss[:120]}"
+        )
         raise RuntimeError(
-            f"❌ url 下载失败（重试 4 次后）：{last_error}\n"
+            f"❌ url 下载失败（重试 {self.MAX_DOWNLOAD_RETRY} 次后，累计等待 {total_wait:.1f} 秒）：{last_error}\n"
             f"   URL: {url_oss[:120]}"
         )
 
@@ -4525,7 +4560,15 @@ class JZTQuanZhanEffectAPI:
             ) from e
 
         if df.empty:
-            raise RuntimeError("❌ CSV 数据为空")
+            # ⚠️ 用户决策 2026-08-10：空数据视为测试通过（**仅项目10 启用**）
+            #   场景：账号某日期无推广数据，服务端返回空 CSV（仍 GET 200，OSS 文件存在）
+            #   行为：写入空 xlsx（仅含表头或 0 列）+ 返回成功路径
+            #   注意：项目8/9 保留原「CSV 数据为空」抛错行为，未受本次决策影响
+            print(
+                f"   ├─ ⚠️ CSV 数据为空（{len(df.columns)}列 0行）"
+                f"—— 视为业务无数据，写入空 xlsx"
+            )
+            # 不抛异常，继续走落盘流程
 
         # 3. 日期列智能处理（公共规则1+2）
         date_column, date_value = prepare_date_columns(df, clean_date)

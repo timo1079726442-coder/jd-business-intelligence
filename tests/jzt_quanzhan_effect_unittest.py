@@ -194,8 +194,8 @@ class TestJZTQuanZhanEffectAPI(unittest.TestCase):
             api._handle_response(ret, "test")
 
     # ---- URL 选择 ----
-    def test_13_pick_download_url_zip_first(self):
-        """⚠️ 用户决策：优先 downloadUrlZip。"""
+    def test_13_pick_download_url_csv_first(self):
+        """⚠️ 用户决策 2026-08-10（第二次调整）：优先 downloadUrlCsv，zip 降级。"""
         api = main.JZTQuanZhanEffectAPI()
         ret = {
             "data": {
@@ -204,14 +204,14 @@ class TestJZTQuanZhanEffectAPI(unittest.TestCase):
             }
         }
         url = api._pick_download_url(ret)
-        self.assertEqual(url, "http://x.zip", "zip 应优先")
+        self.assertEqual(url, "http://x.csv", "csv 应优先（模拟浏览器行为）")
 
-    def test_14_pick_download_url_csv_fallback(self):
-        """downloadUrlZip 缺失时降级 downloadUrlCsv。"""
+    def test_14_pick_download_url_zip_fallback(self):
+        """downloadUrlCsv 缺失时降级 downloadUrlZip。"""
         api = main.JZTQuanZhanEffectAPI()
-        ret = {"data": {"downloadUrlCsv": "http://x.csv"}}  # 无 zip
+        ret = {"data": {"downloadUrlZip": "http://x.zip"}}  # 无 csv
         url = api._pick_download_url(ret)
-        self.assertEqual(url, "http://x.csv", "zip 缺失应降级 csv")
+        self.assertEqual(url, "http://x.zip", "csv 缺失应降级 zip")
 
     def test_15_pick_download_url_missing(self):
         """两者都缺失 → RuntimeError。"""
@@ -222,12 +222,17 @@ class TestJZTQuanZhanEffectAPI(unittest.TestCase):
 
     # ---- 完整流程（mock 网络）----
     def test_16_full_export_zip_path(self):
-        """完整流程：POST 拿 zip → GET 404 重试 → 解压 csv → 落盘 xlsx。"""
-        # 准备 mock 响应
-        zip_bytes = _make_zip_bytes("日期,SKU,花费\n2026/4/25,123,99.5\n")
+        """完整流程：POST 拿 csv（用户决策 csv 优先）→ GET 404 重试 → 落盘 xlsx。
+
+        ⚠️ 用户决策 2026-08-10（第二次调整）：csv 优先（模拟浏览器行为）。
+        """
+        # 准备 mock 响应（csv 字节流）
+        csv_bytes_text = "日期,SKU,花费\n2026/4/25,123,99.5\n"
+        csv_bytes = csv_bytes_text.encode("utf-8")
+        url_csv = "http://mock.oss/test.csv?Expires=123&Signature=abc"
         url_zip = "http://mock.oss/test.zip?Expires=123&Signature=abc"
 
-        # POST 返回（含 zip + csv）
+        # POST 返回（同时含 zip + csv）
         post_resp = MagicMock()
         post_resp.raise_for_status = MagicMock()
         post_resp.json = MagicMock(return_value={
@@ -237,18 +242,18 @@ class TestJZTQuanZhanEffectAPI(unittest.TestCase):
                 "code": "RC_SUCCESS",
                 "downloadId": 297893851,
                 "downloadUrlZip": url_zip,
-                "downloadUrlCsv": url_zip.replace(".zip", ".csv"),
+                "downloadUrlCsv": url_csv,
             },
         })
 
-        # GET 返回：第一次 404，第二次 200（zip 字节流）
+        # GET 返回：第一次 404，第二次 200（csv 字节流）
         get_resp_404 = MagicMock()
         get_resp_404.status_code = 404
         get_resp_404.raise_for_status = MagicMock()
 
         get_resp_200 = MagicMock()
         get_resp_200.status_code = 200
-        get_resp_200.content = zip_bytes
+        get_resp_200.content = csv_bytes
 
         # 拦截 session.post 和 requests.get
         with patch.object(main.requests.Session, "post", return_value=post_resp), \
@@ -269,7 +274,7 @@ class TestJZTQuanZhanEffectAPI(unittest.TestCase):
         # 验证 xlsx 数据（用 pandas 反读）
         import pandas as pd
         df = pd.read_excel(result_path, dtype=str)
-        self.assertEqual(len(df), 1, "zip 内 1 行数据（除表头）")
+        self.assertEqual(len(df), 1, "csv 内 1 行数据（除表头）")
         self.assertEqual(df.iloc[0]["SKU"], "123")
         # 日期列存在且非空（prepare_date_columns 已标准化为 yyyy/m/d 或 yyyy-mm-dd HH:MM:SS）
         date_val = str(df.iloc[0]["日期"])
