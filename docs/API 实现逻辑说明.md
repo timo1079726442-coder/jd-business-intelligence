@@ -934,6 +934,146 @@ python main.py --biz_key "京准通全站营销单品计划" --date "2026-08-07"
 | 日期 | 改动 |
 |------|------|
 | 2026-08-09 | **项目 9：京准通全站营销单品计划导出（JZTQuanZhanCampaignAPI）上线**：① 同步两步（POST `/reweb/swa/account/campaign/download` → GET OSS urlCsv）；② payload 15 项（**字段类型严格**：giftFlag/orderStatus/sxuId/obys/province 字符串 ""，campaignTypes 列表 [101]，isDaily bool True，dateValues 嵌套列表）；③ 响应判定同项目 8（code=1/"1" + data.code="RC_SUCCESS"）；④ OSS 404 随机退避 3-10s ×4 次重试；⑤ Cookie 复用 `config/jzt_cookie.txt`；⑥ 输出 `output/京准通全站营销单品计划/{date}/`；⑦ `BUSINESS_REGISTRY` 第10业务，callable 注入 `_run_jzt_quanzhan_campaign_full`；⑧ 与项目 8 共用代码骨架（__init__ / _post_for_csv / _download_csv / run_full_export） |
+
+---
+
+## 项目 10：京准通全站营销单品**推广效果**报表导出（JZTQuanZhanEffectAPI）｜2026-08-10 上线
+
+### 业务定位
+京准通「全站营销-单品推广效果」报表导出。**与项目9 同域同流程（同步两步），但 URL 路径不同**（本项目 `/reweb/swa/effect/order/download`，项目9 是 `/reweb/swa/account/campaign/download`）。最显著差异：响应增加 `downloadUrlZip`（**zip 优先**），需支持 zip 解压。
+
+### 接口基础信息
+| 字段 | 内容 |
+|------|------|
+| **URL** | `https://jzt-api.jd.com/reweb/swa/effect/order/download` |
+| **方法** | **POST（JSON）** + 响应 OSS urlZip/csv 后 GET 下载 |
+| **Content-Type** | `application/json;charset=UTF-8` |
+| **业务页面入口** | `https://jzt.jd.com/home`（全站营销-单品推广效果）|
+
+### 同步两步流程
+| 步骤 | 调用 | 返回 |
+|------|------|------|
+| 1 | POST `/reweb/swa/effect/order/download`（JSON payload） | `data.downloadUrlZip` + `data.downloadUrlCsv`（**zip 优先**）+ `data.downloadId` |
+| 2 | GET 优先 `downloadUrlZip`（zip 压缩包）| zip 字节流（解压取第一个 csv）|
+| 2-alt | 降级 GET `downloadUrlCsv` | csv 字节流（裸流直接读）|
+
+### Payload（13 项，2 日期 + 1 类固定 0 + 3 类固定 list/bool + 7 字符串/开放）
+```python
+{
+  "platform": "",               # 字符串 ""（空=不限）
+  "campaignTypes": [101],        # 列表 [101]（101=京东快车，推测）
+  "startDay": "2026-04-25",
+  "endDay": "2026-04-25",
+  "orderStatus": "1",            # 字符串 "1"（**成交订单**，用户决策 2026-08-10，可传 ""=不限）
+  "giftFlag": "",                # 字符串 ""（含赠品）
+  "skuId": "",                   # 字符串 ""（**新增**，默认不过滤，可传入具体 SKU ID）
+  "spuId": "",                   # 字符串 ""（**新增**，默认不过滤，可传入具体 SPU ID）
+  "clickOrOrderCaliber": 0,      # 0=点击
+  "clickOrOrderDay": 15,         # 转化周期15天
+  "isDaily": false,              # 布尔 false（**用户决策 2026-08-10 不固化，默认 False，可传 True**）
+  "orderStatusCategory": 1,      # 1=成交订单
+  "reportName": "FYA8888_全站营销_效果报表_单品推广_{startDay}_{endDay}"
+}
+```
+
+### 业务固定参数（用户 2026-08-10 确认固化）
+| 常量 | 值 | 类型 | 说明 |
+|------|-----|------|------|
+| `PLATFORM` | "" | 字符串 | 平台（空=不限）|
+| `CAMPAIGN_TYPES` | [101] | **列表** | 业务类型 |
+| `CLICK_OR_ORDER_DAY` | 15 | int | 转化周期 |
+| `CLICK_OR_ORDER_CALIBER` | 0 | int | 点击 |
+| `ORDER_STATUS_CATEGORY` | 1 | int | 成交订单 |
+| `GIFT_FLAG` | "" | 字符串 | 含赠品 |
+| `PIN_ID` | "FYA8888" | 字符串 | 账号 PIN |
+| `DEFAULT_ORDER_STATUS` | "1" | 字符串 | **成交订单**（开放入参，可传空）|
+| `DEFAULT_IS_DAILY` | False | bool | **非日报**（开放入参，可传 True）|
+
+### 开放入参（用户决策 2026-08-10）
+| 入参 | 默认值 | 入参可覆盖 | 说明 |
+|------|--------|-----------|------|
+| `order_status` | `"1"`（成交）| `""`（不限）/ 其他字符串 | 业务订单状态过滤 |
+| `is_daily` | `False`（非日报）| `True`（日报） | 日报开关 |
+| `sku_id` | `""`（不过滤）| 具体 SKU ID | SKU 维度过滤 |
+| `spu_id` | `""`（不过滤）| 具体 SPU ID | SPU 维度过滤 |
+
+### 响应判定（同项目9）
+```
+- success=true
+- code == 1 或 "1"
+- data.code == "RC_SUCCESS"
+- data.downloadUrlZip 或 data.downloadUrlCsv 非空
+```
+
+### ⚠️ 用户决策 2026-08-10：zip 优先，csv 降级
+```
+有 downloadUrlZip → 用 zip（更完整，包含完整数据 + 元数据）
+无 zip 但有 csv  → 降级用 csv（裸流）
+两者都缺失      → 抛 RuntimeError
+```
+
+### 与现有架构的核心差异（**不继承 JDBaseRequest**）
+| 维度 | 项目9（单品计划）| 本项目（单品推广效果）|
+|------|------------------|------------------------|
+| URL | `/swa/account/campaign/download` | **`/swa/effect/order/download`** |
+| 响应 | downloadUrlCsv | **downloadUrlZip + downloadUrlCsv**（zip 优先）|
+| orderStatus | 默认 "" | **默认 "1"**（成交订单，开放入参）|
+| isDaily | 固化 True | **默认 False**（开放入参）|
+| skuId / spuId | 无 | **新增**（默认 ""，开放入参）|
+| obys / dateValues | 有 | **无** |
+| 报表名 | _单品计划报表_ | **效果报表_单品推广_** |
+| 后置处理 | csv 直接读 | **智能 zip/csv 识别 + 解压** |
+
+### Cookie 与 h5st
+- Cookie：`config/jzt_cookie.txt`（与项目7/8/9 互通）
+- h5st：**不需要**
+- UA：**沿用项目9 的 v=151**（用户决策 2026-08-10，保证与 jzt_cookie.txt 会话一致）
+
+### 输出目录
+```
+output/京准通全站营销单品推广效果/{date}/京准通全站营销单品推广效果_{date}.xlsx
+```
+
+### 后置处理（**新增 zip 解压能力**）
+1. URL 后缀智能识别：`.zip` → 解压取第一个 csv；否则裸流 csv
+2. 复用 `prepare_date_columns` / `safe_convert_numeric` / `apply_column_formats`
+3. 报表自带日期列 → 只做格式标准化
+
+### 入口命令
+```bash
+# 单日查询（默认 成交订单 + 非日报）
+python main.py --biz_key "京准通全站营销单品推广效果" --date "2026-04-25"
+
+# 日报模式 + 区间查询 + SKU 过滤
+python main.py --biz_key "京准通全站营销单品推广效果" \
+    --start_date "2026-04-01" --end_date "2026-04-30" \
+    --is_daily True --sku_id "123456789"
+```
+
+### 与项目9 的核心差异汇总
+| 维度 | 项目9 | 项目10 |
+|------|------|--------|
+| URL 路径 | `/swa/account/campaign/download` | **`/swa/effect/order/download`** |
+| 响应 | downloadUrlCsv | **downloadUrlZip + downloadUrlCsv** |
+| orderStatus | "" | **"1"**（开放入参）|
+| isDaily | True | **False**（开放入参）|
+| skuId / spuId | 无 | **有**（默认 ""，开放入参）|
+| obys / dateValues | 有 | **无** |
+| 后置处理 | csv | **zip + csv 智能识别** |
+| 报表名后缀 | _单品计划报表_ | **效果报表_单品推广_** |
+
+### 阶段交付承诺
+- ✅ 阶段1：需求拆解（已确认用户决策：新建 / 4 项入参开放 / zip 优先）
+- ✅ 阶段2：抓包确认（2026-08-10 实证，字段类型严格）
+- ✅ 阶段3：JZTQuanZhanEffectAPI 类骨架 + BUSINESS_REGISTRY 第11业务 + 验证全过
+- ✅ 阶段4：容错适配（OSS 404 重试 / CookieExpiredError / 601 限流 / zip 解压）
+- ✅ 阶段5：mock 单测 20/20 全过 + docs/SKILL.md 归档 + GitHub 推送
+
+### 变更记录
+| 日期 | 改动 |
+|------|------|
+| 2026-08-10 | **项目 10：京准通全站营销单品推广效果导出（JZTQuanZhanEffectAPI）上线**：① 同步两步（POST `/reweb/swa/effect/order/download` → GET OSS **zip 优先** csv 降级 → 解压转 xlsx）；② payload **13 项**（与项目9 差异：orderStatus 默认 "1" 开放入参、isDaily 默认 False 开放入参、skuId/spuId 新增默认 "" 开放入参、移除 obys/dateValues）；③ 响应双字段判定 `code=="1"` + `data.code=="RC_SUCCESS"`；④ **zip 优先策略**（`downloadUrlZip` 优先，缺失降级 csv）；⑤ **zip 解压能力**：URL 后缀 `.zip` 自动识别 → 解压取第一个 csv；⑥ OSS 404 随机退避 3-10s ×4 次重试；⑦ Cookie 复用 `config/jzt_cookie.txt`；⑧ UA **沿用 v=151**（保证与项目9 会话一致）；⑨ 输出 `output/京准通全站营销单品推广效果/{date}/`；⑩ `BUSINESS_REGISTRY` 第11业务，callable 注入 `_run_jzt_quanzhan_effect_full`；⑪ mock 单测 **20/20 全过**：含 payload 字段类型严格 / 报表名模板 / 4 项开放入参 / zip 优先 / 404 重试 / CookieExpiredError / Cookie 缺失 / callable 签名等 |
+|
 | 2026-08-09 | **项目 8：京准通快车订单效果明细导出（JZTKuaicheOrderEffectAPI）上线**：① 同步两步（POST `/reweb/msa/effect/order/download` → GET OSS urlCsv）；② 无 h5st（抓包实证）；③ payload 9 项（clickOrOrderCaliber=0, clickOrOrderDay=15, giftFlag=0, orderStatusCategory=1, orderType="1,3", orderStatuses=[] 固定；startDay/endDay/reportName 动态）；④ 响应判定双字段（code=1 + data.code="RC_SUCCESS"）；⑤ OSS 404 随机退避 3-10s ×4 次；⑥ Cookie 复用 `config/jzt_cookie.txt`（与项目7互通）；⑦ 输出 `output/京准通快车订单效果明细/{date}/`；⑧ `BUSINESS_REGISTRY` 第9业务，callable 注入 `_run_jzt_order_effect_full` |
 | 2026-08-07 | 阶段8-9：真实跑通 add→list→downloadById→GET urlCsv 链路（CSV 218KB），OSS 预热延迟重试，list 字段映射修复（id/subscribeState/data 双层），报表名紧凑格式，.gitignore 安全修复 |
 | 2026-08-07 | **atoms-api 备用 list 路径完整归档**：POST `https://atoms-api.jd.com/api/download/common/asyn/download/reportInfo/list`，body `{page,pageSize,startDay,endDay,nameLike,type}`，type=9=快车自定义报表；响应 `code:1`+`data.datas[]`（注意 datas 非 data）；每记录含 `downloadUrl/status/statusText/progress/logId/createdTime/startDay/endDay/errorMsg`；状态机 `status:2`+`statusText:"报表已生成"`+`progress:100`；**直接含 downloadUrl**（省 downloadById 一步）；需专属头 `loginMode=0`、`language=zh_CN`；系统字段含 `atomsLoginMode:0`、`businessFrom:"JZT_PC"`、`requestDomain:"http://atoms-api.jd.com"`；**决策：保持 jzt-api list 主线不动，atoms-api 仅备用归档** |

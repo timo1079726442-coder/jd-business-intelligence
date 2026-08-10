@@ -3664,6 +3664,30 @@ BUSINESS_REGISTRY = {
             "cookie_path": "京准通Cookie路径（默认config/jzt_cookie.txt，可选）",
         },
     },
+    # 业务：京准通全站营销单品推广效果（2026-08-10 上线，同步两步流程）
+    #   同步接口：POST /reweb/swa/effect/order/download 同时返回 downloadUrlZip + downloadUrlCsv
+    #   优先级：zip 优先（更完整），csv 降级备用
+    #   与项目9 关键差异：
+    #     - URL 路径多了 /effect/ 段（项目9 是 /swa/account/campaign/download）
+    #     - payload：orderStatus 默认 "1"（成交订单，开放传空），isDaily 默认 False（开放入参），skuId/spuId 是新增（默认 ""）
+    #     - 响应增加 downloadUrlZip
+    #   输出到 output/京准通全站营销单品推广效果/{date}/
+    "京准通全站营销单品推广效果": {
+        "api_class": None,  # 占位：下方 JZTQuanZhanEffectAPI 类定义后注入
+        "method": "run_full_export",
+        "callable": None,  # 占位：下方 _run_jzt_quanzhan_effect_full 函数定义后注入
+        "desc": "京准通全站营销单品推广效果报表导出（同步两步：POST拿urlZip/csv→GET下载→解压转xlsx）",
+        "params": {
+            "date": "查询日期YYYY-MM-DD（单日查询）",
+            "start_date": "开始日期YYYY-MM-DD（区间查询，可选）",
+            "end_date": "结束日期YYYY-MM-DD（区间查询，可选）",
+            "cookie_path": "京准通Cookie路径（默认config/jzt_cookie.txt，可选）",
+            "order_status": "订单状态（可选，默认None→\"1\"成交订单；传\"\"=不限）",
+            "is_daily": "日报标志（可选，默认None→False非日报；传True=日报）",
+            "sku_id": "SKU过滤（可选，默认\"\"=不过滤）",
+            "spu_id": "SPU过滤（可选，默认\"\"=不过滤）",
+        },
+    },
 }
 
 
@@ -4056,6 +4080,417 @@ BUSINESS_REGISTRY["京准通快车订单效果明细"]["callable"] = _run_jzt_or
 BUSINESS_REGISTRY["京准通全站营销单品计划"]["callable"] = _run_jzt_quanzhan_campaign_full
 # ⚠️ 业务接口7 类在前向引用（注册表在类之前），回填 api_class
 BUSINESS_REGISTRY["京准通全站营销单品计划"]["api_class"] = JZTQuanZhanCampaignAPI
+
+
+class JZTQuanZhanEffectAPI:
+    """京准通-全站营销**单品推广效果报表**导出 API（2026-08-10 上线骨架）。
+
+    ⚠️ 本类**不继承 JDBaseRequest**（与项目7/8/9 同原因）：
+        - 鉴权体系：仅 Cookie（与项目7/8/9 同一文件 config/jzt_cookie.txt）
+        - 流程：同步两步（POST → 立即 GET OSS），不需要基类的 30 秒间隔/重试模型
+        - UA：禁止切换（h5st 与 UA 绑定；本接口无 h5st 但保留习惯，沿用项目9 的 v=151）
+
+    🆕 与项目9（JZTQuanZhanCampaignAPI 单品计划报表）的关键差异：
+        - URL 路径：多了 /effect/ 段
+            项目9：/reweb/swa/account/campaign/download
+            本项目：/reweb/swa/effect/order/download
+        - payload：
+            * orderStatus：项目9 默认 ""（空=不限）；本项目默认 "1"（**成交订单**，开放入参）
+            * isDaily：项目9 默认 True；本项目默认 False（**调用方可入参切换**）
+            * skuId / spuId：**新增字段**（默认 ""，开放入参；空=不过滤）
+            * obys / dateValues：**移除**（项目9 有，本项目无）
+        - 响应：增加 downloadUrlZip（**zip 优先**，csv 降级备用）
+        - 报表名：FYA8888_全站营销_**效果报表**_单品推广_{startDay}_{endDay}（项目9 是 _单品计划报表_）
+    """
+
+    # ---- 类常量（业务固定参数，2026-08-10 抓包实证 + 用户确认）----
+    BASE_URL = "https://jzt-api.jd.com/reweb/swa/effect/order/download"
+    ORIGIN = "https://jzt.jd.com"
+    REFERER = "https://jzt.jd.com/"
+    SITE_ID = "0"
+    USER_AGENT = (
+        # ⚠️ 沿用项目9 的 v=151 UA（保证与 jzt_cookie.txt 会话一致）
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
+    )
+    OUTPUT_SUBDIR = "京准通全站营销单品推广效果"  # output/京准通全站营销单品推广效果/{date}/
+
+    # 业务固定参数（抓包值，2026-08-10 实证 + 用户 2026-08-10 确认固化）
+    PLATFORM = ""               # 平台（空=不限，字符串）
+    CAMPAIGN_TYPES = [101]      # 业务类型：101=京东快车（推测，列表）
+    CLICK_OR_ORDER_DAY = 15     # 转化周期：15 天
+    CLICK_OR_ORDER_CALIBER = 0  # 0=点击（int）
+    ORDER_STATUS_CATEGORY = 1   # 1=成交订单
+    GIFT_FLAG = ""              # 含赠品（字符串空）
+    PIN_ID = "FYA8888"
+
+    # ⚠️ 用户决策 2026-08-10：
+    #   orderStatus 默认 "1"（成交订单），开放入参支持传空（""=不限）
+    #   isDaily 不固化，调用方可在 run_full_export / _post_for_csv 传入开关
+    #   skuId / spuId 默认 ""（空=不过滤），开放可选入参
+    DEFAULT_ORDER_STATUS = "1"  # 成交订单（用户决策 2026-08-10）
+    DEFAULT_IS_DAILY = False    # 默认非日报（用户决策 2026-08-10，抓包实测值）
+
+    def __init__(self, cookie_path: str = "config/jzt_cookie.txt"):
+        import requests
+
+        # 读 Cookie（与项目7/8/9 互通 jzt_cookie.txt）
+        cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
+        if not os.path.isfile(cookie_path_abs):
+            raise FileNotFoundError(
+                f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
+                f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入此文件"
+            )
+        with open(cookie_path_abs, "r", encoding="utf-8") as f:
+            self.cookie = f.read().strip()
+        if not self.cookie:
+            raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": self.USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Origin": self.ORIGIN,
+            "Referer": self.REFERER,
+            "Cookie": self.cookie,
+        })
+
+        # 输出目录（按 AGENTS.md Excel规则4）
+        self.output_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "output", self.OUTPUT_SUBDIR,
+        )
+
+    # ---- 业务参数组装 ----
+    def _build_payload(
+        self,
+        start_day: str,
+        end_day: str,
+        order_status: str = None,
+        is_daily: bool = None,
+        sku_id: str = "",
+        spu_id: str = "",
+    ) -> dict:
+        """组装请求 payload（抓包实证 + 动态日期 + 开放入参）。
+
+        ⚠️ 用户决策 2026-08-10：
+            - order_status 默认为 "1"（成交订单），传 "" 表示不限
+            - is_daily 默认 False（抓包实测值），调用方可在 run_full_export 传 True/False
+            - sku_id / spu_id 默认 ""（空=不过滤），调用方按需传入
+
+        字段类型严格匹配抓包：
+            - platform/giftFlag/orderStatus/skuId/spuId 是字符串
+            - campaignTypes 是列表 [101]
+            - isDaily 是布尔
+            - startDay/endDay 是字符串
+        """
+        # 入参兜底（None → 类默认）
+        if order_status is None:
+            order_status = self.DEFAULT_ORDER_STATUS
+        if is_daily is None:
+            is_daily = self.DEFAULT_IS_DAILY
+
+        # 报表名：FYA8888_全站营销_效果报表_单品推广_{startDay}_{endDay}
+        report_name = f"{self.PIN_ID}_全站营销_效果报表_单品推广_{start_day}_{end_day}"
+        return {
+            "platform": self.PLATFORM,
+            "campaignTypes": self.CAMPAIGN_TYPES,
+            "startDay": start_day,
+            "endDay": end_day,
+            "orderStatus": order_status,
+            "giftFlag": self.GIFT_FLAG,
+            "skuId": sku_id,
+            "spuId": spu_id,
+            "clickOrOrderCaliber": self.CLICK_OR_ORDER_CALIBER,
+            "clickOrOrderDay": self.CLICK_OR_ORDER_DAY,
+            "isDaily": is_daily,
+            "orderStatusCategory": self.ORDER_STATUS_CATEGORY,
+            "reportName": report_name,
+        }
+
+    def _handle_response(self, ret: dict, op_desc: str):
+        """统一处理响应（与项目8/9 同样的双字段判定）。
+
+        判定：
+            - success=true
+            - code=="1"（兼容字符串/数字）
+            - data.code == "RC_SUCCESS"
+            - data.downloadUrlZip 或 data.downloadUrlCsv 非空
+        """
+        if not ret.get("success", True):
+            msg = ret.get("msg", "未知错误")
+            code = ret.get("code")
+            if code in (2001, 302) or "未登录" in msg or "登录已过期" in msg:
+                raise CookieExpiredError(
+                    f"❌ 京准通 Cookie 过期（{op_desc}返回 code={code}）：\n"
+                    f"   → 请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入 config/jzt_cookie.txt"
+                )
+            if code == 601 or str(code) == "601":
+                raise RuntimeError(
+                    f"❌ 京准通 全站营销效果 限流 code=601：{msg}\n"
+                    f"   → 30-120 分钟冷却，避免重试加重风控"
+                )
+            raise RuntimeError(
+                f"❌ 京准通{op_desc}失败：code={code}, msg={msg}, 完整响应={ret}"
+            )
+        code = ret.get("code")
+        data_code = ret.get("data", {}).get("code")
+        # ⚠️ 兼容字符串/数字 code（项目9 探针发现）
+        if str(code) not in ("0", "1") or data_code != "RC_SUCCESS":
+            raise RuntimeError(
+                f"❌ 京准通{op_desc}业务失败：code={code}, data.code={data_code}\n"
+                f"   完整响应：{ret}"
+            )
+        return ret
+
+    def _pick_download_url(self, ret: dict) -> str:
+        """⚠️ 用户决策 2026-08-10：优先 downloadUrlZip，降级 downloadUrlCsv。
+
+        返回:
+            str - OSS 预签名链接（zip 优先，csv 降级）
+        异常:
+            RuntimeError - 两者都缺失时
+        """
+        data = ret.get("data", {})
+        download_zip = data.get("downloadUrlZip")
+        download_csv = data.get("downloadUrlCsv")
+        if download_zip:
+            print(f"   ├─ 优先使用 downloadUrlZip（zip 压缩包，更完整）")
+            return download_zip
+        if download_csv:
+            print(f"   ├─ downloadUrlZip 缺失，降级使用 downloadUrlCsv")
+            return download_csv
+        raise RuntimeError(f"❌ 响应中 downloadUrlZip/downloadUrlCsv 都缺失：{ret}")
+
+    # ---- 一步：同步 POST 拿 downloadUrl（zip 优先）----
+    def _post_for_csv(
+        self,
+        start_day: str,
+        end_day: str,
+        order_status: str = None,
+        is_daily: bool = None,
+        sku_id: str = "",
+        spu_id: str = "",
+    ) -> str:
+        """POST 同步返回 downloadUrlZip（优先）/ downloadUrlCsv（降级）。
+
+        参数:
+            start_day    - 开始日期 YYYY-MM-DD
+            end_day      - 结束日期 YYYY-MM-DD
+            order_status - 订单状态（默认 "1"=成交订单，传 ""=不限）
+            is_daily     - 日报标志（默认 False=非日报，传 True=日报）
+            sku_id       - SKU 过滤（默认 ""=不过滤）
+            spu_id       - SPU 过滤（默认 ""=不过滤）
+        返回:
+            str - OSS 预签名链接（10 分钟有效）
+        异常:
+            CookieExpiredError / RuntimeError
+        """
+        payload = self._build_payload(
+            start_day, end_day,
+            order_status=order_status,
+            is_daily=is_daily,
+            sku_id=sku_id, spu_id=spu_id,
+        )
+        print(f"🚀 [JZT全站营销单品推广效果] POST {self.BASE_URL}")
+        print(f"   Body: {json.dumps(payload, ensure_ascii=False)}")
+
+        resp = self.session.post(self.BASE_URL, json=payload, timeout=60)
+        resp.raise_for_status()
+        ret = resp.json()
+        self._handle_response(ret, op_desc="导出单品推广效果报表")
+
+        download_id = ret.get("data", {}).get("downloadId")
+        download_url = self._pick_download_url(ret)
+        print(f"✅ 拿到 downloadId={download_id}, downloadUrl（前80字符）: {download_url[:80]}...")
+        return download_url
+
+    # ---- 二步：GET OSS 下载文件字节流（zip/csv 通用）----
+    def _download_file(self, url_oss: str) -> bytes:
+        """GET OSS 链接，下载文件字节流（带 404 随机退避重试）。
+
+        OSS 链接 10 分钟有效，但首次可能 404 NoSuchKey（异步生成）。
+        与项目8/9 同样的重试策略：最多 4 次，3-10s 随机退避。
+        """
+        last_error = None
+        for retry in range(4):  # 最多 4 次
+            try:
+                resp = requests.get(
+                    url_oss,
+                    headers={"User-Agent": self.USER_AGENT},
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    return resp.content
+                if resp.status_code == 404:
+                    backoff = random.uniform(3, 10)
+                    print(
+                        f"  ⚠️ 第 {retry+1}/4 次 url 404 NoSuchKey，"
+                        f"随机退避 {backoff:.1f} 秒后重试..."
+                    )
+                    time.sleep(backoff)
+                    continue
+                resp.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                last_error = e
+                print(f"  ⚠️ url 下载异常：{e}，重试中...")
+                time.sleep(random.uniform(3, 10))
+        raise RuntimeError(
+            f"❌ url 下载失败（重试 4 次后）：{last_error}\n"
+            f"   URL: {url_oss[:120]}"
+        )
+
+    # ---- 一键封装（推荐对外入口）----
+    def run_full_export(
+        self,
+        start_date: str = None,
+        end_date: str = None,
+        date: str = None,
+        order_status: str = None,    # 用户决策 2026-08-10：默认 "1"，可传 ""（不限）
+        is_daily: bool = None,       # 用户决策 2026-08-10：默认 False，可传 True
+        sku_id: str = "",            # 用户决策 2026-08-10：默认 ""（不过滤）
+        spu_id: str = "",            # 用户决策 2026-08-10：默认 ""（不过滤）
+    ) -> str:
+        """一键跑通：POST 同步拿 url（zip 优先）→ GET OSS 下载 → Excel 后置处理 → 落盘。
+
+        参数:
+            start_date   - 开始日期 YYYY-MM-DD（默认 = date）
+            end_date     - 结束日期 YYYY-MM-DD（默认 = date）
+            date         - 单日查询 YYYY-MM-DD
+            order_status - 订单状态（None=默认"1"成交订单；""=不限）
+            is_daily     - 日报标志（None=默认False非日报；True=日报）
+            sku_id       - SKU 过滤（""=不过滤）
+            spu_id       - SPU 过滤（""=不过滤）
+        返回:
+            str - 保存的 .xlsx 绝对路径
+        """
+        if date is None and start_date is None and end_date is None:
+            raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
+        if start_date is None:
+            start_date = date
+        if end_date is None:
+            end_date = date
+
+        print(f"🚀 [JZT全站营销单品推广效果] 启动完整导出：{start_date} ~ {end_date}")
+        print(f"   └─ Step 1/2: POST 同步拿 downloadUrl（zip 优先）...")
+        url_oss = self._post_for_csv(
+            start_date, end_date,
+            order_status=order_status, is_daily=is_daily,
+            sku_id=sku_id, spu_id=spu_id,
+        )
+        print(f"   └─ Step 2/2: GET OSS 下载并落盘为 xlsx...")
+        file_bytes = self._download_file(url_oss)
+
+        # ⚠️ 本项目可能拿到 zip（压缩包含 csv）或 csv（裸流）→ 智能识别
+        return self._post_process_to_xlsx(file_bytes, start_date, url_oss)
+
+    def _post_process_to_xlsx(self, file_bytes: bytes, clean_date: str, url_oss: str) -> str:
+        """把 OSS 下载的文件 → 标准 Excel 后置处理 → 保存为 xlsx。
+
+        ⚠️ URL 后缀决定文件类型（zip/csv）：
+            - URL 含 .zip → BytesIO(zipfile) → 解压取第一个 csv
+            - URL 含 .csv → BytesIO 直接读 csv
+            - URL 含 %3F → URL 编码的 ?，按 URL 末尾 .zip/.csv 判
+        """
+        import io
+        import zipfile
+        import pandas as pd
+
+        # 1. 智能识别文件类型（zip or csv）
+        is_zip = ".zip" in url_oss.lower()
+        if is_zip:
+            print(f"   ├─ 检测到 zip 压缩包，解压中...")
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+                csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                if not csv_names:
+                    raise RuntimeError(f"❌ zip 包内无 csv 文件：{zf.namelist()}")
+                csv_name = csv_names[0]  # 取第一个 csv（通常只有一个）
+                print(f"   ├─ 解压文件：{csv_name}")
+                csv_bytes = zf.read(csv_name)
+        else:
+            csv_bytes = file_bytes
+
+        # 2. 读取 CSV（dtype=str 防精度丢失；UTF-8-sig 兼容 BOM）
+        try:
+            df = pd.read_csv(
+                io.BytesIO(csv_bytes),
+                dtype=str,
+                na_filter=False,
+                encoding="utf-8-sig",
+                keep_default_na=False,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"❌ CSV 解析失败：{e}\n"
+                f"   请检查 OSS 返回内容是否正常"
+            ) from e
+
+        if df.empty:
+            raise RuntimeError("❌ CSV 数据为空")
+
+        # 3. 日期列智能处理（公共规则1+2）
+        date_column, date_value = prepare_date_columns(df, clean_date)
+
+        # 4. 数值安全转换（公共规则3）
+        df = safe_convert_numeric(df)
+
+        # 5. 构造输出路径：output/京准通全站营销单品推广效果/{date}/业务名_{date}.xlsx
+        date_subdir = os.path.join(self.output_dir, clean_date)
+        os.makedirs(date_subdir, exist_ok=True)
+        save_filename = f"京准通全站营销单品推广效果_{clean_date}.xlsx"
+        target_path = os.path.join(date_subdir, save_filename)
+
+        # 6. 写 xlsx + 单元格格式
+        df.to_excel(target_path, index=False, engine="openpyxl")
+        apply_column_formats(target_path, df, date_column=date_column, date_value=date_value)
+
+        print(
+            f"✅ 文件已保存：{target_path}"
+            f"\n   （{'zip→' if is_zip else ''}csv→xlsx 转存 + 日期列 + 数值转换 + 单元格格式，"
+            f"{os.path.getsize(target_path)}字节，{len(df)}行 × {len(df.columns)}列）"
+        )
+        return target_path
+
+
+def _run_jzt_quanzhan_effect_full(**kwargs) -> str:
+    """调度器专用的京准通全站营销单品推广效果完整流程函数（2026-08-10 上线）。
+
+    ⚠️ 注册到 BUSINESS_REGISTRY["京准通全站营销单品推广效果"]["callable"]。
+    设计动机：JZTQuanZhanEffectAPI.__init__ 需要 cookie_path + run_full_export
+              开放入参（order_status / is_daily / sku_id / spu_id），
+              标准调度路径无法透传，本函数手动构造实例并调用 run_full_export。
+
+    参数:
+        kwargs - 来自 run_business 的透传参数：
+            date        (str): 单日查询（start/end 默认=date）
+            start_date  (str): 开始日期 YYYY-MM-DD
+            end_date    (str): 结束日期 YYYY-MM-DD
+            cookie_path (str): 可选，默认 config/jzt_cookie.txt
+            order_status(str): 可选，默认 None→"1"（成交订单）；传 ""=不限
+            is_daily    (bool): 可选，默认 None→False；传 True=日报
+            sku_id      (str): 可选，默认 ""（不过滤）
+            spu_id      (str): 可选，默认 ""（不过滤）
+    返回:
+        str - 保存的 .xlsx 绝对路径
+    """
+    forward_kwargs = {
+        k: kwargs[k] for k in (
+            "start_date", "end_date", "date",
+            "order_status", "is_daily", "sku_id", "spu_id",
+        )
+        if k in kwargs
+    }
+
+    api = JZTQuanZhanEffectAPI(cookie_path=kwargs.get("cookie_path", "config/jzt_cookie.txt"))
+    return api.run_full_export(**forward_kwargs)
+
+
+# ⚠️ 注册表 callable 字段回填（项目10，2026-08-10 上线）
+BUSINESS_REGISTRY["京准通全站营销单品推广效果"]["callable"] = _run_jzt_quanzhan_effect_full
+BUSINESS_REGISTRY["京准通全站营销单品推广效果"]["api_class"] = JZTQuanZhanEffectAPI
 
 
 def list_businesses():
