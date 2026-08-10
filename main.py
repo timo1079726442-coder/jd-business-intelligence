@@ -2847,7 +2847,11 @@ class JZTKuaicheAPI:
             start_date = date
         if not end_date:
             end_date = date
-        if not date:
+        # ⚠️ 2026-08-10 bug fix：原 `if not date` 在 date=None 但 start_date 有值时也会报错
+        #   用户决策补能力：--range last_7d 计算出 start_date/end_date 时不会传 date，
+        #   这种「仅 start_date/end_date 有值」的合法调用不应被此分支误报
+        #   修复：三个值都为 None/空才报错
+        if not date and not start_date and not end_date:
             raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
 
         url = f"{self.BASE_URL}/add?requestFrom=0&businessFrom=1"
@@ -3792,10 +3796,15 @@ def _run_jzt_kuaiche_full(**kwargs) -> str:
         print("ℹ️  未传 h5st（add 接口抓包实测不校验，可正常跑；若报 601 请浏览器F12抓 add 接口的 h5st 重试）")
 
     # 提取透传给 run_full_export 的参数
-    forward_kwargs = {
-        k: kwargs[k] for k in ("start_date", "end_date", "date", "save_filename")
-        if k in kwargs
-    }
+    # ⚠️ 2026-08-10 bug fix：用户决策补能力——支持 --range 透传
+    forward_kwargs = {}
+    for k in ("start_date", "end_date", "date", "save_filename"):
+        if k in kwargs and kwargs[k] is not None:
+            forward_kwargs[k] = kwargs[k]
+
+    # ⚠️ 兜底：如果 start_date/end_date/date 都是 None，强制报错（避免创建任务时三值校验失败）
+    if not forward_kwargs.get("start_date") and not forward_kwargs.get("end_date") and not forward_kwargs.get("date"):
+        raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
 
     api = JZTKuaicheAPI(h5st=h5st, cookie_path=kwargs.get("cookie_path", "config/jzt_cookie.txt"))
     return api.run_full_export(**forward_kwargs)
