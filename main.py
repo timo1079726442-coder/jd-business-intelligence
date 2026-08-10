@@ -822,12 +822,22 @@ class ProductFlowAPI(JDBaseRequest):
     #     搜索/推荐：ca412182e5668a106054
     #     购物车/自主访问：5f9cc2ca20cad3d11642
     #   ⚠️ 警告：新增/修改子渠道，必须修改此字典（业务参数专属配置）。
+    #
+    #   ⚠️ 2026-08-10 配置注释（P1-1）：商智搜索/推荐/购物车接口 **服务端不支持多日区间导出**。
+    #     虽然接口表单里有 startDate/endDate，但服务端实际只返回单日数据。
+    #     用户传入区间（--range last_Nd 或 --start_date/--end_date）时，
+    #     由 _download_sku_by_days() 自动拆成逐天循环调用，每天插入当天日期列后合并输出。
     CHANNEL_MAP = {
         "商品流量来源_搜索":     ("2008", "ca412182e5668a106054"),
         "商品流量来源_推荐":     ("2009", "ca412182e5668a106054"),
         "商品流量来源_购物车":   ("3001", "5f9cc2ca20cad3d11642"),
         "商品流量来源_自主访问": ("3001", "5f9cc2ca20cad3d11642"),  # 与购物车口径重叠，仅保留配置
     }
+
+    # ⚠️ 2026-08-10 用户决策：逐日循环最大天数限制。
+    #   商智搜索/推荐/购物车不支持多日区间，区间查询会拆成逐天循环（每天一次接口+约30秒间隔）。
+    #   设置 31 天上限，防止大批量压接口触发风控 403；超出限制直接报错终止。
+    MAX_RANGE_DAYS = 31
 
     # 反向索引（从CHANNEL_MAP自动生成，用于支持直接传channel_id2）
     _CHANNEL_ID_INDEX = None
@@ -972,6 +982,15 @@ class ProductFlowAPI(JDBaseRequest):
         # 2. 读取日期参数（入参 > config）
         date, start_date, end_date = self._get_date_params(date, start_date, end_date)
 
+        # ⚠️ 2026-08-10 区间拆解（P0 用户决策）：
+        #   商智搜索/推荐/购物车接口 **服务端不支持多日区间导出**（虽然表单有 startDate/endDate，
+        #   但实际只返回单日数据）。当检测到 start_date != end_date（跨多天区间）时，
+        #   自动拆成逐天循环调用：每天 date=startDate=endDate=当天 → 每天插入当天日期列 →
+        #   pandas concat 合并 → 一次性输出合并 xlsx（文件名标注区间，如 2026-08-03_2026-08-09）。
+        #   单日期（start_date == end_date）不进入循环，保持原有执行路径不变。
+        if start_date and end_date and start_date != end_date:
+            return self._download_sku_by_days(biz_key, display_key, start_date, end_date)
+
         # 3. 读取业务参数（全部从config）
         biz_params = self._get_business_params()
 
@@ -999,24 +1018,107 @@ class ProductFlowAPI(JDBaseRequest):
         # 7. 后置处理保存：读Excel → 首列插入【日期】 → 数值安全转换 → 写回
         return self._save_flow_excel(response, filename, date)
 
-    # ---------- 商品流量来源 Excel后置处理（2026-08-05 新增）----------
-    def _save_flow_excel(self, response, filename, date):
-        """商品流量来源专用保存流程（Excel后置处理）。
+    # ---------- 商品流量来源 区间逐日循环导出（2026-08-10 新增）----------
+    def _download_sku_by_days(self, biz_key, display_key, start_date, end_date):
+        """区间查询专用：服务端不支持多日区间 → 拆成逐天循环调用，合并输出。
 
-        导出流程（需求文档要求 + 2026-08-07 公共规则1+2）：
-            ① 接口返回的Excel二进制流 → 读成DataFrame
-            ② 日期列统一处理 prepare_date_columns()：
-               报表自带【日期】/【时间】列 → 禁止重复插入，仅做格式标准化；
-               无日期/时间列 → 首列插入【日期】列（值=查询日期，yyyy/m/d）
-            ③ 调用通用数值安全转换函数 safe_convert_numeric()，处理全表字段类型
-            ④ 写入Excel并设置日期列单元格格式（打开文件不弹格式警告）
+        ⚠️ 背景（P0 用户决策 2026-08-10）：
+           商智搜索/推荐/购物车接口（downSkuTable.ajax）虽然表单有 startDate/endDate，
+           但服务端实际只返回单日数据（已实证）。因此区间查询时不能一次传区间，
+           而是把区间拆成逐天日期列表，每天单独调用接口（date=startDate=endDate=当天），
+           每天得到的单天数据插入当天日期列，最后 pandas.concat 合并为一份 xlsx 输出。
+
+        流程：
+            ① split_date_range() 拆区间 → 校验（格式/start≤end/最大天数上限31天）
+            ② 打印 CLI 警告：接口不支持区间，自动拆分逐日循环
+            ③ for 每天：组装 data（date=startDate=endDate=当天）→ 调接口 →
+               读取单天Excel → 插入当天日期列 → 收集 DataFrame
+            ④ pd.concat 合并全部单天 → 写入合并 xlsx
+               文件名标注区间（如 搜索流量_2026-08-03_2026-08-09.xlsx），
+               输出子目录用最后一天 end_date（用户决策 2026-08-10）
+            ⑤ 中间单天文件不落盘，只输出合并文件（用户决策 2026-08-10）
+
+        入参:
+            biz_key     - 业务key（CHANNEL_MAP中的key）
+            display_key - 友好业务key（用于文件名/日志）
+            start_date  - 区间开始日期 YYYY-MM-DD
+            end_date    - 区间结束日期 YYYY-MM-DD
+        出参:
+            合并后的Excel文件绝对路径
+        """
+        import pandas as pd
+
+        # ① 拆区间 + 边界保护（格式校验 / start≤end / 最大31天，超限抛错）
+        day_list = split_date_range(start_date, end_date, self.MAX_RANGE_DAYS)
+
+        # ② CLI 可见警告（P1-2）：说明接口不支持区间，将自动拆分逐日循环
+        warn_msg = (
+            f"⚠️ [WARN] 商智『{display_key}』接口服务端不支持多日区间导出，"
+            f"本次区间 {start_date} ~ {end_date}（共{len(day_list)}天）将自动拆分为逐日循环调用，"
+            f"预计耗时约 {len(day_list) * 30 // 60} 分钟+（每天间隔30秒）。"
+        )
+        self.logger.warning(warn_msg)
+        print(warn_msg)
+
+        channel_id2, uuid_prefix = self._get_channel_config(biz_key)
+        biz_params = self._get_business_params()
+
+        # ③ 逐天循环：每天 date=startDate=endDate=当天，收集 DataFrame
+        frames = []
+        total = len(day_list)
+        for i, day in enumerate(day_list, 1):
+            self.logger.info(f"    逐日循环 [{i}/{total}] {day}（{display_key}）")
+            data = {
+                "date": day,
+                "startDate": day,
+                "endDate": day,
+                **biz_params,
+                "lastSrcChannelId2": channel_id2,
+            }
+            response = self.request(self.API_URL, data, uuid_prefix=uuid_prefix)
+            # 每天的单天数据：接口无日期列 → prepare_date_columns 自动插入当天日期列
+            df, _col, _val = self._read_flow_df(response, day)
+            frames.append(df)
+
+        # ④ 合并全部单天数据（列结构对齐，忽略行索引重建）
+        merged = pd.concat(frames, ignore_index=True)
+
+        # 文件名标注区间（如 搜索流量_2026-08-03_2026-08-09.xlsx）
+        short_name = display_key.replace("商品流量来源_", "")  # 去掉前缀，保留"搜索/推荐/购物车"
+        filename = f"{short_name}流量_{start_date}_{end_date}.xlsx"
+
+        # ⑤ 输出目录用最后一天 end_date（用户决策 2026-08-10）
+        # ⚠️ 区间文件名含两个日期（start_end），不能复用 build_business_output_path 的
+        #   "去掉 _{date}.xlsx 后缀提取业务模块名"规则（会把 start 日期误并入业务模块名，
+        #   产生 output/搜索流量_2026-08-03/ 这样的错误目录），故在此直接构造目录：
+        #   output/{业务模块}/{end_date}/{filename}
+        business_dir = os.path.join(self.output_dir, f"{short_name}流量", end_date)
+        os.makedirs(business_dir, exist_ok=True)
+        file_path = os.path.join(business_dir, filename)
+        merged.to_excel(file_path, index=False, engine="openpyxl")
+        # 日期列逐格解析（每天插入的日期不同），date_value=None
+        apply_column_formats(file_path, merged, date_column="日期", date_value=None)
+
+        self.logger.info(
+            f"Excel已保存(区间合并): {file_path}（{total}天数据合并，共{len(merged)}行，"
+            f"{os.path.getsize(file_path)}字节）"
+        )
+        return file_path
+
+    # ---------- 商品流量来源 Excel后置处理（2026-08-05 新增）----------
+    def _read_flow_df(self, response, date):
+        """读接口返回的Excel二进制流 → 日期列处理 → 数值安全转换。
+
+        （2026-08-10 抽取公共步骤，供单日 _save_flow_excel 与区间 _download_sku_by_days 复用）
 
         入参:
             response - requests响应（content为接口返回的xlsx二进制）
-            filename - 保存文件名（如 搜索流量_2026-07-29.xlsx）
-            date     - 本次查询日期（如 2026-07-29）
+            date     - 本次查询日期（如 2026-07-29），无日期列时插入的日期值
         出参:
-            保存后的Excel文件绝对路径
+            (df, date_column, date_value)
+                df          - 处理后的DataFrame（已插入/格式化日期列+数值转换）
+                date_column - 实际承载日期的列名
+                date_value  - 插入列场景：日期字符串；自带日期列场景：None
         """
         import io
         import warnings
@@ -1032,15 +1134,34 @@ class ProductFlowAPI(JDBaseRequest):
         #    na_filter=False：空单元格保持空字符串，避免被替换成'nan'文本。
         df = pd.read_excel(io.BytesIO(response.content), dtype=str, na_filter=False)
 
-        # ②③ 日期列统一处理（公共规则1+2，2026-08-07）：
+        # ② 日期列统一处理（公共规则1+2，2026-08-07）：
         #    报表自带【日期】/【时间】列 → 禁止重复插入日期列，仅做格式标准化；
         #    报表无日期/时间列 → 首列插入【日期】列，值=本次查询日期。
         date_column, date_value = prepare_date_columns(df, date)
 
-        # ④ 全表数值安全转换（>15位长数字保留文本，防止精度丢失）
+        # ③ 全表数值安全转换（>15位长数字保留文本，防止精度丢失）
         df = safe_convert_numeric(df)
 
-        # ⑤ 写入Excel → 按列名规则设置单元格格式（日期列/订单编号@/SKU·SPU数值0位小数）
+        return df, date_column, date_value
+
+    def _save_flow_excel(self, response, filename, date):
+        """商品流量来源专用保存流程（单日，Excel后置处理，保持原有行为）。
+
+        导出流程（需求文档要求 + 2026-08-07 公共规则1+2）：
+            ① 复用 _read_flow_df()：读Excel → 日期列处理 → 数值安全转换
+            ② 写入Excel并设置日期列单元格格式（打开文件不弹格式警告）
+
+        入参:
+            response - requests响应（content为接口返回的xlsx二进制）
+            filename - 保存文件名（如 搜索流量_2026-07-29.xlsx）
+            date     - 本次查询日期（如 2026-07-29）
+        出参:
+            保存后的Excel文件绝对路径
+        """
+        # ① 复用公共读取步骤（读二进制流 → 日期列处理 → 数值转换）
+        df, date_column, date_value = self._read_flow_df(response, date)
+
+        # ② 写入Excel → 按列名规则设置单元格格式（日期列/订单编号@/SKU·SPU数值0位小数）
         # 输出目录规则（AGENTS.md Excel规则4）：output/{业务模块}/{date}/{filename}
         file_path = build_business_output_path(self.output_dir, filename, date)
         df.to_excel(file_path, index=False, engine="openpyxl")
@@ -3594,8 +3715,8 @@ BUSINESS_REGISTRY = {
         "desc": "商品搜索效果（搜索子来源2008）",
         "params": {
             "date": "查询日期YYYY-MM-DD（从config.xlsx的date读取）",
-            "startDate": "开始日期（默认=date）",
-            "endDate": "结束日期（默认=date）",
+            "startDate": "开始日期（默认=date）；⚠️接口服务端不支持多日区间，传区间将自动逐日拆分循环（P1-1）",
+            "endDate": "结束日期（默认=date）；同上，区间将自动逐日拆分",
         },
     },
     "商品流量来源_推荐": {
@@ -3604,8 +3725,8 @@ BUSINESS_REGISTRY = {
         "desc": "商品推荐效果（推荐子来源2009）",
         "params": {
             "date": "查询日期YYYY-MM-DD",
-            "startDate": "开始日期",
-            "endDate": "结束日期",
+            "startDate": "开始日期；⚠️接口服务端不支持多日区间，传区间将自动逐日拆分循环（P1-1）",
+            "endDate": "结束日期；同上，区间将自动逐日拆分",
         },
     },
     "商品流量来源_购物车": {
@@ -3614,8 +3735,8 @@ BUSINESS_REGISTRY = {
         "desc": "商品购物车效果（购物车/我的订单回流，3001）",
         "params": {
             "date": "查询日期YYYY-MM-DD",
-            "startDate": "开始日期",
-            "endDate": "结束日期",
+            "startDate": "开始日期；⚠️接口服务端不支持多日区间，传区间将自动逐日拆分循环（P1-1）",
+            "endDate": "结束日期；同上，区间将自动逐日拆分",
         },
     },
     # ⚠️ 自主访问：与购物车数据口径重叠（同3001），enabled=False 停用不执行。
@@ -5878,6 +5999,42 @@ def _resolve_range_to_dates(range_arg: str) -> tuple:
     end_date = today - timedelta(days=1)        # 昨天
     start_date = today - timedelta(days=n)        # 今天-N
     return start_date.isoformat(), end_date.isoformat()
+
+
+def split_date_range(start_date, end_date, max_days=31):
+    """把 [start_date, end_date] 区间拆成逐天日期字符串列表（P0 边界保护工具）。
+
+    ⚠️ 用途（2026-08-10 用户决策）：
+       商智搜索/推荐/购物车接口服务端不支持多日区间导出，区间查询时需拆成逐天循环。
+       本函数负责：① 格式校验（YYYY-MM-DD）；② start ≤ end 校验；③ 最大天数上限校验
+       （默认31天，防止大批量循环压接口触发风控403）。
+
+    入参:
+        start_date - 区间开始日期 YYYY-MM-DD
+        end_date   - 区间结束日期 YYYY-MM-DD
+        max_days   - 最大允许天数（默认31，用户决策 2026-08-10）
+    出参:
+        list[str] - 逐天日期列表，如 ["2026-08-03", "2026-08-04", ..., "2026-08-09"]
+    异常:
+        ValueError - 日期格式不合法 / start晚于end / 天数超上限
+    """
+    from datetime import datetime, timedelta
+    try:
+        d_start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        d_end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except (ValueError, TypeError) as e:
+        raise ValueError(
+            f"日期格式不合法（期望 YYYY-MM-DD）：start={start_date!r}, end={end_date!r}"
+        ) from e
+    if d_start > d_end:
+        raise ValueError(f"开始日期不能晚于结束日期：start={start_date}, end={end_date}")
+    days = (d_end - d_start).days + 1
+    if days > max_days:
+        raise ValueError(
+            f"区间天数({days}天)超过最大限制({max_days}天)，"
+            f"为防止大批量压接口触发风控403，请缩小日期区间后再试"
+        )
+    return [(d_start + timedelta(days=i)).isoformat() for i in range(days)]
 
 
 # ============================================================
