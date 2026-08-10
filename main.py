@@ -5826,11 +5826,46 @@ def parse_args():
         help="结束日期 YYYY-MM-DD（可选，区间查询时用）",
     )
     parser.add_argument(
+        "--range",
+        type=str,
+        choices=["last_1d", "last_3d", "last_7d", "last_15d", "last_30d"],
+        default=None,
+        help="近N天快捷区间（用户决策 2026-08-10）：end=昨天, start=今天-N；"
+             "示例: --range last_7d 即近7天（今天-7 至 昨天）。"
+             "与 --date/--start_date/--end_date 互斥（同时传会报错）。",
+    )
+    parser.add_argument(
         "--list",
         action="store_true",
         help="列出所有已注册业务清单",
     )
     return parser.parse_args()
+
+
+def _resolve_range_to_dates(range_arg: str) -> tuple:
+    """把 `--range last_Nd` 解析为 (start_date, end_date) 字符串元组。
+
+    ⚠️ 用户决策 2026-08-10：end=昨天（今天-1），start=今天-N。
+       避免「今天」数据未生成导致 OSS 404（项目10 阶段7 经验）。
+
+    入参:
+        range_arg - "last_1d" / "last_3d" / "last_7d" / "last_15d" / "last_30d"
+    出参:
+        (start_date, end_date) 字符串元组，YYYY-MM-DD 格式
+
+    异常:
+        ValueError - 格式不合法（理论上 argparse 已校验，这里兜底）
+    """
+    import re
+    from datetime import datetime, timedelta
+    m = re.fullmatch(r"last_(\d+)d", range_arg)
+    if not m:
+        raise ValueError(f"❌ range 参数格式不合法：{range_arg!r}（期望 last_Nd）")
+    n = int(m.group(1))
+    today = datetime.now().date()
+    end_date = today - timedelta(days=1)        # 昨天
+    start_date = today - timedelta(days=n)        # 今天-N
+    return start_date.isoformat(), end_date.isoformat()
 
 
 # ============================================================
@@ -5899,12 +5934,23 @@ def main():
 
     # 决定日期参数
     kwargs = {}
-    if args.date:
-        kwargs["date"] = args.date
-    if args.start_date:
-        kwargs["start_date"] = args.start_date
-    if args.end_date:
-        kwargs["end_date"] = args.end_date
+
+    # ⚠️ 用户决策 2026-08-10：--range 与 --date/--start_date/--end_date 互斥
+    if args.range and (args.date or args.start_date or args.end_date):
+        print("[ERR] --range 不能与 --date / --start_date / --end_date 同时使用")
+        sys.exit(2)
+    if args.range:
+        start_date, end_date = _resolve_range_to_dates(args.range)
+        kwargs["start_date"] = start_date
+        kwargs["end_date"] = end_date
+        print(f"[INFO] --range {args.range} → start_date={start_date}, end_date={end_date}")
+    else:
+        if args.date:
+            kwargs["date"] = args.date
+        if args.start_date:
+            kwargs["start_date"] = args.start_date
+        if args.end_date:
+            kwargs["end_date"] = args.end_date
 
     # 执行
     try:
