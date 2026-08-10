@@ -966,6 +966,54 @@ orderStatusCategory=1, orderType="1,3", orderStatuses=[]
 - **真实跑通**（2026-08-09）：POST→GET 第 1 次就成功（9.3 秒），CSV 12 列 0 行（账号该日无推广数据），成功落盘 xlsx
 - mock 单测 20/20 全过（同步调整 test_13/14 期望反转 + test_16 改 csv 字节流）
 
+---
+
+## 项目11：京准通全站营销全店计划报表导出（2026-08-10 上线）
+
+### 业务要点
+- 京准通「全站营销-全店计划报表」，**同步两步流程**（同项目9 模型）
+- **URL 与项目9 完全相同** `/reweb/swa/account/campaign/download`，靠 `campaignTypes=[118]` 区分业务（项目9 是 [101]）
+- 与项目9 共用 Cookie、UA、Response 判定
+- **本次响应同时含 downloadUrlZip + downloadUrlCsv**（项目9 抓包只含 csv）
+
+### 关键接口
+| 项 | 内容 |
+|----|------|
+| URL | `https://jzt-api.jd.com/reweb/swa/account/campaign/download`（与项目9 同）|
+| 方法 | POST JSON |
+| Payload 字段数 | **15 项**（与项目9 字段结构完全一致）|
+| campaignTypes | **[118]**（疑似全店计划，含义待用户确认）|
+| 报表名 | `FYA8888_全站营销_全店计划报表_{startDay}_{endDay}` |
+| 响应 | **downloadUrlZip + downloadUrlCsv**（csv 优先/zip 降级，继承项目10 策略）|
+| 输出目录 | `output/京准通全站营销全店计划/{date}/` |
+| UA | **沿用项目9 的 v=151**（保证 jzt_cookie.txt 会话一致）|
+
+### 字段类型严格性（核心坑，与项目9 完全相同）
+| 字段 | 类型 | 默认值 | 用户决策 2026-08-10 |
+|------|------|--------|---------------------|
+| `orderStatus` | str | `""`（不限）| 开放入参 |
+| `isDaily` | bool | `True`（日报）| 开放入参 |
+| `sxuId` | str | `""`（不过滤）| 开放入参（字段名 `sxuId` 而非 `skuId`）|
+| `obys` | str | `""`（不过滤）| 开放入参 |
+| 其他字段 | - | 同项目9 | 不可传 |
+
+### 与项目9 关键差异（仅 4 项）
+| 维度 | 项目9（单品计划）| 项目11（全店计划）|
+|------|------------------|---------------------|
+| `campaignTypes` | `[101]` | **`[118]`** |
+| 报表名后缀 | `_单品计划报表_` | **`_全店计划报表_`** |
+| 响应 | 仅 `downloadUrlCsv` | **`downloadUrlZip` + `downloadUrlCsv`** |
+| 业务类型 | 单品计划 | 全店计划 |
+
+### 改动重点
+- 不继承 JDBaseRequest（同项目7-10）
+- 类内常量 12 项
+- 复用项目10 的 csv 优先 + 8 次重试 + 空数据视为成功
+- 字符串 code 兼容：`str(code) in ("0","1")`
+- UA 沿用项目9 的 v=151（保证 jzt_cookie.txt 会话一致）
+
+---
+
 ### 阶段6（用户决策补能力，2026-08-10）：atoms-api list 辅助诊断
 - **新方法** `_poll_report_status_atoms(report_type, start_day, end_day, name_like="", page=1, page_size=10)` 
 - **用途**：OSS GET 404 时，调用此方法查 atoms-api list 接口，确认报表是否已生成
@@ -987,6 +1035,7 @@ orderStatusCategory=1, orderType="1,3", orderStatuses=[]
 
 | 日期 | 改动概要 |
 |------|----------|
+| 2026-08-10 | **项目11：京准通全站营销全店计划导出（JZTQuanZhanCampaignAllStoreAPI）上线（2026-08-10）**：① **URL 与项目9 完全相同** `POST /reweb/swa/account/campaign/download`，**靠 campaignTypes=[118] 区分业务**（项目9 是 [101]）；② payload **15 项**（与项目9 字段结构完全一致：字符串/列表/bool/嵌套列表字段类型严格）；③ 报表名 `FYA8888_全站营销_全店计划报表_{startDay}_{endDay}`（与项目9 `_单品计划报表_` 后缀不同）；④ **响应同时含 downloadUrlZip + downloadUrlCsv**（项目9 抓包只含 csv，本项目数据完整）；⑤ 复用项目10 的 csv 优先 + 8 次重试 + 空数据视为成功 + 严重告警日志；⑥ 4 项开放入参与项目9 一致（order_status / is_daily / sku_id / spu_id）；⑦ 字段名注意：项目11 SKU 过滤字段名是 `sxuId`（项目9 同）而非 `skuId`；⑧ 复用 `config/jzt_cookie.txt`（与项目7-10 互通）；⑨ UA 沿用 v=151（项目9 一致）；⑩ 输出 `output/京准通全站营销全店计划/{date}/`；⑪ `BUSINESS_REGISTRY` 第12业务，callable 注入 `_run_jzt_quanzhan_campaign_all_store_full`；⑫ mock 单测 **20/20 全过**（tests/jzt_quanzhan_all_store_unittest.py） |
 | 2026-08-10 | **项目10：京准通全站营销单品推广效果导出（JZTQuanZhanEffectAPI）上线（2026-08-10）**：① 同步两步流程（POST `/reweb/swa/effect/order/download` → GET OSS urlZip/csv → 解压转 xlsx）；② payload 13 项（**字段类型严格性+4 项开放入参**：orderStatus 默认 "1" 成交订单可传空、isDaily 默认 False 开放入参、skuId/spuId 默认 "" 新增开放入参；移除项目9 的 obys/dateValues）；③ 响应双字段判定：`code=="1"` + `data.code=="RC_SUCCESS"`（兼容字符串/数字）；④ **zip 优先策略**：downloadUrlZip 优先，缺失降级 downloadUrlCsv，两者都缺失 RuntimeError；⑤ **zip 解压能力**：URL 后缀 `.zip` 自动识别 → `zipfile.ZipFile` 解压取第一个 csv；⑥ OSS 404 随机退避 3-10s ×4 次重试；⑦ 复用 `config/jzt_cookie.txt`（与项目7/8/9 互通）；⑧ UA **沿用项目9 的 v=151**（保证 jzt_cookie.txt 会话一致）；⑨ 输出 `output/京准通全站营销单品推广效果/{date}/`；⑩ `BUSINESS_REGISTRY` 第11业务，callable 注入 `_run_jzt_quanzhan_effect_full`；⑪ mock 单测 **20/20 全过**（tests/jzt_quanzhan_effect_unittest.py）：含 payload 字段类型严格 / 报表名模板 / 4 项开放入参 / zip 优先 / 404 重试 / CookieExpiredError / Cookie 缺失 / callable 签名等 |
 | 2026-08-10 | **项目10 阶段7（用户决策优化）**：csv 优先 + 8 次重试 + 空数据视为成功。① `_pick_download_url` 改为 **csv 优先，zip 降级**（模拟浏览器行为：抓包证实浏览器 GET 的是 `.csv` 直链）；② `_download_file` 新增 `MAX_DOWNLOAD_RETRY=8` 类常量（原4次），3-10s 随机退避，**累计 ~60-80 秒**，覆盖跨日归档延迟场景；③ 新增严重告警日志：失败时打印累计等待时间 + 诊断建议（OSS 延迟/签名过期/list 排查）；④ `_post_process_to_xlsx` 空 CSV **不抛错**（**仅项目10 启用**，项目8/9 保持原行为）：空数据视为业务无数据，写入空 xlsx（仅含表头）+ 返回成功路径；⑤ mock 单测 **20/20 全过**（同步调整 test_13/14 期望反转 + test_16 改 csv 字节流）；⑥ **真实跑通**（2026-08-09 验证）：POST→GET **第 1 次就成功**（9.3 秒），CSV 12 列 0 行（账号该日无推广数据），成功落盘 xlsx——**链路完整性完全验证通过** |
 | 2026-08-10 | **项目10 阶段6（用户决策补能力）**：新增 `_poll_report_status_atoms` 辅助诊断方法。① POST `atoms-api.jd.com/api/download/common/asyn/download/reportInfo/list`（与项目7 备用 list 同接口，本次 type=40 而非 9）；② 专属头：`loginMode=0`、`language=zh_CN`、`siteId=0`、`Origin/Referer=jzt.jd.com`（与 jzt-api 不同域）；③ **不写死 report_type**，调用方传入（项目7 已知 9=快车自定义报表；本次 40=疑似全站营销效果报表，含义待用户确认）；④ 返回值含 `status/statusText/progress/downloadUrl/logId`，便于诊断 OSS 404 是否因报表未生成；⑤ **真实调用验证**（type=40，startDay=2026-02-10，endDay=2026-08-10）：返回 3 条 `status=2`+`progress=100`+`downloadUrl` 记录；⚠️ **OSS GET 仍 404**，印证 OSS 异步生成延迟是服务端现象，不是客户端代码问题；⑥ 不替换主线：仅作为辅助诊断，现有 `_download_file` 重试逻辑不变；⑦ **待优化**：OSS 跨日归档需 60+ 秒，当前 4 次上限不够；轻量方案是重试上限 4 →8，重量方案是失败时重调 POST 拿新 urlZip |
