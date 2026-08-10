@@ -4387,6 +4387,102 @@ class JZTQuanZhanEffectAPI:
         # ⚠️ 本项目可能拿到 zip（压缩包含 csv）或 csv（裸流）→ 智能识别
         return self._post_process_to_xlsx(file_bytes, start_date, url_oss)
 
+    # ---- 辅助诊断：atoms-api list 轮询（用户决策 2026-08-10 补能力）----
+    def _poll_report_status_atoms(
+        self,
+        report_type: int,
+        start_day: str,
+        end_day: str,
+        name_like: str = "",
+        page: int = 1,
+        page_size: int = 10,
+    ) -> dict:
+        """调用 atoms-api list 接口查询报表生成状态（**辅助诊断方法**）。
+
+        ⚠️ 用户决策 2026-08-10：补 atoms-api list 排查能力
+            - 用途：OSS GET 404 后，调用本方法查报表是否已生成
+            - 不硬编码 report_type：调用方传入（本次抓包 type=40=全站营销效果报表，但含义待用户确认）
+            - 不替换主线：仅作为辅助诊断；现有 _download_file 重试逻辑不变
+
+        URL: https://atoms-api.jd.com/api/download/common/asyn/download/reportInfo/list
+        方法: POST JSON
+        必带头（与 jzt-api 不同域）：
+            - loginMode=0
+            - language=zh_CN
+            - siteId=0
+            - Origin: https://jzt.jd.com
+            - Referer: https://jzt.jd.com/
+        请求体:
+            {page, pageSize, startDay, endDay, nameLike, type}
+
+        参数:
+            report_type - 业务类型（用户决策 2026-08-10 不固化，调用方传入）
+                         项目7 已知：9 = 快车自定义报表
+                         本次抓包：40（含义待用户确认，疑似全站营销效果报表）
+            start_day   - 开始日期 YYYY-MM-DD
+            end_day     - 结束日期 YYYY-MM-DD
+            name_like   - 报表名模糊匹配（默认空）
+            page        - 页码（默认 1）
+            page_size   - 每页条数（默认 10）
+
+        返回:
+            dict - 完整响应（含 code/data.datas[]/data.paginator）
+                   data.datas[] 每条含 status/statusText/progress/downloadUrl/logId/createdTime 等
+                   调用方根据 statusText="报表已生成" + progress=100 + downloadUrl 判是否可下载
+                   不抛异常，失败时返回原始 dict（便于诊断）
+
+        异常:
+            requests.exceptions.RequestException - 网络层异常向上抛
+        """
+        url = "https://atoms-api.jd.com/api/download/common/asyn/download/reportInfo/list"
+        # atoms-api 专属头（与 jzt-api 不同）
+        atoms_headers = {
+            "loginMode": "0",
+            "language": "zh_CN",
+            "siteId": "0",
+            "Origin": "https://jzt.jd.com",
+            "Referer": "https://jzt.jd.com/",
+            "Content-Type": "application/json",
+        }
+        # 合并 session headers + 专属头（专属头优先）
+        merged_headers = {**self.session.headers, **atoms_headers}
+
+        payload = {
+            "page": page,
+            "pageSize": page_size,
+            "startDay": start_day,
+            "endDay": end_day,
+            "nameLike": name_like,
+            "type": report_type,
+        }
+        print(f"🔍 [JZT atoms-api 排查] POST {url}")
+        print(f"   Body: {json.dumps(payload, ensure_ascii=False)}")
+
+        resp = requests.post(
+            url, json=payload, headers=merged_headers, timeout=30,
+        )
+        resp.raise_for_status()
+        ret = resp.json()
+
+        # 不抛业务异常（这是诊断方法），仅打印关键字段
+        code = ret.get("code")
+        datas = ret.get("data", {}).get("datas", [])
+        print(f"   ├─ code: {code}")
+        print(f"   ├─ 记录数: {len(datas)}")
+        for i, item in enumerate(datas[:5]):  # 最多打印前 5 条
+            status = item.get("status")
+            status_text = item.get("statusText", "")
+            progress = item.get("progress", "?")
+            has_url = bool(item.get("downloadUrl"))
+            log_id = item.get("logId", "")
+            print(
+                f"   ├─ [{i+1}] status={status} statusText='{status_text}' "
+                f"progress={progress} has_downloadUrl={has_url} logId={log_id}"
+            )
+        if len(datas) > 5:
+            print(f"   ├─ ...还有 {len(datas)-5} 条省略")
+        return ret
+
     def _post_process_to_xlsx(self, file_bytes: bytes, clean_date: str, url_oss: str) -> str:
         """把 OSS 下载的文件 → 标准 Excel 后置处理 → 保存为 xlsx。
 
