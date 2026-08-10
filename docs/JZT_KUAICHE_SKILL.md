@@ -248,6 +248,8 @@ with sync_playwright() as p:
 | 2026-08-09 | 阶段14 | **项目9 京准通全站营销单品计划上线**——新接口 `POST /reweb/swa/account/campaign/download`；新增 `JZTQuanZhanCampaignAPI`；字段类型严格匹配抓包（giftFlag 等用字符串""，campaignTypes 是列表）；输出 `output/京准通全站营销单品计划/{date}/` |
 | 2026-08-09 | 阶段15 | **Cookie 管理规则写入 AGENTS.md**——默认保留本地 Cookie，仅 601/切账号/分享时才删 |
 | 2026-08-09 | 阶段16 | **代码提交 GitHub**——commit `c678c16`（3业务+规则+Excel扩展）+ `3fac25c`（.gitignore 补 `_test_*.py` 排除）|
+| 2026-08-10 | 阶段17 | **项目10/11/12（京准通全站营销）上线**——单品推广效果 `JZTQuanZhanEffectAPI` / 全店计划 `JZTQuanZhanCampaignAllStoreAPI` / 全店推广效果 `JZTQuanZhanEffectAllStoreAPI`；完整业务沉淀已归档至 `.trae/skills/jd-api-analyze/SKILL.md`（本快车专项文档不重复记录） |
+| 2026-08-10 | 阶段18 | **p7 测试适配**——同步 `wait_for_task_ready` 纯 downloadById 探针策略（08-09 重构）断言：重算 session.get 消耗（轮1不探针，5轮=5 list+4 探针+1 后置 list）、新增探针失败工厂、修正保存名断言 `京准通快车效果自定义_{startTimeStr}.xlsx`；`tests/test_jzt_kuaiche_p7.py` 42/42 通过 |
 
 ---
 

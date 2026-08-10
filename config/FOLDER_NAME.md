@@ -16,9 +16,9 @@
 
 | 文件 | 作用 | 注意事项 |
 |------|------|---------|
-| `cookie.txt` | 京东登录Cookie | ⚠️ 已加入 `.gitignore`，**禁止上传GitHub** |
+| `cookie.txt` | 京东商智登录Cookie | ⚠️ 已加入 `.gitignore`，**禁止上传GitHub** |
+| `jzt_cookie.txt` | 京准通（jzt-api.jd.com）登录Cookie | ⚠️ 已加入 `.gitignore`，**禁止上传GitHub** |
 | `config.xlsx` | 业务参数配置（日期、渠道ID、盐值、间隔等） | 公开可上传 |
-| `新建文本文档.txt` | 临时配置文件 | 工具生成，可删除 |
 
 ## 命名规范
 
