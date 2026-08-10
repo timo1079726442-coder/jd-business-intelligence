@@ -1560,18 +1560,21 @@ class ProductDetailAPI(JDBaseRequest):
     def _gen_uuid_random(self):
         """完全随机 UUID 生成器（不依赖任何固定前缀）。
 
-        ⚠️ 业务背景：用户抓包显示 UUID 前缀为 `42005c22589c8b55826d`（非固定 prefix），
+        ⚠️ 业务背景：用户抓包显示 UUID 前缀为 `c30f3b84431d43dee267-19feab01d7e`（22+10），
         证明前端 SDK 每次会话运行时动态生成。完全随机化符合用户 2026-08-07
         "禁止硬编码 uuid 前缀"约束。
 
-        复制来源：项目 4 OfflineChannelAPI._gen_uuid_random（已验证可用）
+        2026-08-10 bug fix：原 16+10 格式与抓包 22+10 不一致，导致服务端 0 字节空响应。
+        改为 22+10（11 字节 + 5 字节随机 hex），与京东前端 SDK 实际生成对齐。
+
+        复制来源：项目 4 OfflineChannelAPI._gen_uuid_random
 
         返回:
-            str - 形如 "42005c22589c8b55826d-19fdaefe247"（16hex + - + 10hex）
+            str - 形如 "c30f3b84431d43dee267-19feab01d7e"（22hex + - + 10hex）
         """
         import secrets
-        # 16位小写hex + "-" + 10位小写hex，与抓包格式完全一致
-        prefix = secrets.token_hex(8)        # 8字节 = 16hex 字符
+        # 22位小写hex + "-" + 10位小写hex，与抓包格式完全一致（2026-08-10 bug fix）
+        prefix = secrets.token_hex(11)       # 11字节 = 22hex 字符
         suffix = secrets.token_hex(5)        # 5字节 = 10hex 字符
         return f"{prefix}-{suffix}"
 
