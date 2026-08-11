@@ -1455,4 +1455,322 @@ code: 1
 | 2026-08-07 | 阶段8-9：真实跑通 add→list→downloadById→GET urlCsv 链路（CSV 218KB），OSS 预热延迟重试，list 字段映射修复（id/subscribeState/data 双层），报表名紧凑格式，.gitignore 安全修复 |
 | 2026-08-07 | **atoms-api 备用 list 路径完整归档**：POST `https://atoms-api.jd.com/api/download/common/asyn/download/reportInfo/list`，body `{page,pageSize,startDay,endDay,nameLike,type}`，type=9=快车自定义报表；响应 `code:1`+`data.datas[]`（注意 datas 非 data）；每记录含 `downloadUrl/status/statusText/progress/logId/createdTime/startDay/endDay/errorMsg`；状态机 `status:2`+`statusText:"报表已生成"`+`progress:100`；**直接含 downloadUrl**（省 downloadById 一步）；需专属头 `loginMode=0`、`language=zh_CN`；系统字段含 `atomsLoginMode:0`、`businessFrom:"JZT_PC"`、`requestDomain:"http://atoms-api.jd.com"`；**决策：保持 jzt-api list 主线不动，atoms-api 仅备用归档** |
 | 2026-08-07 | 阶段1：需求拆解 + 5 阶段交付计划（与商智项目1-6 同套流程）|
+
+---
+
+## 项目 14：京麦订单明细【加密】导出（JingMaiOrderExportAPI）｜2026-08-11 真实跑通上线
+
+### 业务定位
+- **业务名**：京麦订单明细【加密】导出
+- **真实入口页面**：`https://shop.jd.com/jdm/trade/tools/export/ExprotList`（嵌在 seller-v10.shop.jd.com 的 iframe）
+- **真实接口域名**：`sff.jd.com`（4 个 dsm 接口）+ `export.shop.jd.com`（1 个 GET 下载）+ `imap.qq.com`（1 个 IMAP 监听）
+- **5 步异步链路**（区别于商智同步、京准通 3 步）：
+  1. createdExportTask（POST + h5st + dsm）→ 创建任务
+  2. queryExportTaskInfo（POST + h5st + dsm）→ **分页查任务列表**，按 startTime/endTime 匹配刚创建的任务拿 taskId
+  3. export.action（GET + 仅 Cookie）→ 下载加密 zip
+  4. exportTaskPwdSend（POST + h5st + dsm）→ 触发短信下发密码（**接口不返回密码明文**）
+  5. IMAP 监听 QQ 邮箱 + msoffcrypto 双层解密 + Excel 后置统一规则
+- **业务硬性约束**（2026-08-11 实证）：
+  - 时间跨度最大 31 天
+  - 同导出类型两次间隔 ≥10 分钟（实证 10 分钟内连导触发 201）
+  - 单日最多 10 次（code=201「连续两次导出订单明细信息任务类型时间间隔至少为10分钟」）
+  - 单 taskId 两次密码申请间隔 ≥60 秒
+  - 单 taskId 单日 ≤10 次密码申请
+  - h5st 5-30 分钟过期，必须真实浏览器实时生成
+  - 触发 601 后 30-120 分钟冷却，不要重试
+
+### 鉴权体系（3 次切换）
+| 步骤 | 鉴权头 | 域名 |
+|---|---|---|
+| 1/2/4 步 | Cookie + h5st + dsm-eid/dsm-platform/dsm-trace-id/dsm-lang + x-rp-client=h5_2.4.0 | sff.jd.com |
+| 第 3 步 | **仅 Cookie + Referer**（**不需要 h5st / dsm 头**） | export.shop.jd.com |
+| 第 5 步 | 纯本地 zipfile + msoffcrypto（无网络） | 本地 |
+
+⚠️ **关键发现**：第 3 步鉴权**完全不同**——`export.shop.jd.com` 是 export 子域，**不需要 h5st**。这个差异是项目 14 与商智/京准通最大的不同。
+
+### 第 1 步：createdExportTask（创建任务）
+- **URL**：`https://sff.jd.com/api?v=1.0&appId=CQLEJWPYPFOVQBC8UFLQ&api=dsm.order.export.exportCenterService.createdExportTask`
+- **方法**：POST JSON
+- **Headers**（业务固定）：
+  - `Cookie: <完整 .shop.jd.com 域 Cookie>`（从 `config/jm_cookie.txt` 读取）
+  - `h5st: <前端强签名，一次性>`（CLI `--h5st` 入参）
+  - `dsm-eid: <Cookie 中 3AB9D23F7A4B3CSS 字段值>`（**从 Cookie 提取**）
+  - `dsm-platform: pc`
+  - `dsm-lang: zh-CN`
+  - `dsm-site: ""`（**空字符串**）
+  - `dsm-trace-id: <UUID v4，每请求唯一>`（`str(uuid.uuid4())`）
+  - `x-rp-client: h5_2.4.0`
+  - `x-referer-page: https://shop.jd.com/jdm/trade/tools/export/ExprotList`
+  - `Origin: https://shop.jd.com`
+  - `Referer: https://shop.jd.com/jdm/trade/tools/export/ExprotList?exportTaskType=0`
+- **Body**：
+  ```json
+  {
+    "exportParam": {
+      "exportTaskType": 0,
+      "taskDataParam": "{\"startDate\":\"2026-08-10 00:00:00\",\"endDate\":\"2026-08-10 23:59:59\",\"exportTaskType\":0,\"skuId\":null,\"warningType\":null,\"locSkuId\":null,\"sensitiveInfoSign\":\"0\",\"orderStatusList\":[-1]}"
+    }
+  }
+  ```
+  ⚠️ **taskDataParam 必须是 JSON 字符串**（`json.dumps(..., separators=(",", ":"))`），不能直接传对象。
+- **响应（成功）**：`{"msg": "成功", "code": 200, "dsm-trace-id": "..."}`
+  ⚠️ **响应里没有 taskId 字段**（与京准通 add 不同）→ 必须再调 queryExportTaskInfo 分页查
+- **业务码**（2026-08-11 实证）：
+  - `200` + `msg="成功"` → 成功
+  - `201` → 单日次数超限（触发 10 分钟间隔）
+  - `601` → 风控限流（**不重试**）
+  - 业务码非 0/200 + message 含"登录" → Cookie 过期
+
+### 第 2 步：queryExportTaskInfo（轮询拿 taskId）
+- **URL**：`https://sff.jd.com/api?v=1.0&appId=CQLEJWPYPFOVQBC8UFLQ&api=dsm.order.export.exportCenterService.queryExportTaskInfo`
+- **方法**：POST JSON
+- **Headers**：与第 1 步完全一致（同 dsm 头模板）
+- **Body**：
+  ```json
+  {
+    "exportParam": {
+      "exportTaskType": 0,
+      "page": 1,
+      "pageSize": 10
+    }
+  }
+  ```
+- **响应（成功）**：
+  ```json
+  {
+    "msg": "成功",
+    "code": 200,
+    "data": {
+      "totalItem": 36,
+      "pageIndex": 1,
+      "pageSize": 10,
+      "itemList": [
+        {
+          "id": "105874726884",                          // ← 这就是 taskId
+          "taskStatus": 2,                              // 2=已完成，0/1=等待/处理中
+          "encryptFlag": true,                           // 加密标识
+          "taskTypeName": "订单明细信息",
+          "smsSendTip": "接收号码：136****6794，每日限发送10次",  // 接收号码脱敏
+          "createDate": 1786414834000,                    // 毫秒时间戳
+          "taskData": {
+            "startTime": "2026-08-10 00:00:00",          // 关键：用这个匹配刚创建的任务
+            "endTime": "2026-08-10 23:59:59",
+            "orderStatusList": [-1],
+            ...
+          }
+        }
+      ]
+    }
+  }
+  ```
+- **轮询逻辑**：
+  1. 每次轮询调一次 `queryExportTaskInfo` 拉取前 10 条任务
+  2. 在 `itemList` 里**按 `taskData.startTime/endTime` 严格字符串相等匹配**刚创建的任务
+  3. 看 `taskStatus`：
+     - `2`（已完成）→ 返回该条任务（含 taskId）
+     - `0/1`（等待/处理中）→ 等 3 秒后重试
+     - `3/4`（失败/过期）→ 抛 RuntimeError
+     - 任务未出现（创建太新/服务端延迟）→ 等 3 秒后重试
+  4. 重复直到 `max_poll_times=20`（合计 60s 超时）
+- ⚠️ **关键发现**：`createdExportTask` 响应**没有 taskId**，必须用此接口分页查+按时间匹配（与京准通 add 接口的 data.reportId 模式不同）
+
+### 第 3 步：export.action（下载加密 zip）
+- **URL**：`https://export.shop.jd.com/exportCenter/export.action?taskId={taskId}`
+- **方法**：GET
+- **Headers**（**与第 1/2/4 步完全不同**）：
+  ```python
+  {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/144.0.0.0 ...Edg/144.0.0.0",
+      "Accept": "text/html,application/xhtml+xml,...",  # 注意：带 text/html（浏览器类型）
+      "Accept-Language": "zh-CN,zh;q=0.9,...",
+      "Accept-Encoding": "gzip, deflate, br, zstd",
+      "Referer": "https://shop.jd.com/jdm/trade/tools/export/ExprotList?exportTaskType=0",  # 必须保留
+      "Cookie": <京麦 Cookie>,  # 仅 Cookie，不需要 h5st
+      "Sec-Fetch-Dest": "document",  # 浏览器行为
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "same-site",
+      "Sec-Fetch-User": "?1",
+      "Upgrade-Insecure-Requests": "1",
+  }
+  ```
+  ⚠️ **绝对不能传 dsm-* 头**（export.shop.jd.com 域不识别，会拒）
+- **响应（成功）**：
+  - 状态码：200
+  - `Content-Type: application/octet-stream`
+  - `Content-Disposition: form-data; name="attachment"; filename="105874726884.zip"`（**文件名直接是 `<taskId>.zip`**）
+  - Body：加密 zip 字节流（PK\x03\x04 开头，但内容已加密）
+- **响应失败**：
+  - 401/302 → Cookie 过期
+  - < 1KB → 任务未完成/已过期/任务不存在
+  - magic bytes 不是 `PK\x03\x04` → 接口变更/异常
+- ⚠️ **关键发现**：`export.shop.jd.com` 域鉴权**完全不需要 h5st**（GET 静态下载，走 cookie-only）
+
+### 第 4 步：exportTaskPwdSend（申请短信密码）
+- **URL**：`https://sff.jd.com/api?v=1.0&appId=CQLEJWPYPFOVQBC8UFLQ&api=dsm.order.export.exportCenterService.exportTaskPwdSend`
+- **方法**：POST JSON
+- **Headers**：与第 1/2 步一致
+- **Body**：
+  ```json
+  {
+    "exportParam": {
+      "exportTaskType": 0,
+      "taskId": "105874726884"
+    }
+  }
+  ```
+- **响应（成功）**：
+  ```json
+  {
+    "msg": "成功",
+    "code": 200,
+    "data": "密码短信发送成功!当前任务剩余短信发送次数8次",   // ← data 是字符串（不是 JSON 对象）
+    "dsm-trace-id": "..."
+  }
+  ```
+  ⚠️ **关键发现**：`data` 字段是**字符串**（与京麦其他 dsm 接口的 JSON 对象不同）
+- **解析剩余次数**（正则）：
+  ```python
+  re.search(r"剩余\s*短信\s*发送\s*次数\s*(\d+)\s*次", raw_data)
+  ```
+  支持容错："剩余 短信 发送 次数 3 次" 这种含多空格的格式
+- **业务约束**：
+  - 单 taskId 两次申请间隔 ≥60 秒
+  - 单 taskId 单日 ≤10 次
+  - 每调用一次扣减 1 次剩余（实证 10 → 9 → 8...）
+- ⚠️ **关键发现**：**接口不返回密码明文**（与设计预期一致）—— 密码只发到京东商家平台绑定的安全手机
+
+### 第 5 步：IMAP 监听拿密码 + 双层解密 + Excel 后置
+**5 步前半：IMAP 监听**
+- **协议**：IMAP SSL（标准库 `imaplib`）
+- **服务器**：`imap.qq.com:993`（QQ 邮箱）
+- **配置**：`config/imap_config.ini`（不入仓），含 host/port/user/auth_code/use_ssl/folder/sender_filter/subject_keyword/max_wait_seconds/poll_interval_seconds
+- **核心实现**：
+  ```python
+  mail = imaplib.IMAP4_SSL(host, port)
+  mail.login(user, auth_code)
+  mail.select("INBOX")
+  # ⚠️ 关键：不用 SUBJECT 中文搜索（ASCII 编码炸），改 ALL + 客户端过滤
+  typ, data = mail.search(None, "ALL")
+  for msg_id in data[0].split()[::-1][:10]:  # 倒序最近 10 封
+      typ, msg_data = mail.fetch(msg_id, "(RFC822)")
+      msg = email.message_from_bytes(msg_data[0][1])
+      # decode_header 解析主题（处理 Base64/Quoted-Printable）
+      # 客户端判断 subject_keyword
+      # 解析正文 → 正则提取密码
+  ```
+- **正则**（3 种格式容错 + 1 个兜底）：
+  1. `taskId:XXX, password:YYY` 格式
+  2. `XXX...YYY` 紧跟格式
+  3. `解压密码：YYY` 格式
+  4. 兜底：`([A-Za-z0-9]{6,12})`（iPhone 邮件正文纯密码，过滤 taskId 自身和纯数字短串）
+- **超时降级**（用户决策 2026-08-11）：IMAP 监听超时后**保留 zip** + 提示用户 `--sms-password` 重跑，不报错退出
+
+**5 步后半：双层解密 + xls → xlsx 转存 + Excel 后置**
+- **关键发现**：京麦订单明细 zip 是**双层加密**：
+  - 第 1 层：zip 容器用 ZipCrypto 加密（zipfile 标准库支持）
+  - 第 2 层：内部 xls 是 OLE2 复合文档，**内容本身也加密**（需要同密码二次解密）
+- **双层解密实现**：
+  ```python
+  # 第 1 层：zipfile 解开 zip
+  with zipfile.ZipFile(zip_path, "r") as zf:
+      encrypted_ole2_bytes = zf.read(target_name, pwd=password.encode("utf-8"))
+
+  # 第 2 层：msoffcrypto 二次解密
+  office_file = msoffcrypto.OfficeFile(io.BytesIO(encrypted_ole2_bytes))
+  office_file.load_key(password=password)
+  office_file.decrypt(decrypted_buf)
+  decrypted_ole2_bytes = decrypted_buf.getvalue()
+
+  # 读解密后的 xlsx（用通用工具 read_excel_bytes 按 magic bytes 自动选引擎）
+  df = read_excel_bytes(decrypted_ole2_bytes)
+  ```
+  ⚠️ **xlrd 2.0+ 不支持 `password` 参数**（实测）—— 必须用 msoffcrypto-tool
+  ⚠️ **解密后是 .xlsx 不是 .xls**（OLE2 头是加密容器的"假象"）—— 用 `read_excel_bytes` 按 `PK\x03\x04` 自动识别
+- **Excel 后置统一规则**（与项目 1-13 一致）：
+  - 规则 1：日期列智能识别（已有日期/时间列不重复新增，仅标准化）
+  - 规则 2：日期统一 `yyyy/m/d` 格式
+  - 规则 3：数值安全转换（SKU/SPU 整数 0 位小数 + 订单编号 @ 强制文本）
+  - 规则 4：输出目录 `output/京麦订单明细/{date}/订单明细_{date}.xlsx`
+- **删除中间 zip**（用户决策 2026-08-11）：只留解密后 xlsx
+
+### 完整 5 步一键入口
+```bash
+# 完整 5 步一键（IMAP 拿密码 + 双层解密 + Excel 后置）
+python main.py --biz_key "京麦订单明细_完整一键导出" \
+    --date 2026-08-10 \
+    --h5st "<F12 抓的 h5st 值>"
+
+# 用 --sms-password 手动传入密码（跳过 IMAP）
+python main.py --biz_key "京麦订单明细_完整一键导出" \
+    --date 2026-08-10 \
+    --h5st "<h5st>" \
+    --sms_password "AbCd1234"
+
+# 分步调用
+python main.py --biz_key "京麦订单明细_创建任务" --date 2026-08-10 --h5st "<h5st>"
+python main.py --biz_key "京麦订单明细_创建并轮询" --date 2026-08-10 --h5st "<h5st>"
+python main.py --biz_key "京麦订单明细_创建轮询并下载zip" --date 2026-08-10 --h5st "<h5st>"
+python main.py --biz_key "京麦订单明细_创建轮询下载并申请密码" --date 2026-08-10 --h5st "<h5st>"
+```
+
+### 关键发现（2026-08-11 实证）
+1. **h5st 一致性**：同一份 h5st 在 createdExportTask / queryExportTaskInfo / exportTaskPwdSend 三个 dsm 接口都通
+2. **taskStatus 状态机**：0=等待/处理中（实证 6 秒内变 2）→ 2=已完成
+3. **taskId 必须在分页查里匹配**：`createdExportTask` 响应**没有 taskId**
+4. **smsSendTip 号码脱敏**：`136****6794`（前 3+4 星+后 4）—— 不同店铺不同
+5. **每次任务密码不同**：`3WPFwj` → `4xkbWM`，**必须 IMAP 拿密码**，不能用旧密码
+6. **双层加密链路**：zip(ZipCrypto) + 内部 xls(msoffcrypto 加密)
+7. **xlrd 不支持 password**：必须用 msoffcrypto-tool
+8. **解密后是 .xlsx**（OLE2 头是假象）
+9. **IMAP 中文主题编码 bug**：`imaplib.search("SUBJECT 中文")` ASCII 编码炸 → 改 ALL + 客户端 decode_header
+10. **每个任务独立**：taskId / password 都新生成，不能跨任务复用
+
+### 异常处理矩阵
+| 异常 | 处理 |
+|---|---|
+| 业务码 200 + 成功 | 正常 |
+| 业务码 201（单日超限） | RuntimeError + 提示等 10 分钟 |
+| 业务码 601（风控） | RiskControlError（不重试） |
+| HTTP 401/302（第 3 步） | CookieExpiredError |
+| 响应 < 1KB | RuntimeError（任务未完成/过期） |
+| zip magic bytes 不对 | RuntimeError（接口变更/异常） |
+| 短信 data 字段非字符串 | RuntimeError（接口变更，防御性检查） |
+| OLE2 解密失败 | RuntimeError（密码错误 or 内部 xls 空） |
+| IMAP 登录失败 | RuntimeError（授权码过期） |
+| IMAP 监听超时 | **保留 zip + 提示重跑**（不抛错退出） |
+
+### 入口命令
+```bash
+# 完整 5 步一键（IMAP 自动监听 + 双层解密 + Excel 后置）
+python main.py --biz_key "京麦订单明细_完整一键导出" --date 2026-08-10 --h5st "<h5st>"
+
+# 跳过 IMAP 用 --sms-password 手动传入密码
+python main.py --biz_key "京麦订单明细_完整一键导出" --date 2026-08-10 --h5st "<h5st>" --sms_password "AbCd1234"
+
+# 自定义 Cookie / IMAP 路径
+python main.py --biz_key "京麦订单明细_完整一键导出" --date 2026-08-10 \
+    --h5st "<h5st>" \
+    --cookie_path "config/jm_cookie.txt" \
+    --imap_config_path "config/imap_config.ini"
+```
+
+### 依赖
+- `msoffcrypto-tool>=6.0.0`（pip 装，本项目独有）
+- `xlrd==2.0.1`（pandas 兼容 .xls 必需，**不要升 3.0**——会移除 .xls 支持）
+- `openpyxl>=3.1.0`（写 xlsx + 单元格格式）
+- `imaplib`（标准库）
+
+### 关联文件
+- **业务类**：`main.py` `class JingMaiOrderExportAPI`（~700 行含详细中文注释）
+- **Cookie 文件**：`config/jm_cookie.txt`（**不入仓**，3098 字符京麦 .shop.jd.com 域 Cookie）
+- **IMAP 配置**：`config/imap_config.ini`（**不入仓**，含 QQ 邮箱授权码）
+- **IMAP 模板**：`config/imap_config.ini.example`（入仓模板，含 iPhone 快捷指令配置说明）
+- **CLI 参数**：`--h5st` / `--sms_password` / `--cookie_path` / `--imap_config_path`（京麦订单导出专用，2026-08-11 阶段5 新增）
+- **业务沉淀**：`.trae/skills/jd-api-analyze/SKILL.md` 京麦分区「项目14」章节
+- **抓包脚本**：`jd_cdp_capture.py`（项目14 已真实跑通，**不再需要**）
+
+### 变更记录
+| 日期 | 改动 |
+|------|------|
+| 2026-08-11 | **项目 14：京麦订单明细【加密】导出（JingMaiOrderExportAPI）真实跑通上线（远程提交 11e0b84）**：① **5 步异步链路**（区别于商智同步、京准通 3 步）—— createdExportTask → queryExportTaskInfo（**分页查列表按 startTime/endTime 匹配**拿 taskId）→ export.action 仅 Cookie 下载 → exportTaskPwdSend 触发短信（**不返回密码明文**）→ IMAP 监听 + msoffcrypto 双层解密；② **鉴权 3 次切换** —— 1/2/4 步 sff.jd.com h5st+dsm、3 步 export.shop.jd.com 仅 Cookie+Referer、5 步本地 zipfile+msoffcrypto；③ 业务类**不继承 JDBaseRequest**（h5st 与 UA 绑定，异步流程差异大）；④ 5 个业务 key（创建任务/创建并轮询/创建轮询下载zip/创建轮询下载并申请密码/完整一键导出）+ 4 个一键方法；⑤ CLI 新增 4 个项目14 专用参数（--h5st/--sms_password/--cookie_path/--imap_config_path）；⑥ IMAP 监听 QQ 邮箱（imaplib 标准库）+ iPhone 快捷指令自动转发短信（主题"京东密码转发"）；⑦ 关键发现：**msoffcrypto 双层解密**（zip ZipCrypto + 内部 xls msoffcrypto 加密，xlrd 2.0+ 不支持 password 参数）；⑧ 关键发现：**smsSendTip 号码脱敏**（`136****6794`，前 3+4 星+后 4）；⑨ 关键发现：**每次任务密码不同**（实证 `3WPFwj` → `4xkbWM`），不能跨任务复用；⑩ 关键发现：**IMAP 中文主题编码 bug**（`imaplib.search("SUBJECT 中文")` ASCII 编码炸，改 ALL + 客户端 decode_header + 客户端判断主题）；⑪ 关键发现：**每次任务都重新生成 taskId/password**；⑫ Excel 后置统一规则应用：日期列智能新增、yyyy/m/d 格式、SKU/SPU 整数 0、订单编号 @ 强制文本、合计行剔除、B2 冻结；⑬ 真实跑通 1 单（订单号 3586255013115624、金额 1049）写入 `output/京麦订单明细/2026-08-10/订单明细_2026-08-10.xlsx`（6843 字节）；⑭ 自查 9 维度 0 问题 0 警告；⑮ 新增 `config/jm_cookie.txt` + `config/imap_config.ini`（不入仓）+ `config/imap_config.ini.example`（入仓模板）；⑯ .gitignore 新加 `config/jm_cookie.txt` + `config/imap_config.ini` 白名单 |
 | 2026-08-07 | 阶段2：用户决策汇总（合并 main.py / 不写 uuid / payload 类内常量 / Cookie 独立文件 / 兜底 2026-08-07）|
