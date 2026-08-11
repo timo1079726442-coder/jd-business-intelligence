@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 main.py - 京东商智数据导出工具（重构版 v2.0）
 
@@ -462,7 +462,7 @@ def apply_column_formats(file_path, df, date_column="日期", date_value=None):
 #  业务名称：通用能力
 #  接口地址：无（封装通用能力，被各业务API复用）
 #  功能说明：
-#      - Cookie 读取与更新（config/cookie.txt）
+#      - Cookie 读取与更新（config/sz_cookie.txt）
 #      - 风控签名生成（User-mup / User-mnp / uuid）
 #      - 30秒请求间隔控制（从config读取，严格执行）
 #      - 重试机制（最多3次，递增等待）
@@ -726,7 +726,7 @@ class JDBaseRequest:
 
                             if status_code in (302, -1) or "登录" in error_msg or "login" in error_msg.lower():
                                 self.logger.error(f"Cookie可能已过期: {error_msg} (status={status_code})")
-                                raise CookieExpiredError("Cookie已过期，请更新 config/cookie.txt")
+                                raise CookieExpiredError("Cookie已过期，请更新 config/sz_cookie.txt")
 
                             self.logger.warning(f"风控拦截: {error_msg} (status={status_code})")
                             if attempt < self.MAX_RETRIES:
@@ -1208,7 +1208,7 @@ class ProductFlowAPI(JDBaseRequest):
 #      1. 必带 Origin/Referer（缺失被平台拦截）
 #      2. 业务表单参数固定不变（13 个字段）
 #      3. User-mup / User-mnp / uuid 每次调用动态生成（禁止硬编码）
-#      4. Cookie 从浏览器会话获取（走 config/cookie.txt，禁止入代码）
+#      4. Cookie 从浏览器会话获取（走 config/sz_cookie.txt，禁止入代码）
 # ============================================================
 class OfflineChannelAPI(JDBaseRequest):
     """店铺来源-离线渠道流量报表 API。
@@ -1220,7 +1220,7 @@ class OfflineChannelAPI(JDBaseRequest):
 
     父类复用：
         - 父类 JDBaseRequest 提供：
-            * Cookie 读取（config/cookie.txt）
+            * Cookie 读取（config/sz_cookie.txt）
             * 风控签名（User-mnp MD5 哈希，盐值复用全局 SIGN_SALT）
             * 自动 30 秒间隔（_wait_interval）
             * 自动重试 + UA 切换
@@ -1413,7 +1413,7 @@ class OfflineChannelAPI(JDBaseRequest):
                 # 5.4 HTTP 状态码基础检查
                 if response.status_code == 401:
                     self.logger.error("HTTP 401 未授权 - Cookie 可能已过期或被禁用")
-                    raise CookieExpiredError("Cookie已过期或无效，请更新 config/cookie.txt")
+                    raise CookieExpiredError("Cookie已过期或无效，请更新 config/sz_cookie.txt")
                 if response.status_code == 403:
                     self.logger.error("HTTP 403 禁止访问 - Cookie/签名/Origin 校验失败")
                     # 不抛 CookieExpired，让重试机制 + UA 切换兜底
@@ -1612,7 +1612,7 @@ class OfflineChannelAPI(JDBaseRequest):
 #  硬性约束（用户 2026-08-07 确认）：
 #      1. GET 不用 POST，参数全拼 URL
 #      2. 风控三元组每次全新生成，UUID 不使用固定前缀
-#      3. Cookie 从 config/cookie.txt 整体读取
+#      3. Cookie 从 config/sz_cookie.txt 整体读取
 #      4. 必须双重校验：Content-Disposition + PK 魔数
 #      5. 文件名从 Content-Disposition 提取原始名
 #      6. 保存目录：output/商品明细/{date}/{原始文件名}
@@ -1630,7 +1630,7 @@ class ProductDetailAPI(JDBaseRequest):
 
     父类复用：
         - 父类 JDBaseRequest 提供：
-            * Cookie 读取（config/cookie.txt）
+            * Cookie 读取（config/sz_cookie.txt）
             * 风控签名（基类 _gen_risk_params / _wait_interval）
             * 自动 30 秒间隔
             * 自动重试 + UA 切换（_switch_ua）
@@ -2040,7 +2040,7 @@ class ProductDetailAPI(JDBaseRequest):
                 # 5.4 HTTP 状态码基础检查
                 if response.status_code == 401:
                     self.logger.error("HTTP 401 未授权 - Cookie 可能已过期或被禁用")
-                    raise CookieExpiredError("Cookie已过期或无效，请更新 config/cookie.txt")
+                    raise CookieExpiredError("Cookie已过期或无效，请更新 config/sz_cookie.txt")
                 if response.status_code == 403:
                     self.logger.error("HTTP 403 禁止访问 - Cookie/签名/Referer 校验失败")
                     # 不抛 CookieExpired，让重试机制 + UA 切换兜底
@@ -2176,7 +2176,7 @@ class ProductDetailAPI(JDBaseRequest):
 #  硬性约束：
 #      1. 风控三元组每次全新生成，uuid 完全随机（16hex-10hex，同项目4/5）
 #      2. 601 不重试（抛 RiskControlError，同项目4/5 阶段4 修复）
-#      3. Cookie 从 config/cookie.txt 整体读取
+#      3. Cookie 从 config/sz_cookie.txt 整体读取
 # ============================================================
 class LossProductAPI(JDBaseRequest):
     """商品流失分析 API（竞争分析-竞争流失-商品流失，2026-08-07）。
@@ -2471,7 +2471,7 @@ class LossProductAPI(JDBaseRequest):
                 # 4.4 HTTP 状态码基础检查
                 if response.status_code == 401:
                     self.logger.error("HTTP 401 未授权 - Cookie 可能已过期或被禁用")
-                    raise CookieExpiredError("Cookie已过期或无效，请更新 config/cookie.txt")
+                    raise CookieExpiredError("Cookie已过期或无效，请更新 config/sz_cookie.txt")
                 if response.status_code == 403:
                     self.logger.error("HTTP 403 禁止访问 - Cookie/签名/Origin 校验失败")
                     # 不抛 CookieExpired，让重试机制 + UA 切换兜底
@@ -3708,6 +3708,39 @@ class JZTKuaicheOrderEffectAPI:
 #       "desc":     业务描述,
 #       "params":   业务专属参数说明（dict，键值对形式展示给用户）
 #   }
+#
+# ════════════════════════════════════════════════════════════════════════
+# ⚠️ 业务模块占位（2026-08-11 用户决策：3 大模块各留占位，方便后续扩展）
+# ════════════════════════════════════════════════════════════════════════
+#
+# 📦 商智模块（sz）- szgateway.jd.com 域
+#    现有业务（项目1/4/5/6/13）：
+#      - 商品流量来源_搜索 / _推荐 / _购物车
+#      - 店铺来源_三级渠道
+#      - 商品明细导出
+#      - 商品流失分析
+#      - 商智关键词分析
+#    Cookie：config/sz_cookie.txt（不入仓）
+#    风控：USER_MNP_SALT + UUID_PREFIX（在 config/config.xlsx + 类常量）
+#    新增项目时复制现有 class 模板，修改 API_URL / payload / 列名即可
+#
+# 📦 京准通模块（jzt）- jzt-api.jd.com 域
+#    现有业务（项目7-12）：
+#      - 京准通快车自定义报表 / 订单效果明细
+#      - 京准通全站营销单品计划 / 单品推广效果 / 全店计划 / 全店推广效果
+#    Cookie：config/jzt_cookie.txt（不入仓）
+#    鉴权：仅 Cookie（h5st 可选）+ UA v=151
+#    新增项目时复制 JZTKuaicheAPI / JZTQuanZhanEffectAPI 等模板
+#
+# 📦 京麦模块（jm）- sff.jd.com + export.shop.jd.com 域
+#    现有业务（项目14，5 个一键）：
+#      - 京麦订单明细_创建任务 / 创建并轮询 / 创建轮询下载zip / 创建轮询下载并申请密码 / 完整一键导出
+#    Cookie：config/jm_cookie.txt（不入仓）
+#    鉴权：h5st（一次性，CLI --h5st 传）+ dsm-* 全套头
+#    短信密码：QQ 邮箱 IMAP（config/imap_config.ini 不入仓）
+#    新增项目时复制 JingMaiOrderExportAPI 模板（5 步异步链路）
+#
+# ════════════════════════════════════════════════════════════════════════
 BUSINESS_REGISTRY = {
     "商品流量来源_搜索": {
         "api_class": ProductFlowAPI,
@@ -5783,7 +5816,7 @@ class KeywordAnalysisAPI(JDBaseRequest):
 
     父类复用：
         - JDBaseRequest 提供：
-            * Cookie 读取（config/cookie.txt）
+            * Cookie 读取（config/sz_cookie.txt）
             * 风控签名（UUID 完全随机 + MD5 哈希）
             * 自动 30 秒间隔（_wait_interval）
             * 自动重试 + UA 切换
@@ -5955,7 +5988,7 @@ class KeywordAnalysisAPI(JDBaseRequest):
                 raise CookieExpiredError(
                     f"❌ 关键词分析 Cookie 过期（HTTP {response.status_code}）\n"
                     f"   → 请浏览器重新登录 https://sz.jd.com/szweb/sz/view/viewflow/shopKeywordsVNew.html\n"
-                    f"   → F12 抓 szgateway.jd.com 域 Cookie 写入 config/cookie.txt"
+                    f"   → F12 抓 szgateway.jd.com 域 Cookie 写入 config/sz_cookie.txt"
                 )
             raise RuntimeError(
                 f"❌ 关键词分析响应不是 xlsx 流（HTTP {response.status_code}, Content-Type={content_type}）\n"
@@ -6118,7 +6151,7 @@ class JingMaiOrderExportAPI:
 
     参数:
         h5st        - 浏览器 F12 抓 createdExportTask 请求头 h5st 值（**一次性**）
-        cookie_path - 京麦 Cookie 文件路径（默认 config/cookie.txt）
+        cookie_path - 京麦 Cookie 文件路径（默认 config/sz_cookie.txt）
                       ⚠️ 京麦与商智/京准通 Cookie 不互通，但 sff.jd.com 用的是
                          shop.jd.com 域 Cookie，与商智 cookie 实际是不同账户会话；
                          建议复制到 config/jm_cookie.txt 单独维护，本类先支持自定义路径
@@ -6151,12 +6184,12 @@ class JingMaiOrderExportAPI:
     CODE_DAILY_LIMIT = 201    # 单日次数超限
     CODE_RISK = 601           # 风控限流（不重试）
 
-    def __init__(self, h5st: str = "", cookie_path: str = "config/cookie.txt"):
+    def __init__(self, h5st: str = "", cookie_path: str = "config/sz_cookie.txt"):
         """初始化京麦订单导出 API。
 
         参数:
             h5st        - 浏览器F12抓 createdExportTask 请求头 h5st（**必填**）
-            cookie_path - 京麦 Cookie 文件路径，默认 config/cookie.txt
+            cookie_path - 京麦 Cookie 文件路径，默认 config/sz_cookie.txt
         """
         import requests
 
@@ -6999,7 +7032,7 @@ class JingMaiOrderExportAPI:
             raise CookieExpiredError(
                 f"❌ 京麦订单导出 Cookie 过期（HTTP 401）\n"
                 f"   → 请浏览器登录 https://shop.jd.com/jdm/trade/tools/export/ExprotList，"
-                f"F12 抓 .shop.jd.com 域 Cookie 写入 config/cookie.txt"
+                f"F12 抓 .shop.jd.com 域 Cookie 写入 config/sz_cookie.txt"
             )
         if resp.status_code == 302:
             # 重定向到登录页 → Cookie 失效
@@ -7735,7 +7768,7 @@ def _run_jm_create_task(**kwargs) -> dict:
         )
 
     # cookie_path 可选
-    cookie_path = kwargs.get("cookie_path", "config/cookie.txt")
+    cookie_path = kwargs.get("cookie_path", "config/sz_cookie.txt")
 
     # 透传给 create_export_task 的参数
     forward_kwargs = {
@@ -7771,7 +7804,7 @@ def _run_jm_create_and_wait(**kwargs) -> dict:
             "   → 浏览器F12抓 createdExportTask 请求头 h5st 复制传入"
         )
 
-    cookie_path = kwargs.get("cookie_path", "config/cookie.txt")
+    cookie_path = kwargs.get("cookie_path", "config/sz_cookie.txt")
     forward_kwargs = {
         k: kwargs[k] for k in (
             "start_date", "end_date", "date",
@@ -7805,7 +7838,7 @@ def _run_jm_create_wait_download(**kwargs) -> dict:
             "   → 浏览器F12抓 createdExportTask 请求头 h5st 复制传入"
         )
 
-    cookie_path = kwargs.get("cookie_path", "config/cookie.txt")
+    cookie_path = kwargs.get("cookie_path", "config/sz_cookie.txt")
     forward_kwargs = {
         k: kwargs[k] for k in (
             "start_date", "end_date", "date",
@@ -7840,7 +7873,7 @@ def _run_jm_full_with_pwd(**kwargs) -> dict:
             "   → 浏览器F12抓 createdExportTask 请求头 h5st 复制传入"
         )
 
-    cookie_path = kwargs.get("cookie_path", "config/cookie.txt")
+    cookie_path = kwargs.get("cookie_path", "config/sz_cookie.txt")
     forward_kwargs = {
         k: kwargs[k] for k in (
             "start_date", "end_date", "date",
@@ -7875,7 +7908,7 @@ def _run_jm_run_full_export(**kwargs) -> dict:
             "   → 浏览器F12抓 createdExportTask 请求头 h5st 复制传入"
         )
 
-    cookie_path = kwargs.get("cookie_path", "config/cookie.txt")
+    cookie_path = kwargs.get("cookie_path", "config/sz_cookie.txt")
     forward_kwargs = {
         k: kwargs[k] for k in (
             "start_date", "end_date", "date",
@@ -7997,7 +8030,7 @@ def _run_single_business(biz_key, **kwargs):
         return result
     except CookieExpiredError as e:
         print(f"[ERR] Cookie已过期: {e}")
-        print(f"       请重新获取Cookie，更新 config/cookie.txt 后重试。")
+        print(f"       请重新获取Cookie，更新 config/sz_cookie.txt 后重试。")
         raise
     except Exception as e:
         print(f"[ERR] 业务失败: {biz_key} → {e}")
@@ -8476,3 +8509,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

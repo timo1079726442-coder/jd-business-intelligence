@@ -64,7 +64,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 # Cookie 文件路径
 COOKIE_FILES = {
     "jm": os.path.join(PROJECT_ROOT, "config", "jm_cookie.txt"),     # 京麦
-    "sz": os.path.join(PROJECT_ROOT, "config", "cookie.txt"),       # 商智
+    "sz": os.path.join(PROJECT_ROOT, "config", "sz_cookie.txt"),     # 商智（2026-08-11 重命名 cookie.txt → sz_cookie.txt）
     "jzt": os.path.join(PROJECT_ROOT, "config", "jzt_cookie.txt"),   # 京准通
 }
 
