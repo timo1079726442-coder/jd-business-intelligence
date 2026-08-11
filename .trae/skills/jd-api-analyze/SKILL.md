@@ -568,6 +568,44 @@ python main.py --biz_key "商品流失分析" --date "2026-08-05"
 
 ---
 
+## 项目13：商智关键词分析导出（2026-08-10 上线）
+
+### 业务要点
+- 商智「关键词分析」报表，按**搜索词**（lastSrcPageSearchKeyword）聚合导出（downTable.ajax 家族）
+- **同步一步流程**：POST 直接返回 xlsx 字节流（无 taskId、无轮询，区别于京准通异步三步）
+- **服务端支持区间聚合**：day+DAY 或 month+MONTH（**与项目1 搜索/推荐/购物车不同，无需逐日拆分**）
+- 鉴权：Cookie + User-mup/uuid/User-mnp 三元组（UUID 完全随机 16hex-10hex，与项目4 同源）
+
+### 关键接口
+| 项 | 内容 |
+|----|------|
+| URL | `POST https://szgateway.jd.com/szpaas/szajax/keyword/analysis/shopOut/downTable.ajax` |
+| 页面入口 | `viewflow/shopKeywordsVNew.html` |
+| 业务类 | `KeywordAnalysisAPI`（继承 JDBaseRequest，BUSINESS_REGISTRY 第13业务）|
+| groupType | `lastSrcPageSearchKeyword` |
+| 固定参数 | method=POST / target=_self / groupType / attributes / limit=300 / sortField=`jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src` / sortType=desc |
+| 可变参数 | platformCate1=""（空=全品类，读 config 兜底）|
+| 输出 | `output/商智关键词分析/{startDate}/商智关键词分析_{startDate}_{day\|month}.xlsx` |
+
+### 双粒度实证要点（核心坑）
+| 粒度 | dateType/interval | date 格式 | 插入列 |
+|------|------------------|----------|--------|
+| day | day/DAY（**interval 在前**）| `YYYY-MM-DD` | 「日期」YYYY/M/D |
+| month | month/MONTH（**dateType 在前**）| `YYYYMM` 紧凑（如 202607）| 「日期范围」YYYY/M/D ~ YYYY/M/D |
+
+### 与项目1-6 差异
+- URL 路径 keyword/analysis/shopOut；Referer=shopKeywordsVNew.html；groupType=lastSrcPageSearchKeyword
+- **原生 Excel 无时间列** → pandas 读取后手动插入时间区间列（day 插「日期」、month 插「日期范围」）
+- **空数据合法**：warning 后仍保存空表（与项目10/11/12 行为一致）
+
+### 改动重点
+- `_run_keyword_analysis_full` callable 注入；注册表前向引用（api_class 在类定义后回填）
+- `_gen_uuid_random` / `_gen_risk_params_random` UUID 完全随机（不依赖基类 UUID_PREFIX）
+- `_get_date_params` day/month **字段顺序精确匹配抓包**（dict 插入顺序：month=dateType 在前、day=interval 在前）
+- Content-Type 校验：非 spreadsheetml → 401/403 抛 CookieExpiredError，其他 RuntimeError
+
+---
+
 ### 新增业务接入规范（v2.0 业务注册中心，2026-08-05）
 
 后续新增业务（店铺来源报表/订单明细/售后订单/京准通广告报表）统一按以下步骤接入，**禁止大改调度核心**：
@@ -1081,6 +1119,7 @@ orderStatusCategory=1, orderType="1,3", orderStatuses=[]
 
 | 日期 | 改动概要 |
 |------|----------|
+| 2026-08-10 | **项目13：商智关键词分析导出（KeywordAnalysisAPI）上线（2026-08-10，远程提交 cd47f7b 同步）**：① 商智 downTable.ajax 家族新成员，按搜索词（lastSrcPageSearchKeyword）聚合；② **同步 xlsx 字节流**（无 taskId 无轮询，区别于京准通异步三步）；③ **服务端支持区间聚合**（day+DAY / month+MONTH，与项目1 搜索/推荐/购物车"不支持多日区间"不同，无需逐日拆分）；④ **双粒度实证坑**：day 粒度 date=`YYYY-MM-DD`（字段顺序 interval 在前）、month 粒度 date=`YYYYMM` 紧凑（字段顺序 dateType 在前）——dict 插入顺序精确匹配抓包；⑤ **原生 Excel 无时间列** → 手动插入时间区间列（day 插「日期」、month 插「日期范围」YYYY/M/D ~ YYYY/M/D）；⑥ UUID 完全随机（16hex-10hex，与项目4 同源，不依赖 UUID_PREFIX）；⑦ 固定参数 7 项（method=POST/target=_self/groupType/attributes/limit=300/sortField 浏览量/sortType=desc），可变参数 platformCate1=""；⑧ 空数据合法（warning 后保存空表）；⑨ 401/403 → CookieExpiredError，Content-Type 非 spreadsheetml → RuntimeError；⑩ 输出 `output/商智关键词分析/{startDate}/商智关键词分析_{startDate}_{day\|month}.xlsx`；⑪ BUSINESS_REGISTRY 第13业务，callable 注入 `_run_keyword_analysis_full`，注册表前向引用回填 api_class；⑫ 入口：`python main.py --biz_key "商智关键词分析" --date/--start_date/--end_date [--granularity day|month]` |
 | 2026-08-10 | **项目12：京准通全站营销全店推广效果导出（JZTQuanZhanEffectAllStoreAPI）上线（2026-08-10）**：① **URL 与项目10 完全相同** `POST /reweb/swa/effect/order/download`，**靠 campaignTypes=[118] 区分业务**（项目10 是 [101]）；② payload **13 项**（与项目10 字段结构完全一致：字符串/列表/bool 字段类型严格）；③ 报表名 `FYA8888_全站营销_效果报表_全店推广_{startDay}_{endDay}`（与项目10 `_效果报表_单品推广_` 后缀不同）；④ 响应同时含 downloadUrlZip + downloadUrlCsv；⑤ 复用项目10 的 csv 优先 + 8 次重试 + 空数据视为成功 + 严重告警日志 + Excel 增强（合计行去除/商品ID 0位小数/首列冻结）；⑥ 4 项开放入参与项目10/11 一致（order_status / is_daily / sku_id / spu_id）；⑦ 默认值与项目10 一致：`orderStatus="1"` 成交订单、`isDaily=False` 非日报；⑧ 复用 `config/jzt_cookie.txt`（与项目7-11 互通）；⑨ UA 沿用 v=151（项目10 一致）；⑩ 输出 `output/京准通全站营销全店推广效果/{date}/`；⑪ `BUSINESS_REGISTRY` 第13业务，callable 注入 `_run_jzt_quanzhan_effect_all_store_full`；⑫ mock 单测 **20/20 全过**（tests/jzt_quanzhan_effect_all_store_unittest.py） |
 | 2026-08-10 | **项目11：京准通全站营销全店计划导出（JZTQuanZhanCampaignAllStoreAPI）上线（2026-08-10）**：① **URL 与项目9 完全相同** `POST /reweb/swa/account/campaign/download`，**靠 campaignTypes=[118] 区分业务**（项目9 是 [101]）；② payload **15 项**（与项目9 字段结构完全一致：字符串/列表/bool/嵌套列表字段类型严格）；③ 报表名 `FYA8888_全站营销_全店计划报表_{startDay}_{endDay}`（与项目9 `_单品计划报表_` 后缀不同）；④ **响应同时含 downloadUrlZip + downloadUrlCsv**（项目9 抓包只含 csv，本项目数据完整）；⑤ 复用项目10 的 csv 优先 + 8 次重试 + 空数据视为成功 + 严重告警日志；⑥ 4 项开放入参与项目9 一致（order_status / is_daily / sku_id / spu_id）；⑦ 字段名注意：项目11 SKU 过滤字段名是 `sxuId`（项目9 同）而非 `skuId`；⑧ 复用 `config/jzt_cookie.txt`（与项目7-10 互通）；⑨ UA 沿用 v=151（项目9 一致）；⑩ 输出 `output/京准通全站营销全店计划/{date}/`；⑪ `BUSINESS_REGISTRY` 第12业务，callable 注入 `_run_jzt_quanzhan_campaign_all_store_full`；⑫ mock 单测 **20/20 全过**（tests/jzt_quanzhan_all_store_unittest.py） |
 | 2026-08-10 | **项目10：京准通全站营销单品推广效果导出（JZTQuanZhanEffectAPI）上线（2026-08-10）**：① 同步两步流程（POST `/reweb/swa/effect/order/download` → GET OSS urlZip/csv → 解压转 xlsx）；② payload 13 项（**字段类型严格性+4 项开放入参**：orderStatus 默认 "1" 成交订单可传空、isDaily 默认 False 开放入参、skuId/spuId 默认 "" 新增开放入参；移除项目9 的 obys/dateValues）；③ 响应双字段判定：`code=="1"` + `data.code=="RC_SUCCESS"`（兼容字符串/数字）；④ **zip 优先策略**：downloadUrlZip 优先，缺失降级 downloadUrlCsv，两者都缺失 RuntimeError；⑤ **zip 解压能力**：URL 后缀 `.zip` 自动识别 → `zipfile.ZipFile` 解压取第一个 csv；⑥ OSS 404 随机退避 3-10s ×4 次重试；⑦ 复用 `config/jzt_cookie.txt`（与项目7/8/9 互通）；⑧ UA **沿用项目9 的 v=151**（保证 jzt_cookie.txt 会话一致）；⑨ 输出 `output/京准通全站营销单品推广效果/{date}/`；⑩ `BUSINESS_REGISTRY` 第11业务，callable 注入 `_run_jzt_quanzhan_effect_full`；⑪ mock 单测 **20/20 全过**（tests/jzt_quanzhan_effect_unittest.py）：含 payload 字段类型严格 / 报表名模板 / 4 项开放入参 / zip 优先 / 404 重试 / CookieExpiredError / Cookie 缺失 / callable 签名等 |

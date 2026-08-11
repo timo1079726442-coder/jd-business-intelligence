@@ -607,6 +607,79 @@ python main.py --biz_key "商品流失分析" --date "2026-08-05"
 
 ---
 
+## 项目 13：商智关键词分析导出（KeywordAnalysisAPI）｜2026-08-10 上线
+
+### 业务定位
+按**搜索词（关键词）**聚合的商智流量报表导出（`downTable.ajax` 家族），输出关键词维度的访客数/浏览量/成交/转化率等数据。
+
+### 接口基本信息
+| 项 | 内容 |
+|----|------|
+| 业务key | `商智关键词分析`（BUSINESS_REGISTRY 第13业务）|
+| 接口URL | `POST https://szgateway.jd.com/szpaas/szajax/keyword/analysis/shopOut/downTable.ajax` |
+| 页面入口 | `https://sz.jd.com/szweb/sz/view/viewflow/shopKeywordsVNew.html` |
+| 业务类 | `KeywordAnalysisAPI`（继承 JDBaseRequest，main.py L5677）|
+| 返回格式 | **同步 xlsx 字节流**（无 taskId、无需轮询）|
+| 表单格式 | `application/x-www-form-urlencoded`（非 JSON）|
+| 鉴权 | Cookie + User-mup/uuid/User-mnp 风控三元组（**UUID 完全随机** 16hex-10hex，与项目4 同源）|
+| 输出 | `output/商智关键词分析/{startDate}/商智关键词分析_{startDate}_{day\|month}.xlsx` |
+
+### 与项目1-6 的关键差异
+| 维度 | 项目1-6 | 项目13 |
+|------|---------|--------|
+| URL 路径 | source/* 或 competitionAnalysis/* | **keyword/analysis/shopOut** |
+| Referer | viewSourcesVNew.html 等 | **viewflow/shopKeywordsVNew.html** |
+| 分组维度 | lastSrcChannelId2/3 等 | **lastSrcPageSearchKeyword**（搜索词）|
+| 区间查询 | 搜索/推荐/购物车不支持多日区间（需逐日拆分）| **服务端支持区间聚合**（day+DAY / month+MONTH，无需逐日循环）|
+| 时间列 | prepare_date_columns 统一处理 | 原生无时间列 → **手动插入时间区间列** |
+| 排序字段 | 按渠道业务 | **jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src**（浏览量）|
+
+### 双粒度聚合（day/month，2026-08-10 抓包实证）
+| 粒度 | dateType | interval | date 字段格式 | 插入列 |
+|------|----------|----------|--------------|--------|
+| day | day | DAY | `YYYY-MM-DD`（带分隔符）| 「日期」（YYYY/M/D）|
+| month | month | MONTH | `YYYYMM`（紧凑无分隔符，如 202607）| 「日期范围」（YYYY/M/D ~ YYYY/M/D）|
+
+⚠️ **字段顺序按抓包实证**（Python dict 保留插入顺序，必须精确匹配）：
+- month 抓包：`dateType=month, interval=MONTH`（**dateType 在前**）
+- day 抓包：`interval=DAY, dateType=day`（**interval 在前**）
+- 代码 `_get_date_params` 两个粒度各起一段 dict 组装，保证字段顺序与抓包一致
+
+### 固定/可变参数
+- **固定参数**（2026-08-10 抓包固化，不读 config）：`method=POST` / `target=_self` / `groupType=lastSrcPageSearchKeyword` / `attributes=lastSrcPageSearchKeyword` / `limit=300` / `sortField=jdr_sch_traffic_enter_shop__browse_page_cnt_shop_last_src` / `sortType=desc`
+- **可变参数**（读 config 兜底+警告）：`platformCate1=""`（空=全品类）
+
+### 流程（同步一步）
+```
+_run_keyword_analysis_full(**kwargs)   # 调度 callable，转发 date/start_date/end_date/granularity
+  → KeywordAnalysisAPI().run_full_export(...)
+    → _build_form_payload（固定 + 可变 + 日期 + 风控三元组）
+    → _post_for_xlsx（POST 同步拿 xlsx 字节流）
+    → _post_process_xlsx（读 xlsx → 按粒度插入时间区间列 → safe_convert_numeric → 落盘 + apply_column_formats）
+```
+
+### 异常处理
+- Content-Type 不含 spreadsheetml → 非 xlsx 流：
+  - 401/403 → `CookieExpiredError`（提示重抓 cookie）
+  - 其他 → RuntimeError
+- **空数据合法**：warning 后仍保存空表（不抛错，与项目10/11/12 空数据视为成功一致）
+
+### 入口命令
+```bash
+# 单日（day 粒度）
+python main.py --biz_key "商智关键词分析" --date "2026-07-30"
+
+# 区间（month 粒度）
+python main.py --biz_key "商智关键词分析" --start_date "2026-07-01" --end_date "2026-07-31" --granularity month
+```
+
+### 变更记录
+| 日期 | 改动 |
+|------|------|
+| 2026-08-10 | KeywordAnalysisAPI 上线（远程提交 cd47f7b）：同步 xlsx 流 + UUID 完全随机 + day/month 双粒度 + 时间区间列插入 |
+
+---
+
 ## 项目 7：京准通快车自定义报表导出（JZTKuaicheAPI）｜2026-08-07 上线骨架
 
 ### 业务定位
