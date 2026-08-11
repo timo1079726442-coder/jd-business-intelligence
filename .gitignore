@@ -3,6 +3,10 @@ config/cookie.txt
 # 京准通独立 Cookie（与商智不互通，项目7）
 config/jzt_cookie.txt
 config/新建文本文档.txt
+# 京麦订单导出 IMAP 配置（含 QQ 邮箱授权码，2026-08-11 项目14 阶段5）
+config/imap_config.ini
+# 京麦订单导出独立 Cookie（与商智不互通，项目14 阶段5）
+config/jm_cookie.txt
 
 # 输出和日志
 output/

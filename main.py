@@ -3899,6 +3899,110 @@ BUSINESS_REGISTRY = {
             "granularity": "聚合粒度：'day' / 'month'（默认 'day'）",
         },
     },
+    # 业务：京麦订单明细【加密】导出（项目14，2026-08-11 启动）
+    #   流程：5 步异步链路（创建任务→轮询→短信申请→下载加密zip→解压xlsx）
+    #   鉴权：Cookie + h5st（前端强签名）+ dsm-eid / dsm-platform / dsm-trace-id / dsm-lang
+    #   ⚠️ 接口域名 sff.jd.com（不是 seller-v10.shop.jd.com），入口 shop.jd.com
+    #   阶段1+2：创建任务 + 轮询拿 taskId（queryExportTaskInfo 实证为分页列表）
+    "京麦订单明细_创建任务": {
+        "api_class": None,  # 占位：下方 JingMaiOrderExportAPI 定义后回填
+        "method": "create_export_task",
+        "callable": None,  # 占位：下方 _run_jm_create_task 函数定义后注入
+        "desc": "京麦订单明细【加密】导出 - 第1步：创建导出任务（POST /api?api=dsm.order.export.exportCenterService.createdExportTask）",
+        "params": {
+            "date": "单日查询YYYY-MM-DD（默认=start_date=end_date）",
+            "start_date": "开始日期YYYY-MM-DD（含）",
+            "end_date": "结束日期YYYY-MM-DD（含）",
+            "h5st": "必填，浏览器F12抓 createdExportTask 请求头 h5st（前端强签名，一次性）",
+            "order_status_list": "订单状态列表，默认 [-1]（全部），可传 [1,2,3] 等",
+            "sensitive_info_sign": "敏感信息导出标志，默认 '0'（不导出收件人敏感信息）",
+            "export_task_type": "导出任务类型，默认 0（订单明细）",
+        },
+    },
+    # 业务：京麦订单明细 - 第1+2步一键（创建任务→轮询拿 taskId）（2026-08-11）
+    #   ⚠️ 2026-08-11 实证：createdExportTask 响应**没有 taskId**，
+    #     必须再调 queryExportTaskInfo 分页查任务列表，按 startTime/endTime 匹配刚那条 → 拿 id
+    "京麦订单明细_创建并轮询": {
+        "api_class": None,
+        "method": "create_and_wait",
+        "callable": None,  # 占位：下方 _run_jm_create_and_wait 定义后注入
+        "desc": "京麦订单明细【加密】导出 - 一键创建+轮询拿taskId（创建→分页查→按时间匹配→状态=2 返回）",
+        "params": {
+            "date": "单日查询YYYY-MM-DD（默认=start_date=end_date）",
+            "start_date": "开始日期YYYY-MM-DD（含）",
+            "end_date": "结束日期YYYY-MM-DD（含）",
+            "h5st": "必填，浏览器F12抓 createdExportTask 请求头 h5st（前端强签名，一次性）",
+            "order_status_list": "订单状态列表，默认 [-1]",
+            "sensitive_info_sign": "敏感信息导出标志，默认 '0'",
+            "export_task_type": "导出任务类型，默认 0",
+            "poll_interval": "轮询间隔秒数，默认 3",
+            "max_poll_times": "轮询最大次数，默认 20（合计 60s）",
+        },
+    },
+    # 业务：京麦订单明细 - 第1+2+3步一键（创建+轮询+下载加密 zip，2026-08-11）
+    #   ⚠️ 第3步 GET export.action 仅 Cookie 鉴权（不需要 h5st / dsm 头），
+    #     返回加密 zip（PK magic bytes + password encrypted），解压密码由阶段4短信下发
+    "京麦订单明细_创建轮询并下载zip": {
+        "api_class": None,
+        "method": "create_wait_and_download",
+        "callable": None,  # 占位：下方 _run_jm_create_wait_download 定义后注入
+        "desc": "京麦订单明细【加密】导出 - 一键创建+轮询+下载加密zip（h5st创建→轮询→Cookie下载）",
+        "params": {
+            "date": "单日查询YYYY-MM-DD（默认=start_date=end_date）",
+            "start_date": "开始日期YYYY-MM-DD（含）",
+            "end_date": "结束日期YYYY-MM-DD（含）",
+            "h5st": "必填，浏览器F12抓 createdExportTask 请求头 h5st（前端强签名，一次性）",
+            "order_status_list": "订单状态列表，默认 [-1]",
+            "sensitive_info_sign": "敏感信息导出标志，默认 '0'",
+            "export_task_type": "导出任务类型，默认 0",
+            "poll_interval": "轮询间隔秒数，默认 3",
+            "max_poll_times": "轮询最大次数，默认 20（合计 60s）",
+        },
+    },
+    # 业务：京麦订单明细 - 第1+2+3+4步一键（创建+轮询+下载+短信申请，2026-08-11）
+    #   ⚠️ 第4步 exportTaskPwdSend 需要 h5st（与 createdExportTask 同一份 h5st 可复用）
+    #     响应 data 是字符串（"密码短信发送成功!当前任务剩余短信发送次数N次"），
+    #     **不返回密码明文**——密码只发到短信接收号码（如 1366794）
+    "京麦订单明细_创建轮询下载并申请密码": {
+        "api_class": None,
+        "method": "create_wait_download_and_request_pwd",
+        "callable": None,  # 占位：下方 _run_jm_full_with_pwd 定义后注入
+        "desc": "京麦订单明细【加密】导出 - 完整4步一键：创建→轮询→下载→短信申请（密码发到手机/邮件）",
+        "params": {
+            "date": "单日查询YYYY-MM-DD（默认=start_date=end_date）",
+            "start_date": "开始日期YYYY-MM-DD（含）",
+            "end_date": "结束日期YYYY-MM-DD（含）",
+            "h5st": "必填，浏览器F12抓 createdExportTask 请求头 h5st",
+            "order_status_list": "订单状态列表，默认 [-1]",
+            "sensitive_info_sign": "敏感信息导出标志，默认 '0'",
+            "export_task_type": "导出任务类型，默认 0",
+            "poll_interval": "轮询间隔秒数，默认 3",
+            "max_poll_times": "轮询最大次数，默认 20（合计 60s）",
+        },
+    },
+    # 业务：京麦订单明细 - 完整5步一键（创建+轮询+下载+短信申请+IMAP拿密码+解压xlsx，2026-08-11）
+    #   ⚠️ 鉴权 3 次切换：sff.jd.com dsm/h5st → export.shop.jd.com 仅Cookie → 本地zipfile
+    #   密码获取优先级：sms_password（命令行） > IMAP 自动监听
+    #   IMAP 超时（用户决策 2026-08-11）：保留 zip + 提示人工 --sms-password 重跑，不报错退出
+    "京麦订单明细_完整一键导出": {
+        "api_class": None,
+        "method": "run_full_export",
+        "callable": None,  # 占位：下方 _run_jm_run_full_export 定义后注入
+        "desc": "京麦订单明细【加密】导出 - 完整5步一键：创建→轮询→下载→短信→IMAP拿密码→解压xlsx",
+        "params": {
+            "date": "单日查询YYYY-MM-DD（默认=start_date=end_date）",
+            "start_date": "开始日期YYYY-MM-DD（含）",
+            "end_date": "结束日期YYYY-MM-DD（含）",
+            "h5st": "必填，浏览器F12抓 createdExportTask 请求头 h5st",
+            "sms_password": "可选：手动传入解压密码（优先级高于IMAP）",
+            "imap_config_path": "IMAP配置文件路径，默认 config/imap_config.ini",
+            "order_status_list": "订单状态列表，默认 [-1]",
+            "sensitive_info_sign": "敏感信息导出标志，默认 '0'",
+            "export_task_type": "导出任务类型，默认 0",
+            "poll_interval": "轮询间隔秒数，默认 3",
+            "max_poll_times": "轮询最大次数，默认 20（合计 60s）",
+        },
+    },
 }
 
 
@@ -5967,6 +6071,1833 @@ class KeywordAnalysisAPI(JDBaseRequest):
 BUSINESS_REGISTRY["商智关键词分析"]["api_class"] = KeywordAnalysisAPI
 
 
+# ============================================================
+#  业务接口 14：（新业务 - 京麦订单明细【加密】导出，2026-08-11 启动）
+# ------------------------------------------------------------
+#  中文说明（小白必读）：
+#    京麦订单导出页面是「先创建任务 → 后台生成加密 zip → 用户触发短信获取解压密码」的模式。
+#    完整 5 步异步链路（用户决策 2026-08-11）：
+#      1) countDown              前置限流校验（页面进入时调用，本期先跳过，保留扩展位）
+#      2) createdExportTask      POST 创建导出任务，返回 taskId
+#      3) queryExportTaskInfo    轮询任务状态，直到完成
+#      4) exportTaskPwdSend      触发短信下发（接口不返回密码明文）
+#      5) export.action          GET 下载加密 zip → 用密码解压 → 内部 xlsx
+#
+#  ⚠️ 鉴权差异（与商智/京准通完全不同）：
+#    - 鉴权签名：h5st（前端强签名，一次性，浏览器实时生成，**禁止复用抓包值**）
+#    - 风控字段：dsm-eid / dsm-platform / dsm-lang / dsm-trace-id（每请求不同）
+#    - 域名：sff.jd.com（不是 seller-v10.shop.jd.com）
+#    - 入口：shop.jd.com/jdm/trade/tools/export/ExprotList
+#    - 鉴权头按抓包 2026-08-11 实证固化（不读 config，因 h5st 是一次性签名）
+#
+#  阶段1（本轮交付）范围：
+#    - 业务类 JingMaiOrderExportAPI 骨架（Cookie + dsm 头注入 + h5st 入参）
+#    - 仅实现 create_export_task()（POST createdExportTask → 解析 taskId）
+#    - 其余 4 步方法占位（raise NotImplementedError 提示后续抓包）
+#
+#  业务硬性约束（2026-08-06/11 踩坑日志）：
+#    - 时间跨度最大 31 天（订单明细【加密】导出服务端强制）
+#    - 同导出类型账号维度：两次导出间隔≥10 分钟，单日最多 10 次（code=201）
+#    - 单 taskId 申请密码：单任务单日≤10 次，两次调用间隔≥60 秒
+#    - h5st 必须真实浏览器实时生成（禁止硬编码复用抓包值）
+#    - 严禁代理/VPN/IP 池访问京麦（升级风险）
+#    - 触发 601 后 30-120 分钟冷却，冷却期间任何请求都会重置冷却
+# ============================================================
+
+import secrets as _secrets  # 用于 dsm-trace-id 唯一化
+import uuid as _uuid        # 用于 dsm-trace-id 标准 UUID 格式（与抓包格式一致）
+
+
+class JingMaiOrderExportAPI:
+    """京麦订单明细【加密】导出 API（项目14，2026-08-11 启动骨架）。
+
+    ⚠️ 本类**不继承 JDBaseRequest**（与项目7 同原因）：
+        - 鉴权体系：h5st + dsm 全套头（不是商智 User-mnp/uuid）
+        - 异步 5 步流程（创建→轮询→短信→下载→解压），不适合基类 30秒重试模型
+        - UA 与 h5st 绑定，禁用基类 UA 切换（会致 h5st 失效）
+
+    参数:
+        h5st        - 浏览器 F12 抓 createdExportTask 请求头 h5st 值（**一次性**）
+        cookie_path - 京麦 Cookie 文件路径（默认 config/cookie.txt）
+                      ⚠️ 京麦与商智/京准通 Cookie 不互通，但 sff.jd.com 用的是
+                         shop.jd.com 域 Cookie，与商智 cookie 实际是不同账户会话；
+                         建议复制到 config/jm_cookie.txt 单独维护，本类先支持自定义路径
+    """
+
+    # ---- 鉴权域（业务约束，固定）----
+    BASE_URL = "https://sff.jd.com/api"
+    APP_ID = "CQLEJWPYPFOVQBC8UFLQ"
+    API_VERSION = "1.0"
+    ORIGIN = "https://shop.jd.com"
+    REFERER = "https://shop.jd.com/jdm/trade/tools/export/ExprotList?exportTaskType=0"
+    X_REFERER_PAGE = "https://shop.jd.com/jdm/trade/tools/export/ExprotList"
+    X_RP_CLIENT = "h5_2.4.0"
+
+    # ---- UA（与 h5st 绑定，禁用基类 UA 切换）----
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0"
+    )
+
+    # ---- 业务硬性约束（2026-08-11 实证，与踩坑日志坑5/坑6 一致）----
+    MAX_RANGE_DAYS = 31       # 订单明细【加密】导出时间跨度上限（服务端强制）
+    EXPORT_INTERVAL_MIN = 600 # 同导出类型两次间隔 ≥10 分钟（秒）
+    EXPORT_DAILY_LIMIT = 10   # 单日最多 10 次（code=201 表示超额）
+    PWD_SEND_INTERVAL_MIN = 60  # 单 taskId 两次密码申请间隔 ≥60 秒
+    PWD_SEND_DAILY_LIMIT = 10  # 单 taskId 单日最多 10 次密码申请
+
+    # ---- 业务码（与项目4-13 一致体系）----
+    CODE_OK = 200
+    CODE_DAILY_LIMIT = 201    # 单日次数超限
+    CODE_RISK = 601           # 风控限流（不重试）
+
+    def __init__(self, h5st: str = "", cookie_path: str = "config/cookie.txt"):
+        """初始化京麦订单导出 API。
+
+        参数:
+            h5st        - 浏览器F12抓 createdExportTask 请求头 h5st（**必填**）
+            cookie_path - 京麦 Cookie 文件路径，默认 config/cookie.txt
+        """
+        import requests
+
+        # 1. h5st 校验（必填，前端强签名一次性）
+        if not h5st:
+            # 不强制必抛错——保留空字符串的可能（万一某些调用方想先做参数校验，
+            # 实际创建任务时再报错）。但打印强提示让用户警觉。
+            print(
+                "ℹ️  [京麦订单] 未传 h5st。⚠️ 京麦接口强校验 h5st 签名，"
+                "调用 create_export_task() 时会因签名缺失失败。\n"
+                "   → 请浏览器登录 https://shop.jd.com/jdm/trade/tools/export/ExprotList，"
+                "F12 抓 createdExportTask 请求头 h5st 复制传入"
+            )
+        self.h5st = h5st
+
+        # 2. 读 Cookie（不存在即抛错，强制用户抓包）
+        cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
+        if not os.path.isfile(cookie_path_abs):
+            raise FileNotFoundError(
+                f"❌ 京麦 Cookie 文件不存在：{cookie_path_abs}\n"
+                f"   请浏览器登录 https://shop.jd.com/jdm/trade/tools/export/ExprotList，"
+                f"F12 抓 sff.jd.com 域 Cookie 写入此文件"
+            )
+        with open(cookie_path_abs, "r", encoding="utf-8") as f:
+            self.cookie = f.read().strip()
+        if not self.cookie:
+            raise ValueError(f"❌ 京麦 Cookie 文件 {cookie_path_abs} 内容为空")
+
+        # 3. requests Session（UA 与 h5st 绑定，禁用基类 UA 切换）
+        self.session = requests.Session()
+        # ⚠️ 关键：基础头不直接 update h5st（h5st 每次请求都可能不同，按需注入）
+        #    这里只放不变的鉴权头和会话头
+        self.session.headers.update({
+            "User-Agent": self.USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Origin": self.ORIGIN,
+            "Referer": self.REFERER,
+            "X-Referer-Page": self.X_REFERER_PAGE,
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Rp-Client": self.X_RP_CLIENT,
+            "Cookie": self.cookie,
+        })
+
+    # ---- 工具方法 ----
+
+    @staticmethod
+    def _gen_dsm_trace_id() -> str:
+        """生成 dsm-trace-id（每请求唯一）。
+
+        抓包 2026-08-11 实证：格式 `175fe167-09ff-4678-bac9-d24b3d7ddd90`（标准 UUID v4 字符串）
+        """
+        return str(_uuid.uuid4())
+
+    @staticmethod
+    def _gen_dsm_eid(cookie: str) -> str:
+        """从 Cookie 抓 dsm-eid（与 3AB9D23F7A4B3CSS 字段一致）。
+
+        抓包 2026-08-11 实证：dsm-eid = URL-decode(3AB9D23F7A4B3CSS 的 value)
+            Cookie: 3AB9D23F7A4B3CSS=jdd03PXDAJVX5VICPIPT5...
+            dsm-eid: jdd03PXDAJVX5VICPIPT5...
+
+        说明：直接复用 cookie 中的 3AB9D23F7A4B3CSS 字段值（去前缀 jdd03 前缀外的内容），
+              与抓包抓到的 dsm-eid 头部值字面一致。
+        """
+        import re as _re
+        m = _re.search(r"3AB9D23F7A4B3CSS=([^;]+)", cookie)
+        if not m:
+            return ""
+        return m.group(1).strip()
+
+    def _build_request_headers(self) -> dict:
+        """组装单次请求的完整鉴权头（h5st + dsm-* 动态注入）。
+
+        返回:
+            dict - 完整请求头（含 dsm-trace-id 唯一化、dsm-eid 从 cookie 提取）
+        """
+        headers = {
+            "dsm-eid": self._gen_dsm_eid(self.cookie),
+            "dsm-lang": "zh-CN",
+            "dsm-platform": "pc",
+            "dsm-site": "",  # 抓包实证为空字符串
+            "dsm-trace-id": self._gen_dsm_trace_id(),
+            "h5st": self.h5st,  # 一次性签名
+        }
+        return headers
+
+    @staticmethod
+    def _build_api_url(api_name: str) -> str:
+        """拼接接口 URL。
+
+        模板：https://sff.jd.com/api?v={VER}&appId={APP_ID}&api=dsm.order.export.exportCenterService.{api_name}
+
+        参数:
+            api_name - 目标方法名（如 createdExportTask / queryExportTaskInfo / exportTaskPwdSend）
+        返回:
+            str - 完整 URL
+        """
+        # 抓包 2026-08-11 实证：api 路径是 dsm.order.export.exportCenterService.<接口名>
+        full_api = f"dsm.order.export.exportCenterService.{api_name}"
+        return (
+            f"{JingMaiOrderExportAPI.BASE_URL}"
+            f"?v={JingMaiOrderExportAPI.API_VERSION}"
+            f"&appId={JingMaiOrderExportAPI.APP_ID}"
+            f"&api={full_api}"
+        )
+
+    def _post_dsm(self, api_name: str, body: dict) -> dict:
+        """京麦 dsm 体系接口统一 POST（JSON）。
+
+        ⚠️ 鉴权头（dsm-eid / dsm-platform / dsm-trace-id / dsm-lang / h5st）
+           每请求动态注入，不在 session.headers 里固化。
+
+        参数:
+            api_name - 目标方法名（createdExportTask 等）
+            body     - POST body（dict，会被 json.dumps 序列化）
+        返回:
+            dict - 解析后的 JSON 响应
+        异常:
+            CookieExpiredError - Cookie 过期 / 未登录
+            RuntimeError       - 业务码非 200 / 序列化失败 / 反序列化失败
+        """
+        url = self._build_api_url(api_name)
+        headers = self._build_request_headers()
+
+        # 调试日志：打印 URL + 关键头（敏感字段做长度截断，不打印完整 h5st）
+        print(f"🚀 [京麦订单] POST {url}")
+        print(f"   Body: {json.dumps(body, ensure_ascii=False)}")
+        print(f"   Headers(关键): dsm-eid={headers['dsm-eid'][:30]}..., dsm-trace-id={headers['dsm-trace-id']}, h5st={self.h5st[:30]}...（共 {len(self.h5st)} 字符）")
+
+        resp = self.session.post(url, headers=headers, json=body, timeout=60)
+        resp.raise_for_status()
+        try:
+            ret = resp.json()
+        except Exception as e:
+            raise RuntimeError(
+                f"❌ 京麦 {api_name} 响应非 JSON：HTTP {resp.status_code}，"
+                f"响应片段={resp.text[:200]!r}"
+            ) from e
+
+        # 业务码判定
+        self._handle_response(ret, op_desc=api_name)
+        return ret
+
+    def _handle_response(self, ret: dict, op_desc: str):
+        """统一处理京麦 dsm 体系响应（项目14，2026-08-11 启动）。
+
+        业务码体系（与京麦其他 dsm 接口一致，2026-08-11 抓包实证）：
+            - code=200 + msg="成功" → 成功
+            - code=200 但 msg 含"操作频繁" / "限流" → 仍走 601 路径（不重试）
+            - code=201 → 单日次数超限（按 EXPORT_DAILY_LIMIT 处理）
+            - code=601 → 风控限流（**不重试**，抛 RiskControlError）
+            - code 非 0/200 + message 含"登录" → CookieExpiredError
+
+        异常:
+            CookieExpiredError / RiskControlError / RuntimeError
+        """
+        code = ret.get("code")
+        msg = str(ret.get("msg", ""))
+
+        # 1. 业务码 200 + msg 成功 → 通过
+        if code == self.CODE_OK and ("成功" in msg or "success" in msg.lower()):
+            return ret
+
+        # 2. 文本型 601（与项目4/5 实证一致：msg 含"操作频繁/限流"）
+        if code == self.CODE_RISK or any(k in msg for k in ("操作频繁", "限流", "risk")):
+            raise RiskControlError(
+                f"❌ 京麦 {op_desc} 触发 601 风控限流：code={code}, msg={msg}\n"
+                f"   → 30-120 分钟冷却，避免加重风控；"
+                f"   冷却期间任何请求都会重置冷却"
+            )
+
+        # 3. 201 = 单日次数超限
+        if code == self.CODE_DAILY_LIMIT:
+            raise RuntimeError(
+                f"❌ 京麦 {op_desc} 单日次数超限：code={code}, msg={msg}\n"
+                f"   → 等待 {self.EXPORT_INTERVAL_MIN // 60} 分钟后重试，"
+                f"或明日再试（单日上限 {self.EXPORT_DAILY_LIMIT} 次）"
+            )
+
+        # 4. Cookie 过期
+        if code in (2001, 302) or any(k in msg for k in ("未登录", "登录已过期", "请重新登录")):
+            raise CookieExpiredError(
+                f"❌ 京麦 Cookie 过期（{op_desc}返回 code={code}）：\n"
+                f"   → 请浏览器登录 https://shop.jd.com/jdm/trade/tools/export/ExprotList，"
+                f"F12 抓 sff.jd.com 域 Cookie 写入配置文件"
+            )
+
+        # 5. 其它业务码 → RuntimeError（含完整响应便于排查）
+        raise RuntimeError(
+            f"❌ 京麦 {op_desc} 业务失败：code={code}, msg={msg}, 完整响应={ret}"
+        )
+
+    # ---- 工具：业务表单参数组装 ----
+
+    @staticmethod
+    def _build_task_data_param(
+        start_date: str,
+        end_date: str,
+        order_status_list: list = None,
+        sensitive_info_sign: str = "0",
+        export_task_type: int = 0,
+        sku_id=None,
+        loc_sku_id=None,
+        warning_type=None,
+    ) -> str:
+        """组装 createdExportTask 的 taskDataParam 内层 JSON 字符串。
+
+        抓包 2026-08-11 实证：
+            {
+              "startDate": "2026-08-10 00:00:00",
+              "endDate":   "2026-08-10 23:59:59",
+              "exportTaskType": 0,
+              "skuId": null,
+              "warningType": null,
+              "locSkuId": null,
+              "sensitiveInfoSign": "0",
+              "orderStatusList": [-1]
+            }
+
+        ⚠️ 注意：taskDataParam 必须是 **JSON 字符串**（json.dumps 序列化），不能直接传对象。
+
+        参数:
+            start_date         - 开始日期 YYYY-MM-DD
+            end_date           - 结束日期 YYYY-MM-DD
+            order_status_list  - 订单状态列表，默认 [-1]（全部订单状态）
+            sensitive_info_sign- 敏感信息导出标志，默认 "0"（不导出收件人敏感信息）
+            export_task_type   - 导出任务类型，默认 0（订单明细）
+            sku_id / loc_sku_id/ warning_type - 可选过滤参数（默认 None）
+        返回:
+            str - 序列化后的 JSON 字符串
+        """
+        if order_status_list is None:
+            order_status_list = [-1]
+        task_data = {
+            "startDate": f"{start_date} 00:00:00",
+            "endDate": f"{end_date} 23:59:59",
+            "exportTaskType": export_task_type,
+            "skuId": sku_id,
+            "warningType": warning_type,
+            "locSkuId": loc_sku_id,
+            "sensitiveInfoSign": sensitive_info_sign,
+            "orderStatusList": order_status_list,
+        }
+        return json.dumps(task_data, ensure_ascii=False, separators=(",", ":"))
+
+    # ---- 5 步方法：阶段1 仅实现 create_export_task；其余 4 步占位 ----
+
+    def create_export_task(
+        self,
+        start_date: str = None,
+        end_date: str = None,
+        date: str = None,
+        order_status_list: list = None,
+        sensitive_info_sign: str = "0",
+        export_task_type: int = 0,
+    ) -> dict:
+        """第 1 步：创建京麦订单明细【加密】导出任务。
+
+        POST /api?api=dsm.order.export.exportCenterService.createdExportTask
+        Body: {"exportParam": {"exportTaskType": 0, "taskDataParam": "{...内层JSON字符串...}"}}
+
+        抓包 2026-08-11 实证：
+            {
+              "exportParam": {
+                "exportTaskType": 0,
+                "taskDataParam": "{\"startDate\":\"2026-08-10 00:00:00\",...}"
+              }
+            }
+
+        响应（成功）：
+            {"msg": "成功", "code": 200, "dsm-trace-id": "..."}
+            ⚠️ 实证响应**没有 taskId 字段**（与京准通 add 不同），taskId 需从
+            后续 queryExportTaskInfo 轮询接口获取，或业务升级后才有。
+
+        参数:
+            start_date         - 开始日期 YYYY-MM-DD（默认 = date）
+            end_date           - 结束日期 YYYY-MM-DD（默认 = date）
+            date               - 单日查询 YYYY-MM-DD（start/end 默认 = date）
+            order_status_list  - 订单状态列表，默认 [-1]（全部）
+            sensitive_info_sign- 敏感信息标志，默认 "0"
+            export_task_type   - 任务类型，默认 0
+        返回:
+            dict - 接口响应 JSON（含 code/msg/dsm-trace-id，**项目14阶段1实证不含 taskId**）
+                  实际 taskId 由后续 queryExportTaskInfo 阶段提供，本方法先回执完整响应
+        异常:
+            ValueError         - 缺日期参数 / 区间 >31 天
+            CookieExpiredError - Cookie 过期
+            RiskControlError   - 触发 601 风控限流
+            RuntimeError       - 业务码非 200
+        """
+        # 1. 参数兜底
+        if date is None and start_date is None and end_date is None:
+            raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
+        if start_date is None:
+            start_date = date
+        if end_date is None:
+            end_date = date
+
+        # 2. 区间合法性校验
+        from datetime import datetime as _dt
+        d_start = _dt.strptime(start_date, "%Y-%m-%d").date()
+        d_end = _dt.strptime(end_date, "%Y-%m-%d").date()
+        if d_start > d_end:
+            raise ValueError(f"❌ 开始日期不能晚于结束日期：start={start_date}, end={end_date}")
+        days = (d_end - d_start).days + 1
+        if days > self.MAX_RANGE_DAYS:
+            raise ValueError(
+                f"❌ 订单明细【加密】导出时间跨度({days}天)超过最大限制({self.MAX_RANGE_DAYS}天)，"
+                f"请缩小日期区间后再试"
+            )
+
+        # 3. 组装 body
+        task_data_param_str = self._build_task_data_param(
+            start_date=start_date,
+            end_date=end_date,
+            order_status_list=order_status_list,
+            sensitive_info_sign=sensitive_info_sign,
+            export_task_type=export_task_type,
+        )
+        body = {
+            "exportParam": {
+                "exportTaskType": export_task_type,
+                "taskDataParam": task_data_param_str,
+            }
+        }
+
+        # 4. POST
+        print(f"📝 [京麦订单] 第 1 步：创建导出任务 {start_date} ~ {end_date}（共 {days} 天）")
+        ret = self._post_dsm("createdExportTask", body)
+
+        # 5. 回执
+        print(
+            f"✅ [京麦订单] 创建任务响应：code={ret.get('code')}, msg={ret.get('msg')}, "
+            f"dsm-trace-id={ret.get('dsm-trace-id')}"
+        )
+        return ret
+
+    def create_and_wait(
+        self,
+        start_date: str = None,
+        end_date: str = None,
+        date: str = None,
+        order_status_list: list = None,
+        sensitive_info_sign: str = "0",
+        export_task_type: int = 0,
+        poll_interval: int = 3,
+        max_poll_times: int = 20,
+    ) -> dict:
+        """第 1+2 步一键：创建任务 + 轮询拿 taskId（2026-08-11 项目14 阶段2 一键封装）。
+
+        ⚠️ 京麦与京准通关键差异：
+            - 京准通 add 返回 data.reportId
+            - 京麦 createdExportTask 响应**没有 taskId**（实证 2026-08-11）
+              → 必须再 queryExportTaskInfo 分页查，按 startTime/endTime 匹配刚那条 → 拿 id
+
+        调用：
+            api.create_and_wait(date="2026-08-10")
+            api.create_and_wait(start_date="2026-08-10", end_date="2026-08-10",
+                                poll_interval=5, max_poll_times=30)
+
+        返回:
+            dict - taskStatus=2 的任务完整记录（含 id=taskId、taskData、smsSendTip、encryptFlag）
+
+        异常:
+            ValueError         - 缺日期参数 / 区间 >31 天
+            CookieExpiredError - Cookie 过期
+            RiskControlError   - 触发 601 风控
+            RuntimeError       - 轮询超时 / 任务失败/过期 / 业务码非 200
+        """
+        # 日期兜底
+        if date is None and start_date is None and end_date is None:
+            raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
+        if start_date is None:
+            start_date = date
+        if end_date is None:
+            end_date = date
+
+        # 第 1 步：创建
+        create_ret = self.create_export_task(
+            start_date=start_date,
+            end_date=end_date,
+            order_status_list=order_status_list,
+            sensitive_info_sign=sensitive_info_sign,
+            export_task_type=export_task_type,
+        )
+        if create_ret.get("code") != self.CODE_OK:
+            raise RuntimeError(f"❌ 创建任务失败：{create_ret}")
+
+        # 第 2 步：轮询（每次轮询都重新调 queryExportTaskInfo，按时间匹配）
+        task_item = self.wait_for_task_ready(
+            start_date=start_date,
+            end_date=end_date,
+            poll_interval=poll_interval,
+            max_poll_times=max_poll_times,
+        )
+
+        # 一键回执：含 taskId / status / encryptFlag / smsSendTip
+        return {
+            "code": self.CODE_OK,
+            "msg": "成功",
+            "taskId": task_item.get("id"),
+            "taskStatus": task_item.get("taskStatus"),
+            "encryptFlag": task_item.get("encryptFlag"),
+            "taskTypeName": task_item.get("taskTypeName"),
+            "smsSendTip": task_item.get("smsSendTip"),
+            "smsReceiver": self.get_sms_receiver(task_item),
+            "createDate": task_item.get("createDate"),
+            "taskData": task_item.get("taskData"),
+            "rawItem": task_item,  # 完整原始任务记录，方便阶段 3/4 直接取字段
+        }
+
+    def create_wait_and_download(
+        self,
+        start_date: str = None,
+        end_date: str = None,
+        date: str = None,
+        order_status_list: list = None,
+        sensitive_info_sign: str = "0",
+        export_task_type: int = 0,
+        poll_interval: int = 3,
+        max_poll_times: int = 20,
+    ) -> dict:
+        """第 1+2+3 步一键：创建 + 轮询拿 taskId + 下载加密 zip（2026-08-11 项目14 阶段3 一键封装）。
+
+        ⚠️ 鉴权三次切换：
+            1. 创建/轮询：h5st + Cookie + dsm-* 全套头（sff.jd.com）
+            2. 下载：仅 Cookie + Referer（export.shop.jd.com，不需要 h5st / dsm 头）
+            3. 短信申请：h5st + Cookie + dsm-* 全套头（sff.jd.com，阶段4 待实现）
+
+        返回:
+            dict - 含 taskId / zip_path / zip_filename / zip_size 等
+
+        异常:
+            ValueError         - 缺日期参数 / 区间 >31 天
+            CookieExpiredError - Cookie 过期
+            RiskControlError   - 触发 601 风控
+            RuntimeError       - 轮询超时 / 任务失败/过期 / 业务码非 200 / 下载失败
+        """
+        # 第 1+2 步：创建+轮询
+        wait_ret = self.create_and_wait(
+            start_date=start_date,
+            end_date=end_date,
+            date=date,
+            order_status_list=order_status_list,
+            sensitive_info_sign=sensitive_info_sign,
+            export_task_type=export_task_type,
+            poll_interval=poll_interval,
+            max_poll_times=max_poll_times,
+        )
+        task_id = wait_ret.get("taskId")
+        if not task_id:
+            raise RuntimeError(f"❌ create_and_wait 没拿到 taskId：{wait_ret}")
+
+        # 第 3 步：下载加密 zip
+        zip_bytes, filename = self.download_encrypted_zip(task_id)
+        zip_path = self.save_encrypted_zip(zip_bytes, filename)
+
+        # 一键回执
+        return {
+            "code": self.CODE_OK,
+            "msg": "成功",
+            "taskId": task_id,
+            "taskStatus": wait_ret.get("taskStatus"),
+            "encryptFlag": wait_ret.get("encryptFlag"),
+            "smsSendTip": wait_ret.get("smsSendTip"),
+            "smsReceiver": wait_ret.get("smsReceiver"),
+            "createDate": wait_ret.get("createDate"),
+            "zip_path": zip_path,
+            "zip_filename": filename,
+            "zip_size": len(zip_bytes),
+            # ⚠️ 下一步：阶段4 exportTaskPwdSend 触发短信 → 短信密码 → 解压 zip
+            "rawItem": wait_ret.get("rawItem"),
+        }
+
+    def create_wait_download_and_request_pwd(
+        self,
+        start_date: str = None,
+        end_date: str = None,
+        date: str = None,
+        order_status_list: list = None,
+        sensitive_info_sign: str = "0",
+        export_task_type: int = 0,
+        poll_interval: int = 3,
+        max_poll_times: int = 20,
+    ) -> dict:
+        """第 1+2+3+4 步一键：创建 + 轮询 + 下载 + 短信申请（2026-08-11 项目14 阶段4 一键封装）。
+
+        ⚠️ 与 create_wait_and_download 的关键差异：
+            - 多一步 exportTaskPwdSend，需要重新注入鉴权头
+            - 短信密码**不返回明文**，只发到安全手机（项目实证 1366794）
+            - 调用方需要：
+                1) 等待手机短信
+                2) 手动或自动（如 IMAP 监听邮箱）拿到解压密码
+                3) 调用 _run_with_password（待实现）解压 zip → 提取 xlsx
+
+        返回:
+            dict - 含 taskId / zip_path / pwd_response / sms_receiver
+                  调用方拿到本回执后，下一步：等短信 → 拿到密码 → 解压
+
+        异常:
+            ValueError         - 缺日期参数
+            CookieExpiredError - Cookie 过期
+            RiskControlError   - 触发 601 风控
+            RuntimeError       - 轮询超时 / 任务失败 / 下载失败 / 短信申请失败
+        """
+        # 第 1+2+3 步：创建+轮询+下载
+        dl_ret = self.create_wait_and_download(
+            start_date=start_date,
+            end_date=end_date,
+            date=date,
+            order_status_list=order_status_list,
+            sensitive_info_sign=sensitive_info_sign,
+            export_task_type=export_task_type,
+            poll_interval=poll_interval,
+            max_poll_times=max_poll_times,
+        )
+        task_id = dl_ret.get("taskId")
+
+        # 第 4 步：申请短信密码
+        pwd_ret = self.request_export_password(
+            task_id=task_id,
+            export_task_type=export_task_type,
+        )
+
+        # 一键回执：含全部上下文 + 短信申请结果
+        return {
+            "code": self.CODE_OK,
+            "msg": "成功",
+            "taskId": task_id,
+            "taskStatus": dl_ret.get("taskStatus"),
+            "encryptFlag": dl_ret.get("encryptFlag"),
+            "smsSendTip": dl_ret.get("smsSendTip"),
+            "smsReceiver": dl_ret.get("smsReceiver"),
+            "createDate": dl_ret.get("createDate"),
+            "zip_path": dl_ret.get("zip_path"),
+            "zip_filename": dl_ret.get("zip_filename"),
+            "zip_size": dl_ret.get("zip_size"),
+            # 短信申请结果
+            "pwd_response": pwd_ret,                       # 完整短信申请响应
+            "remainingTimes": pwd_ret.get("remainingTimes"),  # 剩余发送次数（正则解析）
+            "pwd_raw_message": pwd_ret.get("rawData"),     # 原始 data 字符串
+            # ⚠️ 下一步：等手机短信 → 拿到密码 → 解压 zip（阶段5 待实现）
+            "nextStep": (
+                f"短信已发送至 {dl_ret.get('smsReceiver')}，"
+                f"等待收到解压密码后调用解压方法"
+            ),
+            "rawItem": dl_ret.get("rawItem"),
+        }
+
+    # ---- 阶段 2 已实现：queryExportTaskInfo 分页查询（2026-08-11） ----
+
+    # ---- 任务状态码（2026-08-11 实证：抓包 10 条历史任务全部 taskStatus=2，状态机暂按下列定义）----
+    # ⚠️ 当前实证样本仅覆盖 taskStatus=2，其他状态码（0=等待/1=处理中/3=失败/4=过期）
+    #    含义待后续抓包确认。本类先按以下定义固化状态机：
+    TASK_STATUS_PENDING = 0    # 等待/排队（推测）
+    TASK_STATUS_RUNNING = 1    # 处理中（推测）
+    TASK_STATUS_SUCCESS = 2    # 已完成（✅ 2026-08-11 实证 10/10 历史任务都是这个值）
+    TASK_STATUS_FAILED = 3     # 失败（推测）
+    TASK_STATUS_EXPIRED = 4    # 已过期/超时（推测）
+
+    def query_export_task_list(
+        self,
+        page: int = 1,
+        page_size: int = 10,
+        export_task_type: int = 0,
+    ) -> dict:
+        """第 2 步 a：分页查询任务列表（2026-08-11 实证）。
+
+        POST /api?api=dsm.order.export.exportCenterService.queryExportTaskInfo
+        Body: {"exportParam": {"exportTaskType": 0, "page": 1, "pageSize": 10}}
+
+        ⚠️ 关键发现（2026-08-11 实证）：
+            - 该接口**不是按 taskId 查单个任务**，而是**分页查询任务列表**
+            - 响应 data.itemList[] 包含多条任务，按 createDate 倒序（最新创建的在前）
+            - 每条任务的关键字段：
+                * id              → taskId（如 "105874710541"）
+                * taskStatus      → 状态码（2=已完成，0/1/3/4 含义待补充）
+                * encryptFlag     → true=导出文件加密（订单明细【加密】始终为 true）
+                * taskTypeName    → "订单明细信息"（任务类型中文名）
+                * taskData        → 任务参数（含 startTime/endTime/exportPin/orderStatusList 等）
+                * createDate      → 创建时间（毫秒时间戳）
+                * smsSendTip      → "接收号码：1366794，每日限发送10次"
+                                    ⚠️ 发送密码短信的接收号码从这里取（不是用户手机号！）
+                                    （短信下发到京东商家平台绑定的安全手机 1366794）
+                * exportPin       → 发起导出的账号（pin）
+
+        参数:
+            page             - 页码（默认 1）
+            page_size        - 每页条数（默认 10，10 条够覆盖最近一轮操作）
+            export_task_type - 任务类型（默认 0=订单明细）
+        返回:
+            dict - 完整响应（含 data.itemList[]）
+        异常:
+            CookieExpiredError / RiskControlError / RuntimeError
+        """
+        body = {
+            "exportParam": {
+                "exportTaskType": export_task_type,
+                "page": page,
+                "pageSize": page_size,
+            }
+        }
+        return self._post_dsm("queryExportTaskInfo", body)
+
+    @staticmethod
+    def find_task_by_time_range(
+        item_list: list,
+        start_time: str,
+        end_time: str,
+    ) -> dict | None:
+        """从任务列表中按 startTime/endTime 精确定位单个任务（2026-08-11 工具）。
+
+        ⚠️ 2026-08-11 实证：createdExportTask 响应**没有 taskId**，
+           必须先调 queryExportTaskInfo，再用本方法从列表里把刚创建的任务捞出来。
+
+        匹配规则：完全字符串相等匹配 startTime + endTime
+        （创建任务时 startDate=`YYYY-MM-DD` → 提交到服务端变成 `YYYY-MM-DD 00:00:00`，
+         列表里的 taskData.startTime 也是这个格式）
+
+        参数:
+            item_list - query_export_task_list() 返回的 data.itemList
+            start_time- 期望 startTime，格式 `YYYY-MM-DD HH:MM:SS`（如 "2026-08-10 00:00:00"）
+            end_time  - 期望 endTime，格式 `YYYY-MM-DD HH:MM:SS`（如 "2026-08-10 23:59:59"）
+        返回:
+            dict - 匹配的任务记录（含 id/taskStatus/taskData/encryptFlag 等）
+            None - 未找到
+        """
+        for item in item_list:
+            td = item.get("taskData", {})
+            if td.get("startTime") == start_time and td.get("endTime") == end_time:
+                return item
+        return None
+
+    @staticmethod
+    def parse_task_status(item: dict) -> int:
+        """从单条任务记录拿 taskStatus（兜底 -1 = 字段缺失）。"""
+        try:
+            return int(item.get("taskStatus", -1))
+        except (TypeError, ValueError):
+            return -1
+
+    @staticmethod
+    def get_sms_receiver(item: dict) -> str:
+        """从单条任务记录拿短信接收号码（smsSendTip 字段解析，2026-08-11 实证）。
+
+        ⚠️ 2026-08-11 真实跑通发现：服务端**对手机号脱敏**，格式 `接收号码：136****6794，每日限发送10次`
+            - 格式 = 前 3 位 + 4 个 * + 后 4 位
+            - 完整号码无法从响应里拿到（前端/前端 JS SDK 会从其他接口拿）
+            - 只能拿到脱敏后的 11 位串（保留 *）
+
+        返回:
+            str - 脱敏号码（如 "136****6794"）
+            ""  - 字段缺失
+        """
+        import re as _re
+        tip = item.get("smsSendTip", "")
+        m = _re.search(r"接收号码[：:]\s*(1\d{2}\*+\d{4})", tip)
+        if m:
+            return m.group(1)
+        return ""
+
+    def wait_for_task_ready(
+        self,
+        start_date: str,
+        end_date: str,
+        poll_interval: int = 3,
+        max_poll_times: int = 20,
+        page_size: int = 10,
+    ) -> dict:
+        """第 2 步 b：轮询任务直到 taskStatus=2（已完成）（2026-08-11 实证）。
+
+        完整流程：
+            1. 调 query_export_task_list 拉最近 page_size 条任务
+            2. 在列表里按 startTime/endTime 匹配刚创建的任务
+            3. 看 taskStatus：
+               - 2（已完成）→ 返回该条任务（含 taskId）
+               - 0/1（等待/处理中）→ 等 poll_interval 秒后重试
+               - 3/4（失败/过期）→ 抛 RuntimeError
+               - 任务未出现（创建太新或服务端延迟）→ 等 poll_interval 秒后重试
+            4. 重复直到 max_poll_times 用完
+
+        ⚠️ 关键约束：
+            - max_poll_times=20 × poll_interval=3s = 60s 超时
+            - 京麦任务一般 5-30 秒内完成（与京准通 6-10 秒同量级）
+            - 若超时，调大 max_poll_times 或检查 createDate 是否匹配
+
+        参数:
+            start_date     - 创建任务时传入的开始日期 YYYY-MM-DD
+            end_date       - 创建任务时传入的结束日期 YYYY-MM-DD
+            poll_interval  - 轮询间隔（秒），默认 3s
+            max_poll_times - 最大轮询次数，默认 20
+            page_size      - 列表查询每页条数，默认 10
+        返回:
+            dict - taskStatus=2 的任务完整记录（含 id=taskId / taskData / smsSendTip / ...）
+        异常:
+            RuntimeError - 轮询超时 / 任务状态为失败/过期
+        """
+        # 服务端格式：YYYY-MM-DD 00:00:00 ~ YYYY-MM-DD 23:59:59
+        target_start = f"{start_date} 00:00:00"
+        target_end = f"{end_date} 23:59:59"
+
+        print(
+            f"⏳ [京麦订单] 轮询任务：start={target_start} ~ end={target_end}，"
+            f"间隔 {poll_interval}s × 上限 {max_poll_times} 次（最多 {poll_interval * max_poll_times}s）"
+        )
+
+        for i in range(max_poll_times):
+            ret = self.query_export_task_list(page=1, page_size=page_size)
+            items = ret.get("data", {}).get("itemList", [])
+
+            matched = self.find_task_by_time_range(items, target_start, target_end)
+            if matched is not None:
+                status = self.parse_task_status(matched)
+                task_id = matched.get("id", "")
+                if status == self.TASK_STATUS_SUCCESS:
+                    print(
+                        f"✅ [京麦订单] 轮询命中：taskId={task_id}, taskStatus={status}, "
+                        f"encryptFlag={matched.get('encryptFlag')}, "
+                        f"smsSendTip={matched.get('smsSendTip')!r}"
+                    )
+                    return matched
+                if status in (self.TASK_STATUS_FAILED, self.TASK_STATUS_EXPIRED):
+                    raise RuntimeError(
+                        f"❌ 京麦订单任务失败/过期：taskId={task_id}, taskStatus={status}\n"
+                        f"   完整任务记录：{matched}"
+                    )
+                # 等待/处理中（0/1）
+                print(
+                    f"  [{i+1}/{max_poll_times}] 任务已出现但未完成："
+                    f"taskId={task_id}, taskStatus={status}（{poll_interval}s 后重试）"
+                )
+            else:
+                # 任务未出现（创建太新/服务端延迟/分页未刷到）
+                # 抓包实证：createDate 倒序，最近的任务在 itemList[0]
+                head = items[0] if items else {}
+                print(
+                    f"  [{i+1}/{max_poll_times}] 任务未出现（最新一条 taskId={head.get('id')!r}, "
+                    f"taskStatus={head.get('taskStatus')}）（{poll_interval}s 后重试）"
+                )
+
+            if i < max_poll_times - 1:
+                time.sleep(poll_interval)
+
+        raise RuntimeError(
+            f"❌ 京麦订单轮询超时：{max_poll_times} 次 × {poll_interval}s 后仍未命中 taskStatus=2\n"
+            f"   目标区间：start={target_start}, end={target_end}\n"
+            f"   可能原因：① 服务端延迟超过 {poll_interval * max_poll_times}s；"
+            f"② 创建任务失败但被静默；③ max_poll_times 调小"
+        )
+
+    # ---- 阶段 3/4/5 占位（抓到对应接口的成功报文后再实现） ----
+
+    def request_export_password(self, task_id: str) -> dict:
+        """第 3 步：申请密码短信（占位，待抓包后实现）。
+
+        POST /api?api=dsm.order.export.exportCenterService.exportTaskPwdSend
+        Body: {"taskId": "..."}
+        约束：单 taskId 两次申请间隔 ≥60 秒，单日最多 10 次
+        """
+        raise NotImplementedError(
+            "⏳ 阶段 3 待实现：请提供 exportTaskPwdSend 的成功抓包，"
+            "我再实现短信申请 + 限流控制"
+        )
+
+    def download_encrypted_zip(self, task_id: str) -> bytes:
+        """第 3 步：下载加密 zip（2026-08-11 实证落地）。
+
+        GET https://export.shop.jd.com/exportCenter/export.action?taskId={taskId}
+        鉴权：仅 Cookie（**不需要 h5st / 不需要 dsm 头**——这是关键差异！）
+
+        抓包 2026-08-11 实证：
+            请求头核心：
+                Cookie: <完整 .shop.jd.com 域 Cookie>
+                Referer: https://shop.jd.com/jdm/trade/tools/export/ExprotList?exportTaskType=0
+                User-Agent: <Edge/Chrome>
+            响应核心：
+                Content-Type: application/octet-stream
+                Content-Disposition: form-data; name="attachment"; filename="{taskId}.zip"
+                Content-Length: 6534 (本批 2026-08-10 单日共 6534 字节加密 zip)
+            响应体：<加密 zip 二进制>（PK\\x03\\x04 开头，但内容已加密，
+                     真实订单数据是 zip 内部被密码加密的 xlsx 字节流）
+
+        ⚠️ 关键约束（与京麦 sff.jd.com dsm 接口的差异）：
+            - 鉴权签名**不需要 h5st**（GET 静态下载，不走 dsm 强签名）
+            - 不需要 dsm-eid / dsm-platform / dsm-trace-id / dsm-lang
+            - 不需要 Origin / X-Referer-Page / X-Rp-Client
+            - 只需要 Cookie + Referer + UA
+
+        ⚠️ 关键发现（2026-08-11 实证）：
+            - 文件名直接是 <taskId>.zip（Content-Disposition 里包含）
+            - 压缩包是**密码加密的 zip**（不是普通 zip）：
+                * 第一阶段：zip magic bytes `PK\\x03\\x04` 命中（zip 文件本身）
+                * 第二阶段：zip 内部含**加密条目**（京东 zip AES 加密或 ZipCrypto）
+                * 解压密码由第 4 步 exportTaskPwdSend 触发的短信下发
+            - Content-Length=6534：单日订单量较小时 zip 体积很小（加密开销 + Excel 压缩）
+            - 不带 password 参数（密码只通过短信下发，**接口不返回密码明文**）
+
+        参数:
+            task_id - 创建任务返回的 taskId（如 "105874710541"）
+        返回:
+            bytes - 加密 zip 文件字节流
+        异常:
+            CookieExpiredError - Cookie 过期（401/302）
+            RuntimeError       - 响应非 zip 字节流 / 任务已过期 / 下载异常
+        """
+        if not task_id:
+            raise ValueError("❌ task_id 不能为空")
+
+        url = f"https://export.shop.jd.com/exportCenter/export.action?taskId={task_id}"
+
+        # ⚠️ 仅 Cookie 鉴权，不走基类的 dsm 头（不调 _post_dsm）
+        #    独立构造最小化请求头，避免把 dsm-* 头误传到 export.shop.jd.com
+        download_headers = {
+            "User-Agent": self.USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Referer": self.REFERER,
+            "Cookie": self.cookie,
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-site",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+        print(f"📥 [京麦订单] 第 3 步：GET {url}")
+        print(f"   鉴权：仅 Cookie（{len(self.cookie)} 字符）+ Referer（不需要 h5st / dsm 头）")
+
+        try:
+            resp = self.session.get(url, headers=download_headers, timeout=60, allow_redirects=True)
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"❌ 下载 zip 网络异常：{e}") from e
+
+        # 1. HTTP 状态码校验
+        if resp.status_code == 401:
+            raise CookieExpiredError(
+                f"❌ 京麦订单导出 Cookie 过期（HTTP 401）\n"
+                f"   → 请浏览器登录 https://shop.jd.com/jdm/trade/tools/export/ExprotList，"
+                f"F12 抓 .shop.jd.com 域 Cookie 写入 config/cookie.txt"
+            )
+        if resp.status_code == 302:
+            # 重定向到登录页 → Cookie 失效
+            raise CookieExpiredError(
+                f"❌ 京麦订单导出 Cookie 过期（HTTP 302 重定向）\n"
+                f"   Location={resp.headers.get('Location', '(无)')}\n"
+                f"   → 请浏览器重新登录后重抓 Cookie"
+            )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"❌ 京麦订单导出下载失败：HTTP {resp.status_code}\n"
+                f"   响应片段：{resp.text[:200]!r}"
+            )
+
+        # 2. 校验响应是 zip 字节流（PK magic bytes）
+        content_type = resp.headers.get("Content-Type", "")
+        content_disp = resp.headers.get("Content-Disposition", "")
+        body = resp.content
+
+        if len(body) < 1024:
+            raise RuntimeError(
+                f"❌ 京麦订单导出下载响应过小（{len(body)} 字节）\n"
+                f"   响应头 Content-Type={content_type!r}, Content-Disposition={content_disp!r}\n"
+                f"   可能是任务未完成/已过期/任务不存在（taskId={task_id}）\n"
+                f"   响应片段：{body[:200]!r}"
+            )
+
+        # zip magic bytes: PK\x03\x04
+        if not (body[:4] == b"PK\x03\x04"):
+            raise RuntimeError(
+                f"❌ 京麦订单导出响应不是 zip（magic bytes 校验失败）\n"
+                f"   响应头 Content-Type={content_type!r}, Content-Disposition={content_disp!r}\n"
+                f"   前 32 字节：{body[:32]!r}\n"
+                f"   可能是任务不存在/已过期/接口变更"
+            )
+
+        # 3. 解析文件名（与抓包一致：filename="{taskId}.zip"）
+        filename = f"{task_id}.zip"
+        import re as _re
+        m = _re.search(r'filename=("?)([^";]+)\1', content_disp)
+        if m:
+            filename = m.group(2).strip()
+
+        print(
+            f"✅ [京麦订单] 下载成功：{filename}（{len(body)} 字节，"
+            f"Content-Type={content_type!r}）"
+        )
+        return body, filename
+
+    def save_encrypted_zip(self, zip_bytes: bytes, filename: str, output_dir: str = None) -> str:
+        """把加密 zip 字节流落盘（2026-08-11 工具）。
+
+        输出目录：output/京麦订单明细加密导出/{date}/{filename}
+        （日期取 filename 中的 taskId 创建时间需另外解析；先用 self.OUTPUT_SUBDIR + "raw_zip" 子目录）
+
+        参数:
+            zip_bytes  - download_encrypted_zip() 返回的 zip 字节流
+            filename   - 同上返回的 filename（用于命名）
+            output_dir - 自定义输出目录（默认 output/京麦订单明细加密导出/raw_zip/）
+        返回:
+            str - 落盘的绝对路径
+        """
+        if output_dir is None:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            output_dir = os.path.join(base_dir, "output", "京麦订单明细加密导出", "raw_zip")
+        os.makedirs(output_dir, exist_ok=True)
+
+        target_path = os.path.join(output_dir, filename)
+        with open(target_path, "wb") as f:
+            f.write(zip_bytes)
+        print(f"💾 [京麦订单] zip 已落盘：{target_path}（{os.path.getsize(target_path)} 字节）")
+        return target_path
+
+    # ---- 阶段 5：IMAP 监听 + zip 解压 + xlsx 提取（2026-08-11）----
+
+    @staticmethod
+    def load_imap_config(config_path: str = "config/imap_config.ini") -> dict:
+        """读取 IMAP 配置文件（ini 格式），不存任何敏感字段到代码（2026-08-11 决策）。
+
+        ini 模板（config/imap_config.ini）：
+            [imap]
+            host = imap.qq.com
+            port = 993
+            user = your_qq@qq.com
+            auth_code = xxxxxxxxxxxxxxxx   # QQ 邮箱 IMAP 授权码（不是 QQ 密码）
+            use_ssl = true
+            folder = INBOX
+            sender_filter = jmsj@jd.com   # 只关心京东商家平台发的短信
+            subject_keyword = 解压密码    # 主题含此关键词
+            max_wait_seconds = 300        # 最多等 5 分钟
+            poll_interval_seconds = 5     # 每 5 秒轮询一次
+
+        返回:
+            dict - 配置项（缺字段抛错）
+        异常:
+            FileNotFoundError - 配置文件不存在
+            ValueError        - 必填字段缺失
+        """
+        import configparser
+        if not os.path.isfile(config_path):
+            raise FileNotFoundError(
+                f"❌ IMAP 配置文件不存在：{config_path}\n"
+                f"   请参考 SKILL.md 模板创建 ini 文件，授权码从 QQ 邮箱设置获取"
+            )
+        cfg = configparser.ConfigParser()
+        cfg.read(config_path, encoding="utf-8")
+        if "imap" not in cfg:
+            raise ValueError(f"❌ IMAP 配置文件缺少 [imap] section：{config_path}")
+
+        section = cfg["imap"]
+        required = ["host", "port", "user", "auth_code"]
+        missing = [k for k in required if not section.get(k)]
+        if missing:
+            raise ValueError(
+                f"❌ IMAP 配置文件缺失必填字段：{missing}\n"
+                f"   完整模板见 SKILL.md"
+            )
+        return {
+            "host": section["host"].strip(),
+            "port": int(section["port"]),
+            "user": section["user"].strip(),
+            "auth_code": section["auth_code"].strip(),
+            "use_ssl": section.get("use_ssl", "true").strip().lower() in ("1", "true", "yes"),
+            "folder": section.get("folder", "INBOX").strip(),
+            "sender_filter": section.get("sender_filter", "").strip(),
+            "subject_keyword": section.get("subject_keyword", "解压密码").strip(),
+            "max_wait_seconds": int(section.get("max_wait_seconds", "300")),
+            "poll_interval_seconds": int(section.get("poll_interval_seconds", "5")),
+        }
+
+    @staticmethod
+    def fetch_password_from_imap(
+        task_id: str,
+        config_path: str = "config/imap_config.ini",
+    ) -> str:
+        """从 QQ 邮箱 IMAP 拉取指定 taskId 对应的解压密码（2026-08-11 项目14 阶段5）。
+
+        ⚠️ 业务背景：
+            - iPhone 快捷指令监听京东商家短信（接收号 1366794）
+            - 收到后自动转发到 QQ 邮箱（带 taskId / password 等结构化内容）
+            - 本方法用 IMAP 协议拉邮件，按 taskId 精确匹配
+
+        ⚠️ 重要：需要 `imaplib` 标准库（Python 自带，无需 pip install）
+
+        邮件内容识别规则（与 iPhone 快捷指令约定）：
+            - From:    sender_filter 配置的地址（默认 jmsj@jd.com 或自定义）
+            - Subject: 含 subject_keyword 配置的关键词（默认"解压密码"）
+            - Body:    含 taskId 字符串，正则提取紧跟其后的 6-12 位字母数字混合密码
+                      格式样例：「您的导出任务 105874710541 解压密码为：AbCd1234」
+                      或「taskId: 105874710541, password: AbCd1234」
+
+        行为：
+            - 默认最多等 5 分钟（max_wait_seconds 配置）
+            - 每 5 秒轮询一次（poll_interval_seconds 配置）
+            - 匹配到邮件立即返回密码
+            - 超时抛 TimeoutError
+
+        参数:
+            task_id     - 任务 ID（如 "105874710541"）
+            config_path - IMAP 配置文件路径
+        返回:
+            str - 解压密码
+        异常:
+            FileNotFoundError - 配置文件不存在
+            ValueError        - 必填字段缺失
+            TimeoutError      - 超时未找到
+            RuntimeError      - IMAP 登录失败 / 网络异常
+        """
+        import imaplib
+        import email
+        from email.header import decode_header
+        import time as _time
+
+        cfg = JingMaiOrderExportAPI.load_imap_config(config_path)
+        deadline = _time.time() + cfg["max_wait_seconds"]
+        attempt = 0
+
+        print(
+            f"📬 [京麦订单] 第 5 步：IMAP 监听解压密码 taskId={task_id}\n"
+            f"   服务器: {cfg['host']}:{cfg['port']} | 用户: {cfg['user']}\n"
+            f"   最多等 {cfg['max_wait_seconds']}s（每 {cfg['poll_interval_seconds']}s 轮询）"
+        )
+
+        while _time.time() < deadline:
+            attempt += 1
+            try:
+                # 1. 登录 IMAP
+                if cfg["use_ssl"]:
+                    mail = imaplib.IMAP4_SSL(cfg["host"], cfg["port"])
+                else:
+                    mail = imaplib.IMAP4(cfg["host"], cfg["port"])
+                mail.login(cfg["user"], cfg["auth_code"])
+                mail.select(cfg["folder"])
+
+                # 2. 搜索邮件（先按主题关键词粗筛，再按 taskId 精筛）
+                # ⚠️ 2026-08-11 真实跑通发现：imaplib.search() 内部用 ASCII 编码命令
+                #   传中文"解压密码"会抛 `'ascii' codec can't encode characters` 异常
+                #   解决：把搜索改为 ALL + 客户端过滤主题（避免 IMAP 命令包含中文）
+                #   然后用 email 解析后的 Subject 头判断
+                criterion = "ALL"
+                typ, data = mail.search(None, criterion)
+                if typ != "OK" or not data or not data[0]:
+                    mail.logout()
+                    print(f"  [第 {attempt} 次] 邮箱无邮件（typ={typ}）")
+                else:
+                    # 3. 倒序遍历最新邮件（最近 10 封）
+                    msg_ids = data[0].split()[::-1]
+                    matched_count = 0
+                    for msg_id in msg_ids[:10]:  # 只看最近 10 封
+                        typ, msg_data = mail.fetch(msg_id, "(RFC822)")
+                        if typ != "OK":
+                            continue
+                        msg = email.message_from_bytes(msg_data[0][1])
+
+                        # 3.1 解析主题（处理 RFC 2047 Base64/Quoted-Printable 编码）
+                        from email.header import decode_header
+                        subj_raw = str(msg.get("Subject", ""))
+                        try:
+                            subj_parts = decode_header(subj_raw)
+                            subj_decoded = ""
+                            for part, charset in subj_parts:
+                                if isinstance(part, bytes):
+                                    subj_decoded += part.decode(charset or "utf-8", errors="replace")
+                                else:
+                                    subj_decoded += part
+                            subject_text = subj_decoded
+                        except Exception:
+                            subject_text = subj_raw
+
+                        # 3.2 主题关键词过滤（客户端判断，避开 imaplib 中文编码问题）
+                        if cfg["subject_keyword"] and cfg["subject_keyword"] not in subject_text:
+                            continue
+                        matched_count += 1
+
+                        # 3.3 解析发件人
+                        from_header = msg.get("From", "")
+                        if cfg["sender_filter"] and cfg["sender_filter"] not in from_header:
+                            continue
+
+                        # 3.4 解析正文（处理 multipart）
+                        body_text = ""
+                        if msg.is_multipart():
+                            for part in msg.walk():
+                                if part.get_content_type() == "text/plain":
+                                    try:
+                                        body_text = part.get_payload(decode=True).decode("utf-8", errors="replace")
+                                    except Exception:
+                                        pass
+                                    break
+                        else:
+                            try:
+                                body_text = msg.get_payload(decode=True).decode("utf-8", errors="replace")
+                            except Exception:
+                                body_text = str(msg.get_payload())
+
+                        # 3.5 body 提取密码（taskId 精筛）
+                        import re as _re
+                        if task_id not in body_text and task_id not in subject_text:
+                            continue
+
+                        # 多种密码格式正则（容错）
+                        # 用户决策 2026-08-11：iPhone 快捷指令邮件正文里是密码（不带 taskId），
+                        # 主题含 taskId 字段；匹配策略改为：①主题含 taskId 优先 ②正文取第一个 6-12 位密码
+                        patterns = [
+                            rf"taskId[:\s]*{task_id}[,\s\S]*?password[:\s]*([A-Za-z0-9]{{6,12}})",
+                            rf"{task_id}[^A-Za-z0-9]*?([A-Za-z0-9]{{6,12}})",
+                            rf"解压密码[为：:]*\s*([A-Za-z0-9]{{6,12}})",
+                            # 兜底：直接从正文里取第一个 6-12 位字母数字混合串
+                            r"([A-Za-z0-9]{6,12})",
+                        ]
+                        password = None
+                        for pat in patterns:
+                            m = _re.search(pat, body_text)
+                            if m:
+                                pwd_candidate = m.group(1)
+                                # 兜底正则需要排除常见英文词
+                                if pat == patterns[-1]:
+                                    # 简单启发式：避免匹配到 taskId 自身
+                                    if pwd_candidate == task_id:
+                                        continue
+                                    # 避免匹配到日期/纯数字
+                                    if pwd_candidate.isdigit() and len(pwd_candidate) < 8:
+                                        continue
+                                password = pwd_candidate
+                                break
+
+                        if password:
+                            mail.logout()
+                            print(
+                                f"✅ [京麦订单] IMAP 拿到密码：{password!r}（taskId={task_id}，"
+                                f"第 {attempt} 次轮询命中）"
+                            )
+                            return password
+
+                    mail.logout()
+                    print(
+                        f"  [第 {attempt} 次] 邮箱共 {len(msg_ids)} 封，"
+                        f"主题匹配 {matched_count} 封，但都未含 taskId={task_id}"
+                    )
+
+            except imaplib.IMAP4.error as e:
+                raise RuntimeError(
+                    f"❌ IMAP 登录失败：{e}\n"
+                    f"   检查授权码（{cfg['host']}:{cfg['port']}, user={cfg['user']}）"
+                ) from e
+            except Exception as e:
+                print(f"  [第 {attempt} 次] IMAP 网络异常：{e}（继续重试）")
+
+            if _time.time() < deadline:
+                _time.sleep(cfg["poll_interval_seconds"])
+
+        raise TimeoutError(
+            f"❌ IMAP 监听超时：{cfg['max_wait_seconds']}s 内未找到 taskId={task_id} 的解压密码邮件\n"
+            f"   排查：① iPhone 快捷指令是否正常转发短信 → QQ 邮箱\n"
+            f"         ② QQ 邮箱 IMAP 授权码是否过期\n"
+            f"         ③ 邮件 sender_filter / subject_keyword 配置是否与实际一致"
+        )
+
+    @staticmethod
+    def extract_xlsx_from_zip(
+        zip_path: str,
+        password: str = None,
+        output_dir: str = None,
+        date: str = None,
+    ) -> str:
+        """解压加密 zip + 解密 OLE2 + xls→xlsx 转存 + Excel 后置统一规则（2026-08-11 项目14 阶段5 重构）。
+
+        ⚠️ 京麦订单明细【加密】导出双层加密链路（2026-08-11 实证）：
+            第 1 层：zip 容器用 ZipCrypto 加密（zipfile 标准库支持）
+            第 2 层：内部 xls 是 OLE2 复合文档，**内容本身也加密**（需要同密码二次解密）
+            ⚠️ 这是京麦订单明细【加密】导出独有特点：
+                - 内部条目后缀是 .xlsx 但实际是加密的 OLE2 复合文档
+                - 用 xlrd.open_workbook(filename, password=password) 二次解密
+                - ⚠️ 项目6（商品流失分析）的 .xls 是**未加密** OLE2，本项目是**加密** OLE2
+
+        完整流程：
+            1. zipfile 解开 zip（带密码） → 拿到加密的 OLE2 字节流
+            2. xlrd.open_workbook(io.BytesIO, password=password) 二次解密 → 拿到 DataFrame
+            3. ⚠️ 删除中间加密 zip 文件（用户决策 2026-08-11：只留解密后文件）
+            4. xls → xlsx 转存（pandas + openpyxl 引擎）
+            5. Excel 后置统一规则（AGENTS.md Excel规则 1+2+3+4）：
+               - 规则1：日期列智能识别（已有日期/时间列不重复新增，仅格式化）
+               - 规则2：日期统一 yyyy/m/d
+               - 规则3：数值安全转换（SKU/SPU 整数 0 位小数、订单编号强制文本 @）
+               - 规则4：输出目录 output/京麦订单明细/{date}/订单明细_{date}.xlsx
+            6. ⚠️ 内部 xls 列名待真实数据验证（本轮从 0 字节文件推不出列名）
+
+        参数:
+            zip_path   - 加密 zip 路径（save_encrypted_zip 返回的路径）
+            password   - 解压密码（IMAP 拿到的或人工输入的）
+            output_dir - 自定义输出根目录（默认 output/京麦订单明细/）
+            date       - 单日查询日期 YYYY-MM-DD（决定日期子目录名）
+        返回:
+            str - 解密后 xlsx 的绝对路径
+        异常:
+            RuntimeError - 解压失败（密码错/zip损坏/无xls条目/OLE2 解密失败/转存失败）
+        """
+        import zipfile
+        import io
+        import pandas as pd
+
+        if not os.path.isfile(zip_path):
+            raise RuntimeError(f"❌ 加密 zip 不存在：{zip_path}")
+
+        # 输出根目录：output/京麦订单明细/（用户决策 2026-08-11：按业务模块建立文件夹）
+        if output_dir is None:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            output_dir = os.path.join(base_dir, "output", "京麦订单明细")
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 1. 解开 zip（带密码）
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                # 找第一个 .xlsx/.xls 条目（京东订单明细 .xlsx 后缀但内部 OLE2）
+                candidate_names = [n for n in zf.namelist() if n.lower().endswith((".xlsx", ".xls"))]
+                if not candidate_names:
+                    raise RuntimeError(
+                        f"❌ zip 内未找到 .xlsx/.xls 条目：{zip_path}\n"
+                        f"   zip 内文件列表：{zf.namelist()}"
+                    )
+                target_name = candidate_names[0]
+                print(
+                    f"📂 [京麦订单] 第 5 步：解压 zip\n"
+                    f"   源: {zip_path}\n"
+                    f"   密码: {password!r}\n"
+                    f"   目标条目: {target_name}"
+                )
+
+                # ⚠️ 二次解密：京东订单明细 .xlsx 是加密 OLE2，必须用密码再解一次
+                pwd_bytes = password.encode("utf-8") if password else None
+                encrypted_ole2_bytes = zf.read(target_name, pwd=pwd_bytes)
+        except zipfile.BadZipFile as e:
+            raise RuntimeError(f"❌ zip 文件损坏或不是有效 zip：{e}") from e
+        except RuntimeError as e:
+            # zipfile 在密码错时会抛 RuntimeError "Bad password for file ..."
+            raise RuntimeError(
+                f"❌ zip 解压失败（密码错误？）：{e}\n"
+                f"   zip: {zip_path}\n"
+                f"   密码: {password!r}"
+            ) from e
+
+        # 2. 二次解密：msoffcrypto-tool 专门解 Microsoft Office 加密文件（.xls/.xlsx/.docx）
+        #    ⚠️ 这是项目14独有路径（项目6 是无加密 OLE2，本项目是加密 OLE2）
+        #    xlrd 2.0+ 虽然支持加密 .xls，但 msoffcrypto 更稳，跨格式支持更好
+        try:
+            import msoffcrypto
+        except ImportError:
+            raise RuntimeError(
+                "❌ 缺少 msoffcrypto-tool 库（解密 .xls/.xlsx 加密文件需要）\n"
+                "   安装：pip install msoffcrypto-tool"
+            )
+        try:
+            import io as _io
+            decrypted_buf = _io.BytesIO()
+            office_file = msoffcrypto.OfficeFile(_io.BytesIO(encrypted_ole2_bytes))
+            office_file.load_key(password=password)  # 用密码解密
+            office_file.decrypt(decrypted_buf)
+            decrypted_ole2_bytes = decrypted_buf.getvalue()
+        except Exception as e:
+            raise RuntimeError(
+                f"❌ OLE2 二次解密失败：{e}\n"
+                f"   可能原因：① 密码错误 ② 内部 xls 是空表（无真实订单数据）\n"
+                f"   尝试：用 unzip -P '{password}' '{zip_path}' 命令行验证"
+            ) from e
+
+        # 3. 读解密后的文件（magic bytes 决定格式）
+        #    ⚠️ 2026-08-11 真实跑通发现：京麦订单明细解密后是 .xlsx（PK\x03\x04），
+        #       不是 .xls（OLE2 头是 zip 容器的"假象"——内部已解密成 xlsx）
+        #    magic bytes 处理：
+        #       - b"PK\x03\x04"  → .xlsx  → openpyxl
+        #       - b"\xD0\xCF\x11\xE0" → .xls → xlrd
+        #    用通用工具 read_excel_bytes()（2026-08-07 项目6 已建）
+        try:
+            df_main = read_excel_bytes(decrypted_ole2_bytes)
+            sheet_dfs = {"订单明细": df_main}  # 单 sheet，统一命名
+            print(f"   ├─ 主表: {len(df_main)} 行 × {len(df_main.columns)} 列")
+            print(f"   ├─ 列名: {list(df_main.columns[:8])}{'...' if len(df_main.columns) > 8 else ''}")
+        except Exception as e:
+            raise RuntimeError(
+                f"❌ 解密后文件读取失败：{e}\n"
+                f"   前 16 字节: {decrypted_ole2_bytes[:16].hex()}"
+            ) from e
+
+        # 取第一个 sheet 作为主表（订单明细通常只有 1 个 sheet）
+        main_sheet_name = list(sheet_dfs.keys())[0]
+        df = sheet_dfs[main_sheet_name]
+
+        if df.empty:
+            print(f"   ⚠️ Sheet「{main_sheet_name}」为空表（无订单数据），仍保存空 xlsx")
+        else:
+            print(f"   ├─ 主表「{main_sheet_name}」前 5 列: {list(df.columns[:5])}...")
+
+        # 4. Excel 后置统一规则（规则 1+2：日期列智能处理）
+        # ⚠️ 业务方需求：参照 Excel 报表后置统一规则
+        #     无日期/时间列才新增【日期】列；已有日期/时间列禁止重复新增
+        # ⚠️ 订单明细内层表通常自带「下单时间/订单时间」列，待真实数据验证
+        if date:
+            date_column, date_value = prepare_date_columns(df, date)
+        else:
+            date_column, date_value = None, None
+
+        # 5. Excel 后置统一规则（规则 3：数值安全转换 + 文本列保护 + 合计行剔除）
+        df = safe_convert_numeric(df)
+
+        # 6. 输出路径（用户决策 2026-08-11：业务模块 + 日期子目录）
+        #    AGENTS.md Excel 规则 4：output/{业务模块}/{date}/{filename}
+        #    京麦订单明细业务模块名 = 「订单明细」
+        if date is None:
+            # 兜底：zip 文件名含 taskId（105874726884.zip），无法直接取日期
+            # 用 taskId 转创建时间戳？暂时用 zip mtime
+            import datetime as _dt
+            mtime_ts = os.path.getmtime(zip_path)
+            date = _dt.datetime.fromtimestamp(mtime_ts).strftime("%Y-%m-%d")
+
+        date_subdir = os.path.join(output_dir, date)
+        os.makedirs(date_subdir, exist_ok=True)
+        save_filename = f"订单明细_{date}.xlsx"
+        target_xlsx = os.path.join(date_subdir, save_filename)
+
+        # 7. 写 xlsx + 应用单元格格式（SKU/SPU 整数 0、订单编号文本、日期格式化）
+        df.to_excel(target_xlsx, index=False, engine="openpyxl")
+        if date_column:
+            apply_column_formats(target_xlsx, df, date_column=date_column, date_value=date_value)
+        else:
+            # 即使没日期列也走格式应用（SKU/SPU/订单编号识别）
+            apply_column_formats(target_xlsx, df)
+
+        print(
+            f"✅ [京麦订单] 解密+转存成功：{target_xlsx}（{os.path.getsize(target_xlsx)} 字节，"
+            f"{len(df)}行 × {len(df.columns)}列）"
+        )
+
+        # 8. ⚠️ 用户决策 2026-08-11：删除中间加密 zip（只留解密后 xlsx）
+        try:
+            os.remove(zip_path)
+            print(f"🗑️  [京麦订单] 中间加密 zip 已删除：{zip_path}")
+        except OSError as e:
+            print(f"⚠️ [京麦订单] 中间 zip 删除失败（不影响主流程）：{e}")
+
+        return target_xlsx
+
+    def run_full_export(
+        self,
+        start_date: str = None,
+        end_date: str = None,
+        date: str = None,
+        order_status_list: list = None,
+        sensitive_info_sign: str = "0",
+        export_task_type: int = 0,
+        poll_interval: int = 3,
+        max_poll_times: int = 20,
+        sms_password: str = None,
+        imap_config_path: str = "config/imap_config.ini",
+        imap_timeout_seconds: int = None,
+    ) -> dict:
+        """完整 5 步一键：创建 + 轮询 + 下载 + 短信申请 + IMAP 拿密码 + 解压 xlsx（2026-08-11）。
+
+        ⚠️ 鉴权 3 次切换：
+            1. 创建/轮询/短信申请：h5st + Cookie + dsm-* 全套头（sff.jd.com）
+            2. 下载：仅 Cookie + Referer（export.shop.jd.com）
+            3. 解压：纯本地 zipfile（无网络）
+
+        ⚠️ 密码获取策略（用户决策 2026-08-11）：
+            - 优先用传入的 sms_password（如有，从命令行/环境变量注入）
+            - 否则调 IMAP 监听（imap_config_path 配置）
+            - IMAP 超时后保留 zip，提示用户人工 --sms-password 重跑
+            - （不抛错退出 —— 用户决策「超时后保留 zip + 提示手动输入」）
+
+        参数:
+            start_date / end_date / date / order_status_list / sensitive_info_sign
+                / export_task_type / poll_interval / max_poll_times
+                —— 与 create_wait_download_and_request_pwd 一致
+            sms_password       - 可选：手动传入解压密码（优先级最高）
+            imap_config_path   - IMAP ini 路径（默认 config/imap_config.ini）
+            imap_timeout_seconds - IMAP 监听超时（None=读 ini 的 max_wait_seconds）
+        返回:
+            dict - 含 taskId / zip_path / xlsx_path / password（来源）+ 全链路上下文
+        异常:
+            ValueError         - 缺日期参数 / 区间 >31 天
+            CookieExpiredError - Cookie 过期
+            RiskControlError   - 触发 601 风控
+            RuntimeError       - 轮询超时 / 任务失败 / 下载失败 / 短信申请失败 / 解压失败
+        """
+        # 第 1+2+3+4 步：创建+轮询+下载+短信申请
+        full_ret = self.create_wait_download_and_request_pwd(
+            start_date=start_date,
+            end_date=end_date,
+            date=date,
+            order_status_list=order_status_list,
+            sensitive_info_sign=sensitive_info_sign,
+            export_task_type=export_task_type,
+            poll_interval=poll_interval,
+            max_poll_times=max_poll_times,
+        )
+        task_id = full_ret.get("taskId")
+        zip_path = full_ret.get("zip_path")
+        sms_receiver = full_ret.get("smsReceiver")
+
+        # 第 5 步前半：拿解压密码
+        password = None
+        password_source = None  # "manual" / "imap" / None（取失败）
+        if sms_password:
+            password = sms_password
+            password_source = "manual"
+            print(f"🔑 [京麦订单] 第 5 步：使用人工传入密码 {password!r}")
+        else:
+            # 走 IMAP 监听
+            try:
+                password = self.fetch_password_from_imap(
+                    task_id=task_id,
+                    config_path=imap_config_path,
+                )
+                password_source = "imap"
+            except TimeoutError as e:
+                # 用户决策 2026-08-11：超时后保留 zip + 提示人工输入，不报错退出
+                print(f"⚠️ [京麦订单] IMAP 监听超时，未拿到密码：{e}")
+                print(f"   加密 zip 已保留在：{zip_path}")
+                print(f"   提示：等手机短信拿到解压密码后，重跑命令并加 --sms-password '<密码>'：")
+                print(
+                    f"   python main.py --biz_key '京麦订单明细_创建轮询下载并申请密码' "
+                    f"--date {date or start_date} --h5st '<h5st>' --sms-password '<短信密码>'"
+                )
+                return {
+                    "code": self.CODE_OK,
+                    "msg": "IMAP 监听超时，保留 zip 等人工补密码",
+                    "taskId": task_id,
+                    "zip_path": zip_path,
+                    "xlsx_path": None,
+                    "password": None,
+                    "password_source": None,
+                    "smsReceiver": sms_receiver,
+                    "nextStep": f"用 --sms-password 重新跑，或人工解压 {zip_path}",
+                    "rawItem": full_ret.get("rawItem"),
+                }
+
+        # 第 5 步后半：解压 zip → xlsx
+        xlsx_path = self.extract_xlsx_from_zip(
+            zip_path=zip_path,
+            password=password,
+        )
+
+        # 完整回执
+        return {
+            "code": self.CODE_OK,
+            "msg": "成功",
+            "taskId": task_id,
+            "taskStatus": full_ret.get("taskStatus"),
+            "encryptFlag": full_ret.get("encryptFlag"),
+            "smsReceiver": sms_receiver,
+            "zip_path": zip_path,
+            "xlsx_path": xlsx_path,
+            "password": password,
+            "password_source": password_source,  # 标记密码来源（manual / imap）
+            "remainingTimes": full_ret.get("remainingTimes"),
+            "pwd_raw_message": full_ret.get("pwd_raw_message"),
+            "rawItem": full_ret.get("rawItem"),
+        }
+
+    def request_export_password(
+        self,
+        task_id: str,
+        export_task_type: int = 0,
+    ) -> dict:
+        """第 4 步：申请解压密码短信（2026-08-11 实证落地）。
+
+        POST /api?api=dsm.order.export.exportCenterService.exportTaskPwdSend
+        Body: {"exportParam": {"exportTaskType": 0, "taskId": "..."}}
+
+        抓包 2026-08-11 实证：
+            请求头：与 createdExportTask 相同（Cookie + h5st + dsm-eid + dsm-platform + dsm-trace-id + dsm-lang）
+            请求体：{"exportParam": {"exportTaskType": 0, "taskId": "105874710541"}}
+                     ⚠️ 注意：**嵌套在 exportParam 里**（与 createdExportTask 一致结构）
+            响应：{
+                "msg": "成功",
+                "code": 200,
+                "data": "密码短信发送成功!当前任务剩余短信发送次数8次",  ← data 是**字符串**，不是 JSON 对象
+                "dsm-trace-id": "..."
+            }
+
+        ⚠️ 关键发现（2026-08-11 实证）：
+            - data 字段是**字符串**（不是 JSON 对象）——需要正则解析
+            - 字符串中含"剩余短信发送次数 N 次"——N 是个位数（0-10）
+            - **接口不返回密码明文**（与设计预期一致）——密码只发到京东商家平台绑定的安全手机
+            - 每调用一次扣减 1 次剩余（实证从 10 → 9 → 8）
+            - 短信下发到 smsSendTip 里的接收号码（项目实证 1366794）
+
+        业务硬性约束（与 docs/jd-api-analyze SKILL 一致）：
+            - 单 taskId 两次申请间隔 ≥60 秒（脚本**不实现**——由调用方控制节奏）
+            - 单 taskId 单日 ≤10 次（**接口自动累计**，超额由服务端拒绝，本方法在响应里返回 remainingTimes 给调用方判断）
+
+        参数:
+            task_id         - 任务 ID（如 "105874710541"）
+            export_task_type- 任务类型（默认 0=订单明细）
+        返回:
+            dict - {
+                "code": 200,
+                "msg": "成功",
+                "rawData": "密码短信发送成功!当前任务剩余短信发送次数8次",  # 完整 data 字符串
+                "remainingTimes": 8,                                         # 剩余发送次数（从 data 字符串正则解析）
+                "taskId": "105874710541",
+                "dsmTraceId": "...",
+            }
+        异常:
+            CookieExpiredError - Cookie 过期
+            RiskControlError   - 触发 601 风控
+            RuntimeError       - 业务码非 200 / 响应异常
+        """
+        if not task_id:
+            raise ValueError("❌ task_id 不能为空")
+
+        body = {
+            "exportParam": {
+                "exportTaskType": export_task_type,
+                "taskId": task_id,
+            }
+        }
+
+        print(f"📨 [京麦订单] 第 4 步：申请密码短信 taskId={task_id}")
+        ret = self._post_dsm("exportTaskPwdSend", body)
+
+        # 响应里 data 是字符串（与京麦 dsm 接口常规 JSON 对象不同！）
+        raw_data = ret.get("data", "")
+        if not isinstance(raw_data, str):
+            # 防御性检查：万一未来京东改回 JSON 对象，提示用户
+            raise RuntimeError(
+                f"❌ exportTaskPwdSend 响应 data 不是字符串（类型={type(raw_data).__name__}），"
+                f"可能是接口变更，请人工核对抓包：{ret}"
+            )
+
+        # 正则解析剩余次数（"剩余短信发送次数 N 次"）
+        # 放宽空白匹配：应对服务端话术变化（如"剩余 短信 发送 次数 3 次"也能容错）
+        import re as _re
+        m = _re.search(r"剩余\s*短信\s*发送\s*次数\s*(\d+)\s*次", raw_data)
+        remaining = int(m.group(1)) if m else None
+
+        if remaining is None:
+            # 没匹配上 —— 可能是首次（满 10 次）或服务端话术变更
+            print(f"  ⚠️ 响应中未匹配到「剩余短信发送次数 N 次」字样：{raw_data!r}")
+            print(f"     可能是首次申请（默认 10 次）或服务端文案变更")
+            remaining = None
+
+        print(
+            f"✅ [京麦订单] 短信申请成功：{raw_data!r}"
+            + (f"（剩余 {remaining} 次）" if remaining is not None else "")
+        )
+
+        return {
+            "code": ret.get("code"),
+            "msg": ret.get("msg"),
+            "rawData": raw_data,
+            "remainingTimes": remaining,
+            "taskId": task_id,
+            "dsmTraceId": ret.get("dsm-trace-id"),
+        }
+
+
+# ---- 调度器专用 callable 函数 ----
+
+def _run_jm_create_task(**kwargs) -> dict:
+    """调度器专用：京麦订单导出 - 第 1 步创建任务（项目14 阶段1，2026-08-11）。
+
+    ⚠️ 注册到 BUSINESS_REGISTRY["京麦订单明细_创建任务"]["callable"]。
+    设计动机：JingMaiOrderExportAPI.__init__ 需要 h5st 必填，
+              标准调度路径不支持构造参数注入，本函数手动构造实例并调用 create_export_task。
+    """
+    # 提取透传参数
+    h5st = kwargs.get("h5st", "")
+    if not h5st:
+        raise ValueError(
+            "❌ 京麦订单明细_创建任务 必须传 h5st（浏览器F12抓 createdExportTask 请求头）\n"
+            "   → 请浏览器登录 https://shop.jd.com/jdm/trade/tools/export/ExprotList，\n"
+            "     F12 抓 createdExportTask 请求头 h5st 复制传入"
+        )
+
+    # cookie_path 可选
+    cookie_path = kwargs.get("cookie_path", "config/cookie.txt")
+
+    # 透传给 create_export_task 的参数
+    forward_kwargs = {
+        k: kwargs[k] for k in (
+            "start_date", "end_date", "date",
+            "order_status_list", "sensitive_info_sign", "export_task_type",
+        )
+        if k in kwargs
+    }
+
+    # 日期兜底
+    if not forward_kwargs.get("date") and not forward_kwargs.get("start_date") and not forward_kwargs.get("end_date"):
+        raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
+
+    api = JingMaiOrderExportAPI(h5st=h5st, cookie_path=cookie_path)
+    return api.create_export_task(**forward_kwargs)
+
+
+# ⚠️ 项目14 注册表 callable 字段回填（2026-08-11 启动）
+BUSINESS_REGISTRY["京麦订单明细_创建任务"]["callable"] = _run_jm_create_task
+BUSINESS_REGISTRY["京麦订单明细_创建任务"]["api_class"] = JingMaiOrderExportAPI
+
+
+def _run_jm_create_and_wait(**kwargs) -> dict:
+    """调度器专用：京麦订单导出 - 第 1+2 步一键（创建+轮询）（项目14 阶段2，2026-08-11）。
+
+    ⚠️ 注册到 BUSINESS_REGISTRY["京麦订单明细_创建并轮询"]["callable"]。
+    """
+    h5st = kwargs.get("h5st", "")
+    if not h5st:
+        raise ValueError(
+            "❌ 京麦订单明细_创建并轮询 必须传 h5st\n"
+            "   → 浏览器F12抓 createdExportTask 请求头 h5st 复制传入"
+        )
+
+    cookie_path = kwargs.get("cookie_path", "config/cookie.txt")
+    forward_kwargs = {
+        k: kwargs[k] for k in (
+            "start_date", "end_date", "date",
+            "order_status_list", "sensitive_info_sign", "export_task_type",
+            "poll_interval", "max_poll_times",
+        )
+        if k in kwargs
+    }
+
+    if not forward_kwargs.get("date") and not forward_kwargs.get("start_date") and not forward_kwargs.get("end_date"):
+        raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
+
+    api = JingMaiOrderExportAPI(h5st=h5st, cookie_path=cookie_path)
+    return api.create_and_wait(**forward_kwargs)
+
+
+# ⚠️ 项目14 注册表第 2 个业务回填（创建并轮询一键，2026-08-11）
+BUSINESS_REGISTRY["京麦订单明细_创建并轮询"]["callable"] = _run_jm_create_and_wait
+BUSINESS_REGISTRY["京麦订单明细_创建并轮询"]["api_class"] = JingMaiOrderExportAPI
+
+
+def _run_jm_create_wait_download(**kwargs) -> dict:
+    """调度器专用：京麦订单导出 - 第 1+2+3 步一键（创建+轮询+下载加密 zip，2026-08-11）。
+
+    ⚠️ 注册到 BUSINESS_REGISTRY["京麦订单明细_创建轮询并下载zip"]["callable"]。
+    """
+    h5st = kwargs.get("h5st", "")
+    if not h5st:
+        raise ValueError(
+            "❌ 京麦订单明细_创建轮询并下载zip 必须传 h5st\n"
+            "   → 浏览器F12抓 createdExportTask 请求头 h5st 复制传入"
+        )
+
+    cookie_path = kwargs.get("cookie_path", "config/cookie.txt")
+    forward_kwargs = {
+        k: kwargs[k] for k in (
+            "start_date", "end_date", "date",
+            "order_status_list", "sensitive_info_sign", "export_task_type",
+            "poll_interval", "max_poll_times",
+        )
+        if k in kwargs
+    }
+
+    if not forward_kwargs.get("date") and not forward_kwargs.get("start_date") and not forward_kwargs.get("end_date"):
+        raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
+
+    api = JingMaiOrderExportAPI(h5st=h5st, cookie_path=cookie_path)
+    return api.create_wait_and_download(**forward_kwargs)
+
+
+# ⚠️ 项目14 注册表第 3 个业务回填（创建+轮询+下载zip一键，2026-08-11）
+BUSINESS_REGISTRY["京麦订单明细_创建轮询并下载zip"]["callable"] = _run_jm_create_wait_download
+BUSINESS_REGISTRY["京麦订单明细_创建轮询并下载zip"]["api_class"] = JingMaiOrderExportAPI
+
+
+def _run_jm_full_with_pwd(**kwargs) -> dict:
+    """调度器专用：京麦订单导出 - 完整 4 步一键（创建+轮询+下载+短信申请，2026-08-11）。
+
+    ⚠️ 注册到 BUSINESS_REGISTRY["京麦订单明细_创建轮询下载并申请密码"]["callable"]。
+    设计动机：4 步链路，每步鉴权头不同（h5st/dsm vs Cookie-only），需要单一入口编排。
+    """
+    h5st = kwargs.get("h5st", "")
+    if not h5st:
+        raise ValueError(
+            "❌ 京麦订单明细_创建轮询下载并申请密码 必须传 h5st\n"
+            "   → 浏览器F12抓 createdExportTask 请求头 h5st 复制传入"
+        )
+
+    cookie_path = kwargs.get("cookie_path", "config/cookie.txt")
+    forward_kwargs = {
+        k: kwargs[k] for k in (
+            "start_date", "end_date", "date",
+            "order_status_list", "sensitive_info_sign", "export_task_type",
+            "poll_interval", "max_poll_times",
+        )
+        if k in kwargs
+    }
+
+    if not forward_kwargs.get("date") and not forward_kwargs.get("start_date") and not forward_kwargs.get("end_date"):
+        raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
+
+    api = JingMaiOrderExportAPI(h5st=h5st, cookie_path=cookie_path)
+    return api.create_wait_download_and_request_pwd(**forward_kwargs)
+
+
+# ⚠️ 项目14 注册表第 4 个业务回填（完整 4 步一键，2026-08-11）
+BUSINESS_REGISTRY["京麦订单明细_创建轮询下载并申请密码"]["callable"] = _run_jm_full_with_pwd
+BUSINESS_REGISTRY["京麦订单明细_创建轮询下载并申请密码"]["api_class"] = JingMaiOrderExportAPI
+
+
+def _run_jm_run_full_export(**kwargs) -> dict:
+    """调度器专用：京麦订单导出 - 完整 5 步一键（创建+轮询+下载+短信+IMAP+解压，2026-08-11）。
+
+    ⚠️ 注册到 BUSINESS_REGISTRY["京麦订单明细_完整一键导出"]["callable"]。
+    设计动机：5 步链路最完整，密码获取两路（sms_password 优先 / IMAP 兜底）。
+    """
+    h5st = kwargs.get("h5st", "")
+    if not h5st:
+        raise ValueError(
+            "❌ 京麦订单明细_完整一键导出 必须传 h5st\n"
+            "   → 浏览器F12抓 createdExportTask 请求头 h5st 复制传入"
+        )
+
+    cookie_path = kwargs.get("cookie_path", "config/cookie.txt")
+    forward_kwargs = {
+        k: kwargs[k] for k in (
+            "start_date", "end_date", "date",
+            "order_status_list", "sensitive_info_sign", "export_task_type",
+            "poll_interval", "max_poll_times",
+            "sms_password", "imap_config_path", "imap_timeout_seconds",
+        )
+        if k in kwargs
+    }
+
+    if not forward_kwargs.get("date") and not forward_kwargs.get("start_date") and not forward_kwargs.get("end_date"):
+        raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
+
+    api = JingMaiOrderExportAPI(h5st=h5st, cookie_path=cookie_path)
+    return api.run_full_export(**forward_kwargs)
+
+
+# ⚠️ 项目14 注册表第 5 个业务回填（完整 5 步一键，2026-08-11）
+BUSINESS_REGISTRY["京麦订单明细_完整一键导出"]["callable"] = _run_jm_run_full_export
+BUSINESS_REGISTRY["京麦订单明细_完整一键导出"]["api_class"] = JingMaiOrderExportAPI
+
+
 def list_businesses():
     """打印所有已注册业务清单（启动时用）。"""
     print()
@@ -6332,6 +8263,30 @@ def parse_args():
              "与 --date/--start_date/--end_date 互斥（同时传会报错）。",
     )
     parser.add_argument(
+        "--sms_password",
+        type=str,
+        default=None,
+        help="京麦订单明细【加密】导出专用：手动传入解压密码（优先级高于IMAP自动监听）",
+    )
+    parser.add_argument(
+        "--h5st",
+        type=str,
+        default=None,
+        help="京麦订单明细【加密】导出专用：浏览器F12抓 createdExportTask 请求头 h5st（前端强签名，一次性）",
+    )
+    parser.add_argument(
+        "--cookie_path",
+        type=str,
+        default=None,
+        help="京麦订单明细【加密】导出专用：Cookie 文件路径（默认 config/jm_cookie.txt）",
+    )
+    parser.add_argument(
+        "--imap_config_path",
+        type=str,
+        default=None,
+        help="京麦订单明细【加密】导出专用：IMAP 配置文件路径（默认 config/imap_config.ini）",
+    )
+    parser.add_argument(
         "--list",
         action="store_true",
         help="列出所有已注册业务清单",
@@ -6484,6 +8439,20 @@ def main():
             kwargs["start_date"] = args.start_date
         if args.end_date:
             kwargs["end_date"] = args.end_date
+
+    # 透传京麦订单导出专用参数（2026-08-11 阶段5）
+    if args.sms_password:
+        kwargs["sms_password"] = args.sms_password
+        print(f"[INFO] --sms_password 已传入（优先级高于IMAP自动监听）")
+    if args.h5st:
+        kwargs["h5st"] = args.h5st
+        print(f"[INFO] --h5st 已传入（{len(args.h5st)} 字符）")
+    if args.cookie_path:
+        kwargs["cookie_path"] = args.cookie_path
+        print(f"[INFO] --cookie_path 已传入（{args.cookie_path}）")
+    if args.imap_config_path:
+        kwargs["imap_config_path"] = args.imap_config_path
+        print(f"[INFO] --imap_config_path 已传入（{args.imap_config_path}）")
 
     # 执行
     try:
