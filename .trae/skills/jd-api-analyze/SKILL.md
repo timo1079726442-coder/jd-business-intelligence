@@ -629,11 +629,11 @@ python main.py --biz_key "商品流失分析" --date "2026-08-05"
 
 ---
 
-## 项目1：订单明细【加密】导出（⏸️ 暂停归档 2026-08-06）
+## 项目1：订单明细【加密】导出（⏸️ 暂停归档 2026-08-06 → 升级为项目14 上线 2026-08-11）
 
 ### 项目状态
-- **状态**：⏸️ **暂停归档**（账号/IP 触发 601 风控限流）
-- **恢复前置**：收到明确的【项目恢复指令】+ 账号冷却 30-120 分钟或换公网 IP + 重新抓包拿到 code=200 成功响应
+- **2026-08-06**：⏸️ **暂停归档**（账号/IP 触发 601 风控限流）
+- **2026-08-11**：✅ **升级为项目14 上线** —— 拿到真实 h5st + 京麦 Cookie + iPhone 快捷指令 IMAP 监听 + msoffcrypto 双层解密 + Excel 后置统一规则 + 自查 9 维度 0 问题 0 警告
 - **不要做的事**：禁止继续反复抓包、禁止开发 `jd_order_export.py`（缺成功报文无法验证）
 
 ### 业务说明
@@ -1115,10 +1115,125 @@ orderStatusCategory=1, orderType="1,3", orderStatuses=[]
 
 ---
 
+## 项目14：京麦订单明细【加密】导出（✅ 真实跑通上线 2026-08-11）
+
+### 业务要点
+- 京麦订单导出页面（`https://shop.jd.com/jdm/trade/tools/export/ExprotList`）的"订单明细【加密】导出"
+- **5 步异步链路**（区别于商智同步接口、京准通 3 步异步）：
+  1. createdExportTask（POST + h5st + dsm）→ 创建任务
+  2. queryExportTaskInfo（POST + h5st + dsm）→ **分页查任务列表**，按 startTime/endTime 匹配刚创建的任务拿 taskId
+  3. export.action（GET + 仅 Cookie）→ 下载加密 zip
+  4. exportTaskPwdSend（POST + h5st + dsm）→ 触发短信下发密码（接口**不返回密码明文**）
+  5. IMAP 监听 QQ 邮箱（iPhone 快捷指令自动转发短信）→ 拿解压密码 → **msoffcrypto 双层解密** → Excel 后置 → 删除中间 zip
+- 鉴权**3 次切换**：
+  - 1/2/4 步：`h5st` + Cookie + dsm-eid/dsm-platform/dsm-trace-id/dsm-lang（sff.jd.com）
+  - 第 3 步：**仅 Cookie + Referer**（export.shop.jd.com，不需要 h5st / dsm 头）
+  - 第 5 步：纯本地 zipfile + msoffcrypto（无网络）
+- 业务类：`JingMaiOrderExportAPI`（**不继承 JDBaseRequest**），5 个业务 key：
+  - `京麦订单明细_创建任务`（create_export_task）
+  - `京麦订单明细_创建并轮询`（create_and_wait）
+  - `京麦订单明细_创建轮询并下载zip`（create_wait_and_download）
+  - `京麦订单明细_创建轮询下载并申请密码`（create_wait_download_and_request_pwd）
+  - `京麦订单明细_完整一键导出`（run_full_export）
+- 输出：`output/京麦订单明细/{date}/订单明细_{date}.xlsx`（业务模块 + 日期子目录）
+- Excel 后置统一规则：①日期列智能新增 ②yyyy/m/d 统一格式 ③SKU/SPU 整数 0 位小数 + 订单编号 @ 强制文本 ④合计行剔除 ⑤首列+表头冻结 B2
+
+### 关键接口（5 个）
+| 步骤 | URL | 方法 | 鉴权 |
+|---|---|---|---|
+| 创建任务 | `sff.jd.com/api?api=dsm.order.export.exportCenterService.createdExportTask` | POST JSON | h5st + dsm |
+| 轮询列表 | `sff.jd.com/api?api=dsm.order.export.exportCenterService.queryExportTaskInfo` | POST JSON | h5st + dsm |
+| 下载 zip | `export.shop.jd.com/exportCenter/export.action?taskId=xxx` | GET | 仅 Cookie + Referer |
+| 短信申请 | `sff.jd.com/api?api=dsm.order.export.exportCenterService.exportTaskPwdSend` | POST JSON | h5st + dsm |
+| IMAP 拿密码 | `imap.qq.com:993`（标准库 imaplib） | IMAP SSL | QQ 邮箱授权码 |
+
+### 真实跑通（2026-08-11 实证）
+- **h5st 可用**：同一份 h5st 在 createdExportTask / queryExportTaskInfo / exportTaskPwdSend 三个 dsm 接口都通
+- **Cookie 可用**：京麦独立文件 `config/jm_cookie.txt`（3098 字符）
+- **taskStatus 状态机**：0=等待/处理中 → 2=已完成（6 秒命中）
+- **taskId 获取**：`createdExportTask` 响应**没有 taskId**，必须 `queryExportTaskInfo` 分页查 + 按 `taskData.startTime/endTime` 严格相等匹配（与京准通 add 接口不同）
+- **短信接收号**：`smsSendTip = "接收号码：136****6794，每日限发送10次"`（**脱敏格式**，前 3 + 4 星 + 后 4；用户提醒不同店铺手机号不同 → 动态提取）
+- **每次任务密码不同**（如 `3WPFwj` → `4xkbWM`）—— 必须 IMAP 拿密码，**不能用旧任务密码**
+- **msoffcrypto 双层解密**：zip(ZipCrypto) + 内部 xls(msoffcrypto 加密)，xlrd 2.0+ 不支持 password 参数
+- **解密后是 .xlsx**（不是 .xls）—— OLE2 头是加密容器的"假象"
+- **真实数据**（2026-08-10）：订单号 3586255013115624、商品名「FYA行李箱女2026新款中置宽拉杆旅行」、金额 1049
+
+### 业务硬性约束（2026-08-11 实证）
+- 时间跨度最大 31 天（订单明细【加密】导出服务端强制）
+- 同导出类型两次间隔 ≥10 分钟（实证 10 分钟内连导触发 201）
+- 单日最多 10 次（code=201「连续两次导出订单明细信息任务类型时间间隔至少为10分钟」）
+- 单 taskId 两次密码申请间隔 ≥60 秒
+- 单 taskId 单日 ≤10 次密码申请
+- h5st 必须真实浏览器实时生成（禁止硬编码复用抓包值，5-30 分钟过期）
+- 严禁代理/VPN/IP 池访问京麦（升级风险）
+- 触发 601 后 30-120 分钟冷却，冷却期间任何请求都会重置冷却
+
+### 关键文件
+- `main.py` — `JingMaiOrderExportAPI` 类 + 5 个业务 key + 4 个一键方法 + 工具方法（IMAP/Excel后置）
+- `config/jm_cookie.txt` — 京麦 .shop.jd.com 域 Cookie（**不入仓**）
+- `config/imap_config.ini` — QQ 邮箱 IMAP 授权码配置（**不入仓**）
+- `config/imap_config.ini.example` — IMAP 模板（含 iPhone 快捷指令配置说明，**入仓**）
+- `.gitignore` — 新加 `config/jm_cookie.txt` + `config/imap_config.ini` 白名单
+
+### CLI 参数（项目14 专用）
+- `--h5st` — 浏览器 F12 抓 createdExportTask 请求头 h5st
+- `--sms_password` — 手动传入解压密码（优先级高于 IMAP）
+- `--cookie_path` — Cookie 文件路径（默认 `config/jm_cookie.txt`）
+- `--imap_config_path` — IMAP 配置路径（默认 `config/imap_config.ini`）
+
+### iPhone 快捷指令配置（关键）
+- 触发条件：收到短信「发送方=京东商家平台」+「正文含 taskId 数字串」
+- 转发动作：发邮件到 `config/imap_config.ini` 的 user 配置邮箱
+- 邮件主题模板：「京东密码转发」（与 `subject_keyword` 配置一致）
+- 邮件正文模板：纯密码（如 `4xkbWM`）或「您的导出任务 105874728368 解压密码为：4xkbWM」
+
+### 后期维护要点
+1. **Cookie 维护**：京麦 Cookie 2-7 天过期，症状是 302 重定向或 CookieExpiredError
+2. **h5st 维护**：每次新建任务前抓一次（5-30 分钟过期），症状是 601 或 业务码 1xx
+3. **IMAP 授权码**：每 90 天可能过期，症状是 Login fail
+4. **风控监控**：601 后 30-120 分钟冷却，**不要重试**（会加重风控）
+5. **数据完整性**：8/10 实证只有 1 单，**先看 Excel 真实内容**再判断是否漏导（可能是当天真实订单就少）
+6. **依赖版本固定**：msoffcrypto-tool>=6.0.0、xlrd==2.0.1、openpyxl>=3.1.0
+
+### 踩坑要点（2026-08-11 实证）
+1. **真实入口不是 seller-v10.shop.jd.com** —— 是 `shop.jd.com/jdm/trade/tools/export/ExprotList`（嵌在 seller-v10.shop.jd.com 的 iframe）
+2. **真实接口域名不是 seller-v10.shop.jd.com** —— 是 `sff.jd.com`
+3. **h5st 一次性签名** —— 禁止复用抓包值，必须实时生成
+4. **createdExportTask 响应没有 taskId** —— 必须再调 queryExportTaskInfo 分页查 + 按 startTime/endTime 匹配（与京准通 add 不同）
+5. **smsSendTip 号码脱敏** —— 格式 `136****6794`（前 3+4 星+后 4），真实号码从其他渠道反推
+6. **每次任务密码不同** —— 实证 `3WPFwj` → `4xkbWM`，必须 IMAP 拿密码不能用旧密码
+7. **双层加密链路** —— zip(ZipCrypto) + 内部 xls(msoffcrypto 加密)，xlrd 2.0+ 不支持 password 参数
+8. **解密后是 .xlsx 不是 .xls** —— OLE2 头是加密容器的"假象"
+9. **IMAP 中文主题编码** —— `imaplib.search("SUBJECT 中文")` ASCII 编码炸，改 ALL + 客户端 decode_header + 客户端判断主题
+10. **每个任务都重新生成 taskId/password** —— 不能跨任务复用
+
+### 关联文件
+- 业务类实现：`main.py`（`class JingMaiOrderExportAPI`，~700 行含详细中文注释）
+- 业务沉淀：本 SKILL.md 京麦分区
+- 踩坑记录：`全局复利的踩坑日志.md`（坑9 待补）
+- 接口说明：`docs/API 实现逻辑说明.md`（待补）
+- 文档索引：`docs/项目文档索引.xlsx`（自动入库）
+- 抓包脚本：`jd_cdp_capture.py`（项目14 已真实跑通，不再需要）
+
+### 抓包架构（已完整实现）
+- 5 接口全部真实报文已抓到（2026-08-11）：
+  - createdExportTask / queryExportTaskInfo / export.action / exportTaskPwdSend + IMAP 邮件内容
+- 真实跑通 1 单（订单号 3586255013115624，金额 1049）写入 `output/京麦订单明细/2026-08-10/订单明细_2026-08-10.xlsx`
+
+### 阶段交付（5 阶段全部完成）
+- 阶段 1：需求拆解 + 鉴权体系分析（h5st + dsm）
+- 阶段 2：抓包确认 4 个 sff.jd.com + 1 个 export.shop.jd.com 接口
+- 阶段 3：JingMaiOrderExportAPI 类骨架 + 5 个业务 key 注册
+- 阶段 4：容错适配（轮询循环 / 401/302 Cookie 过期 / 601 风控不重试 / 业务码识别）
+- 阶段 5：IMAP 监听 + msoffcrypto 双层解密 + Excel 后置统一规则 + 自查 9 维度 0 问题 0 警告
+
+---
+
 ## 八、迭代更新记录（时间倒序）
 
 | 日期 | 改动概要 |
 |------|----------|
+| 2026-08-11 | **项目14：京麦订单明细【加密】导出（JingMaiOrderExportAPI）上线（2026-08-11，远程提交 11e0b84）**：① **5 步异步链路**（区别于商智同步、京准通 3 步）—— createdExportTask → queryExportTaskInfo（**分页查列表按 startTime/endTime 匹配**拿 taskId）→ export.action 仅 Cookie 下载 → exportTaskPwdSend 触发短信（**不返回密码明文**）→ IMAP 监听 + msoffcrypto 双层解密；② **鉴权 3 次切换** —— 1/2/4 步 sff.jd.com h5st+dsm、3 步 export.shop.jd.com 仅 Cookie+Referer、5 步本地 zipfile+msoffcrypto；③ 业务类**不继承 JDBaseRequest**（h5st 与 UA 绑定，异步流程差异大）；④ 5 个业务 key（创建任务/创建并轮询/创建轮询下载zip/创建轮询下载并申请密码/完整一键导出）+ 4 个一键方法；⑤ CLI 新增 4 个项目14 专用参数（--h5st/--sms_password/--cookie_path/--imap_config_path）；⑥ IMAP 监听 QQ 邮箱（imaplib 标准库）+ iPhone 快捷指令自动转发短信（主题"京东密码转发"）；⑦ 关键发现：**msoffcrypto 双层解密**（zip ZipCrypto + 内部 xls msoffcrypto 加密，xlrd 2.0+ 不支持 password 参数）；⑧ 关键发现：**smsSendTip 号码脱敏**（`136****6794`，前 3+4 星+后 4）；⑨ 关键发现：**每次任务密码不同**（实证 `3WPFwj` → `4xkbWM`），不能跨任务复用；⑩ 关键发现：**IMAP 中文主题编码 bug**（`imaplib.search("SUBJECT 中文")` ASCII 编码炸，改 ALL + 客户端 decode_header + 客户端判断主题）；⑪ 关键发现：**每次任务都重新生成 taskId/password**；⑫ Excel 后置统一规则应用：日期列智能新增、yyyy/m/d 格式、SKU/SPU 整数 0、订单编号 @ 强制文本、合计行剔除、B2 冻结；⑬ 真实跑通 1 单（订单号 3586255013115624、金额 1049）写入 `output/京麦订单明细/2026-08-10/订单明细_2026-08-10.xlsx`（6843 字节）；⑭ 自查 9 维度 0 问题 0 警告；⑮ 新增 `config/jm_cookie.txt` + `config/imap_config.ini`（不入仓）+ `config/imap_config.ini.example`（入仓模板）；⑯ .gitignore 新加 `config/jm_cookie.txt` + `config/imap_config.ini` 白名单；⑰ `__init__` 业务 1（旧"项目1 暂停归档"）→ 升级为项目14 成功上线；⑱ BUSINESS_REGISTRY 第 14-18 业务（5 个） |
 | 2026-08-10 | **项目13：商智关键词分析导出（KeywordAnalysisAPI）上线（2026-08-10，远程提交 cd47f7b 同步）**：① 商智 downTable.ajax 家族新成员，按搜索词（lastSrcPageSearchKeyword）聚合；② **同步 xlsx 字节流**（无 taskId 无轮询，区别于京准通异步三步）；③ **服务端支持区间聚合**（day+DAY / month+MONTH，与项目1 搜索/推荐/购物车"不支持多日区间"不同，无需逐日拆分）；④ **双粒度实证坑**：day 粒度 date=`YYYY-MM-DD`（字段顺序 interval 在前）、month 粒度 date=`YYYYMM` 紧凑（字段顺序 dateType 在前）——dict 插入顺序精确匹配抓包；⑤ **原生 Excel 无时间列** → 手动插入时间区间列（day 插「日期」、month 插「日期范围」YYYY/M/D ~ YYYY/M/D）；⑥ UUID 完全随机（16hex-10hex，与项目4 同源，不依赖 UUID_PREFIX）；⑦ 固定参数 7 项（method=POST/target=_self/groupType/attributes/limit=300/sortField 浏览量/sortType=desc），可变参数 platformCate1=""；⑧ 空数据合法（warning 后保存空表）；⑨ 401/403 → CookieExpiredError，Content-Type 非 spreadsheetml → RuntimeError；⑩ 输出 `output/商智关键词分析/{startDate}/商智关键词分析_{startDate}_{day\|month}.xlsx`；⑪ BUSINESS_REGISTRY 第13业务，callable 注入 `_run_keyword_analysis_full`，注册表前向引用回填 api_class；⑫ 入口：`python main.py --biz_key "商智关键词分析" --date/--start_date/--end_date [--granularity day|month]` |
 | 2026-08-10 | **项目12：京准通全站营销全店推广效果导出（JZTQuanZhanEffectAllStoreAPI）上线（2026-08-10）**：① **URL 与项目10 完全相同** `POST /reweb/swa/effect/order/download`，**靠 campaignTypes=[118] 区分业务**（项目10 是 [101]）；② payload **13 项**（与项目10 字段结构完全一致：字符串/列表/bool 字段类型严格）；③ 报表名 `FYA8888_全站营销_效果报表_全店推广_{startDay}_{endDay}`（与项目10 `_效果报表_单品推广_` 后缀不同）；④ 响应同时含 downloadUrlZip + downloadUrlCsv；⑤ 复用项目10 的 csv 优先 + 8 次重试 + 空数据视为成功 + 严重告警日志 + Excel 增强（合计行去除/商品ID 0位小数/首列冻结）；⑥ 4 项开放入参与项目10/11 一致（order_status / is_daily / sku_id / spu_id）；⑦ 默认值与项目10 一致：`orderStatus="1"` 成交订单、`isDaily=False` 非日报；⑧ 复用 `config/jzt_cookie.txt`（与项目7-11 互通）；⑨ UA 沿用 v=151（项目10 一致）；⑩ 输出 `output/京准通全站营销全店推广效果/{date}/`；⑪ `BUSINESS_REGISTRY` 第13业务，callable 注入 `_run_jzt_quanzhan_effect_all_store_full`；⑫ mock 单测 **20/20 全过**（tests/jzt_quanzhan_effect_all_store_unittest.py） |
 | 2026-08-10 | **项目11：京准通全站营销全店计划导出（JZTQuanZhanCampaignAllStoreAPI）上线（2026-08-10）**：① **URL 与项目9 完全相同** `POST /reweb/swa/account/campaign/download`，**靠 campaignTypes=[118] 区分业务**（项目9 是 [101]）；② payload **15 项**（与项目9 字段结构完全一致：字符串/列表/bool/嵌套列表字段类型严格）；③ 报表名 `FYA8888_全站营销_全店计划报表_{startDay}_{endDay}`（与项目9 `_单品计划报表_` 后缀不同）；④ **响应同时含 downloadUrlZip + downloadUrlCsv**（项目9 抓包只含 csv，本项目数据完整）；⑤ 复用项目10 的 csv 优先 + 8 次重试 + 空数据视为成功 + 严重告警日志；⑥ 4 项开放入参与项目9 一致（order_status / is_daily / sku_id / spu_id）；⑦ 字段名注意：项目11 SKU 过滤字段名是 `sxuId`（项目9 同）而非 `skuId`；⑧ 复用 `config/jzt_cookie.txt`（与项目7-10 互通）；⑨ UA 沿用 v=151（项目9 一致）；⑩ 输出 `output/京准通全站营销全店计划/{date}/`；⑪ `BUSINESS_REGISTRY` 第12业务，callable 注入 `_run_jzt_quanzhan_campaign_all_store_full`；⑫ mock 单测 **20/20 全过**（tests/jzt_quanzhan_all_store_unittest.py） |
