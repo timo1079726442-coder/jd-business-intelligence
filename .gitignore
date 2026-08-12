@@ -9,6 +9,12 @@ config/新建文本文档.txt
 config/imap_config.ini
 # 京麦订单导出独立 Cookie（与商智不互通，项目14 阶段5）
 config/jm_cookie.txt
+# 2026-08-12 多店铺支持（项目17 启动）：所有店铺子目录里的鉴权文件全部不入仓
+config/*/sz_cookie.txt
+config/*/jzt_cookie.txt
+config/*/jm_cookie.txt
+config/*/h5st.txt
+config/*/imap_config.ini
 
 # 输出和日志
 output/
@@ -17,6 +23,10 @@ logs/
 # CDP 抓包产物（可能含敏感 Cookie + 体积大）
 cdp_network_log.json
 cdp_user_data/
+
+# SQLite 数据库（含店铺配置 + h5st 抓取记录）
+# 2026-08-12：shops.db不入仓（用户决策：每个开发者本地重新生成）
+config/shops.db
 
 # Python缓存
 __pycache__/
