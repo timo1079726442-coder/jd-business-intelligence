@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 main.py - 京东商智数据导出工具（重构版 v2.0）
 
@@ -526,11 +526,14 @@ class JDBaseRequest:
         self.config = self._load_config()
 
         # Cookie 路径
+        # ⚠️ 2026-08-12 修复：基类默认 Cookie 文件路径从 config/cookie.txt → config/sz_cookie.txt
+        # （远程 .gitignore 改成排除 sz_cookie.txt，但基类默认还在读 cookie.txt，造成 Cookie 找不到）
+        # 优先读 config.xlsx 的「cookie文件路径」配置项（兼容旧代码）
         cookie_path_from_config = self.config.get("cookie文件路径")
         if cookie_path_from_config:
             self.cookie_path = cookie_path_from_config if os.path.isabs(cookie_path_from_config) else os.path.join(project_root, cookie_path_from_config)
         else:
-            self.cookie_path = cookie_path or os.path.join(project_root, "config", "cookie.txt")
+            self.cookie_path = cookie_path or os.path.join(project_root, "config", "sz_cookie.txt")
 
         # 输出目录
         output_dir_rel = self.config.get("输出目录", "output/")
