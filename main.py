@@ -4037,12 +4037,16 @@ BUSINESS_REGISTRY = {
         },
     },
     # 业务：京麦售后明细 - 完整4步一键（创建+轮询+下载+解压，**无短信无IMAP**，2026-08-11）
-    #   ⚠️ 项目16 启动骨架，待真实抓包验证：
-    #     - 创建/轮询走 sff.jd.com（与项目14 相同接口？待抓包）
-    #     - 下载走 export.shop.jd.com（与项目14 相同 URL）
-    #     - zip 无密码（不需要短信申请、不需要 IMAP）
-    #     - 任务状态枚举 1=生成中 / 2=成功 / 3=失败（项目14 是 0/1/2）
-    #   鉴权 2 次切换：sff.jd.com dsm/h5st → export.shop.jd.com 仅Cookie
+    #   ⚠️ 项目16 真实抓包确认（2026-08-12 用户提供 HTTP 报文）：
+    #     - api 路径：dsm.seller.afs.bff.ExportDsmService.createExportTask（项目14 不同！）
+    #     - appId：BHPQ4MHJBUOQZKTFTRNS（项目14 CQLEJWPYPFOVQBC8UFLQ 不同！）
+    #     - payload 嵌套：{"request":{"data":{"exportType":2602,"param":"<JSON>"}}, "accessContext":{"source":"web"}}
+    #     - 时间格式：毫秒时间戳（项目14 是 "YYYY-MM-DD HH:MM:SS"）
+    #     - exportType: 2602（固定）
+    #     - 响应 data 是 bool 不是 dict
+    #     - 响应头 X-Rp-Sdtoken 30 分钟有效，下次请求带上
+    #     - 请求头多一个 dsm-file-path: lineation-price
+    #   鉴权 2 次切换：sff.jd.com dsm/h5st/X-Rp-Sdtoken → export.shop.jd.com 仅Cookie（待下载抓包）
     "京麦售后明细_完整一键导出": {
         "api_class": None,
         "method": "run_after_sale_full_export",
@@ -4052,10 +4056,13 @@ BUSINESS_REGISTRY = {
             "date": "单日查询YYYY-MM-DD（默认=start_date=end_date）",
             "start_date": "开始日期YYYY-MM-DD（含）",
             "end_date": "结束日期YYYY-MM-DD（含）",
-            "h5st": "必填，浏览器F12抓 createdExportTask 请求头 h5st（待抓包确认）",
-            "after_sale_status_list": "售后状态列表，默认 None（待抓包确认）",
-            "sensitive_info_sign": "敏感信息导出标志，默认 '0'",
-            "export_task_type": "导出任务类型，默认 0（**待抓包确认，售后可能不同**）",
+            "h5st": "必填，浏览器F12抓 createdExportTask 请求头 h5st",
+            "tab_code": "售后tab类型，默认 'all'（抓包实证）",
+            "after_sale_status_list": "售后状态列表，默认 '' = 全部",
+            "service_order_sub_state_list": "售后子状态列表，默认 ''",
+            "customer_expect_list": "客户期望列表，默认 ''",
+            "refund_status_list": "退款状态列表，默认 ''",
+            "transfer_feedback_reason_list": "转移反馈原因列表，默认 ''",
             "poll_interval": "轮询间隔秒数，默认 3",
             "max_poll_times": "轮询最大次数，默认 20（合计 60s）",
         },
@@ -7800,23 +7807,182 @@ class JingMaiOrderExportAPI:
 
 
 class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
-    """京麦售后订单明细导出 API（项目16，2026-08-11 启动骨架）。
+    """京麦售后订单明细导出 API（项目16，2026-08-11 实证抓包适配）。
+
+    ⚠️ 2026-08-12 真实抓包确认（来自用户提供的原始 HTTP 包）：
+        - api 路径：**dsm.seller.afs.bff.ExportDsmService.<接口名>**（与项目14 完全不同）
+        - appId：**BHPQ4MHJBUOQZKTFTRNS**（与项目14 的 CQLEJWPYPFOVQBC8UFLQ 不同）
+        - payload 嵌套结构：{"request": {"data": {"exportType": 2602, "param": "<JSON字符串>"}}, "accessContext": {"source": "web"}}
+        - param 内容：{exportType, applyTime[ms, ms], applyTimeRange: {dateBegin, dateEnd}, tabCode, ... 13 个售后筛选字段}
+        - 时间格式：**毫秒时间戳**（不是 YYYY-MM-DD HH:MM:SS）
+        - exportType: 2602（售后明细导出，固定值，待更多业务验证）
+        - 响应 data 字段：**bool 类型**（true=成功，不是 JSON 对象）
+        - 响应头 **X-Rp-Sdtoken: set;1800;...**：30分钟有效，下次请求必须带上
+        - 请求头 dsm-file-path: **lineation-price**（售后业务特有）
+        - 请求头 dsm-site: 空字符串
+        - Referer: after-sale/independent-after-sale/list?tabCode=all
+        - X-Referer-Page: after-sale/independent-after-sale/list
 
     ⚠️ 与父类 JingMaiOrderExportAPI 的核心差异：
-        - zip 无密码：解压时 password=None（extract_xlsx_from_zip 已自动支持）
+        - zip 无密码：解压时 password=None
         - 不需要短信申请：跳过 exportTaskPwdSend 步骤
         - 不需要 IMAP：跳过 QQ 邮箱监听
+        - appId 不同（项目14 项目16 是两个独立业务系统）
+        - api 路径前缀不同（order.export vs seller.afs.bff）
+        - payload 嵌套结构不同（exportParam vs request.data）
+        - X-Rp-Sdtoken 必须解析并动态带下次请求（**重要风控令牌**）
 
-    ⚠️ 当前骨架继承父类（项目14）实现，等真实抓包后再调整：
-        - createdExportTask 调用：复用父类 _post_dsm（dsm 头相同）
-        - queryExportTaskInfo 调用：复用父类 _post_dsm
-        - 下载：复用父类 download_encrypted_zip（GET 仅 Cookie，**无 dsm 头**）
-        - 保存：复用父类 save_encrypted_zip
-        - 解压：复用父类 extract_xlsx_from_zip（password=None 时跳过 OLE2 二次解密）
-
-    ⚠️ h5st 默认需要：因为项目14 项目16 都走 createdExportTask
-       等真实抓包确认是否需要 h5st 后，会调整 __init__ 签名
+    ⚠️ 待你提供下载包后再适配下载部分（getAction / 域名）
     """
+
+    # ---- ⚠️ 项目16 特有类常量（与项目14 完全不同）----
+    APP_ID = "BHPQ4MHJBUOQZKTFTRNS"  # ⚠️ 售后明细导出专属 appId
+    API_PATH_PREFIX = "dsm.seller.afs.bff.ExportDsmService"  # ⚠️ 售后明细 api 路径前缀
+    DSM_FILE_PATH = "lineation-price"  # ⚠️ 售后业务特有 dsm-file-path 头（待其他业务验证）
+    REFERER = "https://shop.jd.com/jdm/trade/after-sale/independent-after-sale/list?tabCode=all"
+    X_REFERER_PAGE = "https://shop.jd.com/jdm/trade/after-sale/independent-after-sale/list"
+
+    # ---- 业务硬性约束（项目16 待真实业务限制实证）----
+    EXPORT_TYPE_AFTER_SALE_DETAIL = 2602  # ⚠️ 售后明细导出类型，固定值（待更多业务验证）
+
+    def __init__(self, h5st: str = "", cookie_path: str = "config/jm_cookie.txt"):
+        """初始化京麦售后明细导出 API。
+
+        参数:
+            h5st        - 浏览器F12抓 createdExportTask 请求头 h5st（项目16 抓包实证必需）
+            cookie_path - 京麦 Cookie 文件路径，默认 config/jm_cookie.txt
+        """
+        # 直接调用父类构造，复用 dsm 头/Cookie/requests Session 等
+        super().__init__(h5st=h5st, cookie_path=cookie_path)
+
+        # 项目16 特有：覆盖父类的 Referer / X-Referer-Page（售后页面）
+        self.session.headers.update({
+            "Referer": self.REFERER,
+            "X-Referer-Page": self.X_REFERER_PAGE,
+            "dsm-file-path": self.DSM_FILE_PATH,
+        })
+
+        # 项目16 特有：X-Rp-Sdtoken 风控令牌（从响应里解析，下次请求带上）
+        # 30 分钟有效（响应头 set;1800 表示 1800 秒）
+        self._rp_sdtoken = None
+        self._rp_sdtoken_expire_ts = 0  # unix 时间戳
+
+    # ---- X-Rp-Sdtoken 风控令牌解析 ----
+
+    def _refresh_rp_sdtoken_from_response(self, resp):
+        """从响应头解析 X-Rp-Sdtoken，下次请求带上。
+
+        ⚠️ 抓包 2026-08-12 实证：
+            响应头: X-Rp-Sdtoken: set;1800;AAbEsBpEIOVjqTAKCQtvQu17TNqU7pH-3dnMLzjC_r_fWMMY3YMa0qp_8ydNTsT9FRysfnMmiaf4N7Pm9X4E5TTdwx7_B_iIb1_6e63AqHQtEO46p_GUm1lRA3L6NvdNEknl0d7Io82BvhgQmnwmip28LA8IpHz6tlaVRPtwlg_jB5bnmRMKgac
+            格式: set;<有效期秒数>;<令牌值>
+            有效: 30 分钟（1800 秒）
+
+        参数:
+            resp - requests.Response 对象
+        """
+        sdtoken_header = resp.headers.get("X-Rp-Sdtoken", "")
+        if not sdtoken_header:
+            return
+        parts = sdtoken_header.split(";", 2)
+        if len(parts) == 3 and parts[0] == "set":
+            try:
+                expire_seconds = int(parts[1])
+                import time as _time
+                self._rp_sdtoken = parts[2]
+                self._rp_sdtoken_expire_ts = _time.time() + expire_seconds
+            except (ValueError, IndexError):
+                pass
+
+    def _build_api_url(self, api_name: str) -> str:
+        """⚠️ 重写父类：项目16 api 路径前缀完全不同。
+
+        模板：https://sff.jd.com/api?v={VER}&appId={APP_ID}&api=dsm.seller.afs.bff.ExportDsmService.{api_name}
+        """
+        full_api = f"{self.API_PATH_PREFIX}.{api_name}"
+        return (
+            f"{self.BASE_URL}"
+            f"?v={self.API_VERSION}"
+            f"&appId={self.APP_ID}"
+            f"&api={full_api}"
+        )
+
+    def _post_dsm_after_sale(self, api_name: str, body: dict) -> dict:
+        """⚠️ 项目16 dsm POST（继承父类框架，新增 X-Rp-Sdtoken 动态注入）。
+
+        关键差异 vs 父类：
+            - 动态注入 X-Rp-Sdtoken 头（每次响应刷新，30 分钟有效）
+            - url 用项目16 的 appId + api 路径前缀
+            - 响应头解析 X-Rp-Sdtoken 后自动存到 self._rp_sdtoken
+            - 响应 data 可能是 bool（项目16 createExportTask 返回 data=true）—— 不报错
+        """
+        import time as _time
+        url = self._build_api_url(api_name)
+        headers = self._build_request_headers()
+
+        # 注入 X-Rp-Sdtoken（如果还有效）
+        if self._rp_sdtoken and self._rp_sdtoken_expire_ts > _time.time():
+            headers["X-Rp-Sdtoken"] = self._rp_sdtoken
+
+        print(f"🚀 [京麦售后明细] POST {url}")
+        print(f"   Body: {json.dumps(body, ensure_ascii=False)[:500]}{'...' if len(json.dumps(body, ensure_ascii=False)) > 500 else ''}")
+        print(f"   Headers(关键): dsm-eid={headers.get('dsm-eid','')[:30]}..., dsm-trace-id={headers.get('dsm-trace-id','')}, h5st={self.h5st[:30]}...（共 {len(self.h5st)} 字符）")
+        if "X-Rp-Sdtoken" in headers:
+            print(f"   X-Rp-Sdtoken: {headers['X-Rp-Sdtoken'][:30]}...（有效至 {_time.time() - self._rp_sdtoken_expire_ts:.0f}s 后）")
+
+        resp = self.session.post(url, headers=headers, json=body, timeout=60)
+        # ⚠️ 项目16 响应可能 code=200 但 data=true（不是 dict），不用 raise_for_status 用业务码判断
+        try:
+            ret = resp.json()
+        except Exception as e:
+            raise RuntimeError(
+                f"❌ 京麦售后 {api_name} 响应非 JSON：HTTP {resp.status_code}，"
+                f"响应片段={resp.text[:200]!r}"
+            ) from e
+
+        # 刷新 X-Rp-Sdtoken（从响应头）
+        self._refresh_rp_sdtoken_from_response(resp)
+
+        # 业务码判定（复用父类 _handle_response 框架）
+        self._handle_response_after_sale(ret, op_desc=api_name)
+        return ret
+
+    def _handle_response_after_sale(self, ret: dict, op_desc: str):
+        """⚠️ 项目16 响应处理（与父类 _handle_response 的关键差异）：
+            - data 字段是 bool（true/false），不强行访问 data.taskId 等子字段
+            - 任务 ID 在响应里**没有**，必须后续轮询拿
+        """
+        code = ret.get("code")
+        msg = str(ret.get("msg", ""))
+
+        # 1. code=200 + msg="成功" → 通过
+        if code == self.CODE_OK and ("成功" in msg or "success" in msg.lower()):
+            return ret
+
+        # 2. 风控 601
+        if code == self.CODE_RISK or any(k in msg for k in ("操作频繁", "限流", "risk")):
+            raise RiskControlError(
+                f"❌ 京麦售后 {op_desc} 触发 601 风控限流：code={code}, msg={msg}"
+            )
+
+        # 3. 201 = 单日次数超限
+        if code == self.CODE_DAILY_LIMIT:
+            raise RuntimeError(
+                f"❌ 京麦售后 {op_desc} 单日次数超限：code={code}, msg={msg}\n"
+                f"   → 等待 {self.EXPORT_INTERVAL_MIN // 60} 分钟后重试"
+            )
+
+        # 4. Cookie 过期
+        if code in (2001, 302) or any(k in msg for k in ("未登录", "登录已过期", "请重新登录")):
+            raise CookieExpiredError(
+                f"❌ 京麦售后 Cookie 过期（{op_desc}）：code={code}, msg={msg}\n"
+                f"   → 请浏览器登录 https://shop.jd.com/jdm/trade/after-sale/independent-after-sale/list，"
+                f"F12 抓 sff.jd.com 域 Cookie 写入 config/jm_cookie.txt"
+            )
+
+        # 5. 其它业务码
+        raise RuntimeError(
+            f"❌ 京麦售后 {op_desc} 业务失败：code={code}, msg={msg}, 完整响应={ret}"
+        )
 
     # ---- 业务硬性约束（项目16 待抓包实证，先沿用项目14 约束）----
     MAX_RANGE_DAYS = 31
@@ -7851,25 +8017,47 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
         start_date: str = None,
         end_date: str = None,
         date: str = None,
-        # ⚠️ 项目16 特有筛选参数（待真实抓包确认）----
-        after_sale_status_list: list = None,  # 售后状态列表（默认全选？）
-        sensitive_info_sign: str = "0",
-        export_task_type: int = 0,            # 待抓包确认（订单明细是 0，售后可能是 1/2/其他）
+        tab_code: str = "all",                          # ⚠️ 项目16 抓包实证 tabCode=all
+        after_sale_status_list: str = "",              # 售后状态列表（默认空 = 全部）
+        service_order_sub_state_list: str = "",        # 子状态列表（默认空）
+        customer_expect_list: str = "",                # 客户期望列表（默认空）
+        refund_status_list: str = "",                  # 退款状态列表（默认空）
+        transfer_feedback_reason_list: str = "",       # 转移反馈原因列表（默认空）
     ) -> dict:
-        """第 1 步：创建售后明细导出任务（项目16 阶段1，待真实抓包验证）。
+        """第 1 步：创建售后明细导出任务（项目16，2026-08-12 真实抓包适配）。
 
-        ⚠️ 与项目14 create_export_task 的关键差异（待抓包）：
-            - export_task_type：售后可能是 1/2 而不是 0
-            - taskDataParam 内是否含 after_sale_status_list 字段
-            - URL 完全相同：dsm.order.export.exportCenterService.createdExportTask
+        ⚠️ 2026-08-12 抓包实证：
+            URL: POST https://sff.jd.com/api?v=1.0&appId=BHPQ4MHJBUOQZKTFTRNS&api=dsm.seller.afs.bff.ExportDsmService.createExportTask
+            Body 结构:
+                {
+                    "request": {
+                        "data": {
+                            "exportType": 2602,           # 售后明细导出（固定）
+                            "param": "{<JSON 字符串>}"  # 13+ 个售后筛选字段
+                        }
+                    },
+                    "accessContext": {"source": "web"}
+                }
+            param 内容（JSON 字符串）：
+                {
+                    "applyTime": [dateBegin_ms, dateEnd_ms],
+                    "applyTimeRange": {"dateBegin": dateBegin_ms, "dateEnd": dateEnd_ms},
+                    "tabCode": "all",
+                    "serviceOrderSubStateList": "",
+                    "customerExpectList": "",
+                    "refundStatusList": "",
+                    "afsIdList": null,
+                    ...（其他 13 个售后筛选字段）
+                }
 
         返回:
-            dict - 项目14 同款返回（code/msg/dsm-trace-id），**不含 taskId**
+            dict - {"msg":"成功", "code":200, "data": true, "dsm-trace-id": "..."}
+            ⚠️ **响应 data 是 bool**（不是 taskId 对象），taskId 在轮询里拿
         """
         if not start_date and not date:
             raise ValueError("❌ 必须传入 start_date/end_date 或 date")
 
-        # 日期归一化（与项目14 完全相同）
+        # 日期归一化
         if date:
             start_date = date
             end_date = date
@@ -7877,30 +8065,62 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
             if not end_date:
                 end_date = start_date
 
-        # ⚠️ taskDataParam 结构待真实抓包确认（项目14 实证是 JSON 字符串）
-        import json as _json
-        task_data = {
-            "startDate": f"{start_date} 00:00:00",
-            "endDate": f"{end_date} 23:59:59",
-            "exportTaskType": export_task_type,
-            "skuId": None,
-            "warningType": None,
-            "locSkuId": None,
-            "sensitiveInfoSign": sensitive_info_sign,
-            "orderStatusList": [-1],   # ⚠️ 售后是否有 orderStatusList 还是 after_sale_status_list，待抓包确认
-            # ⚠️ 项目16 特有字段（待确认）：
-            # "afterSaleStatusList": after_sale_status_list or [-1],
-        }
-        body = {
-            "exportParam": {
-                "exportTaskType": export_task_type,
-                "taskDataParam": _json.dumps(task_data, separators=(",", ":")),  # JSON 字符串（项目14 实证）
-            }
+        # 毫秒时间戳
+        import time as _time_local
+        import datetime as _dt_local
+        begin_dt = _dt_local.datetime.strptime(start_date, "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = _dt_local.datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999000)
+        date_begin_ms = int(begin_dt.timestamp() * 1000)
+        date_end_ms = int(end_dt.timestamp() * 1000)
+
+        # ⚠️ 13 个售后筛选字段（2026-08-12 抓包实证）
+        #     全部默认空字符串 / null / 空 dict，意味「全部数据」
+        #     如果你想筛选特定状态，传入具体值
+        param_dict = {
+            "applyTime": [date_begin_ms, date_end_ms],
+            "applyTimeRange": {"dateBegin": date_begin_ms, "dateEnd": date_end_ms},
+            "tabCode": tab_code,
+            "serviceOrderSubStateList": service_order_sub_state_list,
+            "customerExpectList": customer_expect_list,
+            "refundStatusList": refund_status_list,
+            "afsIdList": None,
+            "transferFeedbackReasonList": transfer_feedback_reason_list,
+            "transferFeedbackTime": "",
+            "approveTime": "",
+            "addressList": "",
+            "waybillCodeList": None,
+            "deliveryWareStatusList": "",
+            "refundOperateTypeList": "",
+            "pickWareTypeList": "",
+            "returnWareStatus": "",
+            "processResultList": "",
+            "collectionStatus": "",
+            "tagList": "",
+            "remarkLevelList": "",
+            "orderTypeList": "",
+            "followTypePin": "",
+            "wareInfo": None,
+            "transferFeedbackTimeRange": {},
+            "approveTimeRange": {},
         }
 
-        print(f"📝 [京麦售后明细] 第 1 步：创建导出任务 {start_date} ~ {end_date}（共 1 天）")
-        ret = self._post_dsm("createdExportTask", body)
-        print(f"✅ [京麦售后明细] 创建任务响应：code={ret.get('code')}, msg={ret.get('msg')!r}")
+        # ⚠️ 项目16 真实 payload 嵌套（与项目14 完全不同）
+        body = {
+            "request": {
+                "data": {
+                    "exportType": self.EXPORT_TYPE_AFTER_SALE_DETAIL,  # 2602
+                    "param": json.dumps(param_dict, separators=(",", ":")),
+                }
+            },
+            "accessContext": {"source": "web"},
+        }
+
+        print(f"📝 [京麦售后明细] 第 1 步：创建导出任务 {start_date} ~ {end_date}")
+        print(f"   exportType: {self.EXPORT_TYPE_AFTER_SALE_DETAIL}, tabCode: {tab_code}")
+        print(f"   时间范围: {date_begin_ms} ~ {date_end_ms}（毫秒）")
+        ret = self._post_dsm_after_sale("createExportTask", body)
+        print(f"✅ [京麦售后明细] 创建任务响应：code={ret.get('code')}, msg={ret.get('msg')!r}, data={ret.get('data')!r}")
+        print(f"   X-Rp-Sdtoken 已刷新（30 分钟有效）")
         return ret
 
     def wait_for_after_sale_task_ready(
@@ -7910,87 +8130,103 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
         poll_interval: int = 3,
         max_poll_times: int = 20,
     ) -> dict:
-        """第 2 步：轮询售后任务状态（项目16 阶段2，待真实抓包验证）。
+        """第 2 步：轮询售后任务状态（项目16，**待你提供轮询抓包**）。
 
-        ⚠️ 与项目14 wait_for_task_ready 的关键差异：
-            - 项目16 文档说 status 字段名（不是 taskStatus）
-            - 项目16 文档说状态枚举 1=生成中、2=成功、3=失败
-            - 项目14 项目16 是否在 itemList 字段返回（项目14 是 itemList）待抓包确认
+        ⚠️ 你目前只发了创建任务抓包，轮询接口的接口名 + payload + 响应结构都还不知道。
+        我先按项目14 模式占位，等你发轮询抓包后再适配。
 
-        返回:
-            dict - 命中任务记录（含 id 即 taskId、status、taskData 等）
+        ⚠️ 项目16 与项目14 的差异（待验证）：
+            - 接口名可能不同（项目14 是 queryExportTaskInfo，项目16 可能是 queryExportTaskInfo / queryTaskStatus / 其他）
+            - payload 结构不同（项目16 是 {"request":{"data":{...}}} 嵌套）
+            - 响应字段路径不同（项目16 任务状态可能在 data.taskList / data.list / data 等不同位置）
+            - 状态枚举：项目16 文档说 1=生成中 / 2=成功 / 3=失败（项目14 是 taskStatus 0/1/2）
         """
-        import time as _time
+        import time as _time_local
+        import datetime as _dt_local
 
+        # 毫秒时间戳
+        begin_dt = _dt_local.datetime.strptime(start_date, "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = _dt_local.datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999000)
+        date_begin_ms = int(begin_dt.timestamp() * 1000)
+        date_end_ms = int(end_dt.timestamp() * 1000)
+
+        # ⚠️ 占位 payload（待你提供真实轮询抓包后调整）
         body = {
-            "exportParam": {
-                "exportTaskType": 0,  # ⚠️ 待抓包确认：是否仍用 0？
-                "page": 1,
-                "pageSize": 10,
-            }
+            "request": {
+                "data": {
+                    "exportType": self.EXPORT_TYPE_AFTER_SALE_DETAIL,
+                    "applyTimeRange": {"dateBegin": date_begin_ms, "dateEnd": date_end_ms},
+                    "tabCode": "all",
+                    "page": 1,
+                    "pageSize": 10,
+                    # ⚠️ 待你提供轮询抓包后，补充其他筛选字段
+                }
+            },
+            "accessContext": {"source": "web"},
         }
 
         print(
-            f"⏳ [京麦售后明细] 轮询任务：start={start_date} 00:00:00 ~ end={end_date} 23:59:59，"
+            f"⏳ [京麦售后明细] 轮询任务：start={start_date} ~ end={end_date}，"
             f"间隔 {poll_interval}s × 上限 {max_poll_times} 次（最多 {poll_interval * max_poll_times}s）"
         )
+        print(f"   ⚠️ 轮询接口 payload 是占位，待你提供真实抓包后调整")
         deadline_ts = _time.time() + poll_interval * max_poll_times
         attempt = 0
 
         while _time.time() < deadline_ts:
             attempt += 1
-            ret = self._post_dsm("queryExportTaskInfo", body)
+            # ⚠️ 接口名占位：项目14 是 queryExportTaskInfo，项目16 待你确认
+            ret = self._post_dsm_after_sale("queryExportTaskInfo", body)
 
-            # ⚠️ 项目14 用 itemList，项目16 是否相同待抓包确认
+            # ⚠️ 响应字段路径占位（项目16 不知道 data 下面是什么结构）
             data = ret.get("data", {})
             if isinstance(data, dict):
-                item_list = data.get("itemList", [])
+                # 尝试多种可能：data.taskList / data.list / data.items
+                item_list = (
+                    data.get("taskList")
+                    or data.get("list")
+                    or data.get("items")
+                    or data.get("itemList", [])
+                )
             elif isinstance(data, list):
                 item_list = data
             else:
                 item_list = []
 
-            # ⚠️ 项目16 文档说用 startDate/endDate 匹配，项目14 用 taskData.startTime/endTime，待确认字段路径
+            # ⚠️ 时间戳匹配逻辑占位
             target_item = None
             for item in item_list:
-                # ⚠️ 项目16 可能字段路径（待真实抓包）：
-                #   task_data = item.get("taskData", {})
-                #   item_start = task_data.get("startTime") or task_data.get("startDate")
-                #   item_end = task_data.get("endTime") or task_data.get("endDate")
-                #   if item_start == f"{start_date} 00:00:00" and item_end == f"{end_date} 23:59:59":
-                #       target_item = item
-                #       break
-                # 当前用项目14 字段路径（占位）
-                task_data = item.get("taskData", {})
-                item_start = task_data.get("startTime")
-                item_end = task_data.get("endTime")
-                if item_start == f"{start_date} 00:00:00" and item_end == f"{end_date} 23:59:59":
-                    target_item = item
-                    break
+                # 项目16 用毫秒时间戳匹配（applyTime[0]/[1]）
+                if isinstance(item, dict):
+                    item_time = item.get("applyTime") or item.get("createTime")
+                    if isinstance(item_time, list) and len(item_time) >= 2:
+                        if item_time[0] == date_begin_ms and item_time[1] == date_end_ms:
+                            target_item = item
+                            break
 
             if not target_item:
                 print(f"  [{attempt}/{max_poll_times}] 暂未命中目标任务（item_list 共 {len(item_list)} 条）")
                 _time.sleep(poll_interval)
                 continue
 
-            # ⚠️ 项目16 文档说用 status 字段（不是 taskStatus）
+            # ⚠️ 状态字段名占位（项目16 文档说 status，父类用 taskStatus）
             status = target_item.get("status") or target_item.get("taskStatus")
 
-            if status == self.TASK_STATUS_SUCCESS:  # 2=成功
+            if status == self.TASK_STATUS_SUCCESS:
                 print(
-                    f"✅ [京麦售后明细] 轮询命中：taskId={target_item.get('id')}, status={status}"
+                    f"✅ [京麦售后明细] 轮询命中：taskId={target_item.get('id') or target_item.get('taskId')}, status={status}"
                 )
                 return target_item
-            elif status == self.TASK_STATUS_GENERATING:  # 1=生成中
+            elif status == self.TASK_STATUS_GENERATING:
                 print(
-                    f"  [{attempt}/{max_poll_times}] 任务生成中：taskId={target_item.get('id')}, "
+                    f"  [{attempt}/{max_poll_times}] 任务生成中：taskId={target_item.get('id') or target_item.get('taskId')}, "
                     f"status={status}（{poll_interval}s 后重试）"
                 )
                 _time.sleep(poll_interval)
                 continue
-            elif status == self.TASK_STATUS_FAIL:  # 3=失败
+            elif status == self.TASK_STATUS_FAIL:
                 raise RuntimeError(
-                    f"❌ 京麦售后明细任务失败：taskId={target_item.get('id')}, status={status}"
+                    f"❌ 京麦售后明细任务失败：taskId={target_item.get('id') or target_item.get('taskId')}, status={status}"
                 )
             else:
                 print(f"  [{attempt}/{max_poll_times}] 任务状态未知：{status}（继续等）")
@@ -8047,69 +8283,51 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
         start_date: str = None,
         end_date: str = None,
         date: str = None,
-        # ⚠️ 项目16 特有参数（待真实抓包确认）----
-        after_sale_status_list: list = None,
-        sensitive_info_sign: str = "0",
-        export_task_type: int = 0,        # ⚠️ 待抓包确认
+        # ⚠️ 项目16 特有参数（2026-08-12 抓包实证）----
+        tab_code: str = "all",
+        after_sale_status_list: str = "",
+        service_order_sub_state_list: str = "",
+        customer_expect_list: str = "",
+        refund_status_list: str = "",
+        transfer_feedback_reason_list: str = "",
         poll_interval: int = 3,
         max_poll_times: int = 20,
     ) -> dict:
         """完整 4 步一键：创建 + 轮询 + 下载 + 解压（项目16，**无短信、无 IMAP**）。
 
+        ⚠️ 2026-08-12 真实抓包适配：
+            - 创建走 createExportTask（项目16 api）
+            - 轮询走 queryExportTaskInfo（**待你提供轮询抓包**）
+            - 下载走（**待你提供下载抓包**）
+            - 解压无密码（password=None 跳过 msoffcrypto）
+
         ⚠️ 与项目14 run_full_export 的关键差异：
             - 4 步（项目14 是 5 步：多了短信申请 + IMAP）
-            - 不需要 IMAP 授权码（QQ 邮箱 IMAP 与售后业务无关）
-            - 不调用 request_export_password（售后 zip 无密码）
+            - 不需要 IMAP 授权码
+            - 不调用 request_export_password
+            - appId / api 路径 / payload 结构 / 时间格式（毫秒）都不同
+            - 需要 X-Rp-Sdtoken 动态令牌（_post_dsm_after_sale 自动处理）
 
         返回:
             dict - 含 taskId / zip_path / xlsx_path
         """
-        # ⚠️ 项目14 vs 项目16 export_task_type 不同（待抓包确认）
-        #     项目14 默认 0
-        #     项目16 可能是 1/2/其他
-        #     当前默认 0（与项目14 一致），等你抓包后调整
-        actual_type = export_task_type
-        # ⚠️ 项目14 创建任务时用的是传入的 export_task_type；项目16 也是同一个
-        #     但项目14 _post_dsm 内部会把 export_task_type 写进 payload
-        #     这里直接复用父类流程
-
-        # 第 1+2 步：创建+轮询
-        # ⚠️ 项目16 用什么创建/轮询接口名字？项目14 是 createdExportTask + queryExportTaskInfo
-        #     用户文档也说 createdExportTask + queryExportTaskInfo → **接口相同**
-        #     但 export_task_type 可能不同（项目14=0，项目16=待抓包确认）
         print("=" * 70)
-        print(f"🚀 [京麦售后明细] 完整 4 步一键（{date or f'{start_date}'}）")
+        print(f"🚀 [京麦售后明细] 完整 4 步一键（{date or start_date}）")
+        print(f"   exportType: {self.EXPORT_TYPE_AFTER_SALE_DETAIL} | tabCode: {tab_code}")
         print("=" * 70)
 
-        # 复用父类 _post_dsm 创建（payload 用项目16 参数）
-        # ⚠️ 这里直接调父类 create_export_task（等真实抓包后再单独写项目16 创建方法）
-        #     如果 export_task_type 不同，需要重写 payload
-        #     当前临时复用父类，待验证后调整
-        import json as _json_local
-        _resolved_date = date or start_date
-        _resolved_end = date or end_date
-        _task_data_local = {
-            "startDate": f"{_resolved_date} 00:00:00",
-            "endDate": f"{_resolved_end} 23:59:59",
-            "exportTaskType": export_task_type,
-            "skuId": None,
-            "warningType": None,
-            "locSkuId": None,
-            "sensitiveInfoSign": sensitive_info_sign,
-            "orderStatusList": [-1],
-        }
-        create_ret = self._post_dsm(
-            "createdExportTask",
-            {
-                "exportParam": {
-                    "exportTaskType": export_task_type,
-                    "taskDataParam": _json_local.dumps(
-                        _task_data_local, separators=(",", ":")
-                    ),
-                }
-            },
+        # 第 1 步：创建
+        create_ret = self.create_after_sale_export_task(
+            start_date=start_date,
+            end_date=end_date,
+            date=date,
+            tab_code=tab_code,
+            after_sale_status_list=after_sale_status_list,
+            service_order_sub_state_list=service_order_sub_state_list,
+            customer_expect_list=customer_expect_list,
+            refund_status_list=refund_status_list,
+            transfer_feedback_reason_list=transfer_feedback_reason_list,
         )
-        print(f"   第 1 步响应：code={create_ret.get('code')}")
 
         # 第 2 步：轮询
         item = self.wait_for_after_sale_task_ready(
@@ -8118,28 +8336,31 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
             poll_interval=poll_interval,
             max_poll_times=max_poll_times,
         )
-        task_id = item.get("id")
+        task_id = item.get("id") or item.get("taskId")
+        if not task_id:
+            raise RuntimeError(
+                f"❌ 京麦售后明细轮询命中但无 taskId：{item}\n"
+                f"   → 请检查轮询响应里任务记录的 ID 字段路径"
+            )
 
-        # 第 3 步：下载 zip（GET 仅 Cookie，无密码）
+        # 第 3 步：下载 zip（**待你提供下载抓包后适配**）
         print(f"📥 [京麦售后明细] 第 3 步：下载 zip taskId={task_id}")
-        zip_bytes, filename = self.download_after_sale_zip(task_id)
-        zip_path = self.save_encrypted_zip(zip_bytes, filename)
+        print(f"   ⚠️ 下载接口尚未适配（待你提供下载抓包）")
+        print(f"   临时返回：未下载")
+        # ⚠️ 占位：等下载抓包后改为：
+        #   zip_bytes, filename = self.download_after_sale_zip(task_id)
+        #   zip_path = self.save_encrypted_zip(zip_bytes, filename)
+        zip_path = None
 
-        # 第 4 步：解压（password=None，售后无密码）
-        print(f"📂 [京麦售后明细] 第 4 步：解压 zip（无密码）")
-        xlsx_path = self.extract_xlsx_from_after_sale_zip(
-            zip_path=zip_path,
-            output_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "京麦售后明细"),
-            date=date or start_date,
-        )
-
-        # ⚠️ 中间 zip 删除逻辑：项目16 是否也删？等真实数据验证后再决定
-        #     项目14 删除中间 zip 是因为 zip 是密码加密的（敏感），售后无密码可能不删
-        # try:
-        #     os.remove(zip_path)
-        #     print(f"   🗑️  中间 zip 已删除：{zip_path}")
-        # except OSError:
-        #     pass
+        # 第 4 步：解压（占位，等下载有数据后启用）
+        xlsx_path = None
+        if zip_path and os.path.isfile(zip_path):
+            print(f"📂 [京麦售后明细] 第 4 步：解压 zip（无密码）")
+            xlsx_path = self.extract_xlsx_from_after_sale_zip(
+                zip_path=zip_path,
+                output_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "京麦售后明细"),
+                date=date or start_date,
+            )
 
         return {
             "code": self.CODE_OK,
@@ -8349,14 +8570,16 @@ def _run_jm_after_sale_full(**kwargs) -> dict:
         raise ValueError(
             "❌ 京麦售后明细_完整一键导出 必须传 h5st\n"
             "   → 浏览器F12抓 createdExportTask 请求头 h5st 复制传入\n"
-            "   ⚠️ 项目16 h5st 待真实抓包确认是否必须"
+            "   ⚠️ 项目16 h5st 抓包实证是必需的（与项目14 一致）"
         )
 
     cookie_path = kwargs.get("cookie_path", "config/jm_cookie.txt")
     forward_kwargs = {
         k: kwargs[k] for k in (
             "start_date", "end_date", "date",
-            "after_sale_status_list", "sensitive_info_sign", "export_task_type",
+            "tab_code", "after_sale_status_list",
+            "service_order_sub_state_list", "customer_expect_list",
+            "refund_status_list", "transfer_feedback_reason_list",
             "poll_interval", "max_poll_times",
         )
         if k in kwargs
