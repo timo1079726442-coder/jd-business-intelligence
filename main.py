@@ -8274,22 +8274,105 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
         )
 
     def download_after_sale_zip(self, task_id: str) -> tuple:
-        """第 3 步：下载售后明细 zip（项目16 阶段3，待真实抓包验证）。
+        """第 3 步：下载售后明细 zip（项目16，2026-08-12 真实抓包适配）。
 
-        ⚠️ 与项目14 download_encrypted_zip 完全相同：
-            - URL：https://export.shop.jd.com/exportCenter/export.action?taskId={task_id}
-            - 鉴权：仅 Cookie + Referer（**不要 dsm-* 头、不要 h5st、不要 X-Rp-Client**）
-            - 响应：application/octet-stream，文件名 `<taskId>.zip`
+        ⚠️ 2026-08-12 抓包实证：
+            URL: GET https://export.shop.jd.com/exportCenter/export.action?taskId={task_id}
+            鉴权: **仅 Cookie**（**不要 dsm-* 头、不要 h5st、不要 X-Rp-Client**）
+            Referer: after-sale/independent-after-sale/list?tabCode=all（项目14 是 ExprotList）
+            Accept: text/html,application/xhtml+xml,application/xml,...（完整浏览器 Accept）
+            Sec-Fetch-Dest: document | Sec-Fetch-Mode: navigate | Sec-Fetch-Site: same-site
+            Sec-Fetch-User: ?1 | Upgrade-Insecure-Requests: 1
+            User-Agent: Chrome/144.0.0.0 Edg/144.0.0.0（与项目14 一致）
+            响应: application/octet-stream，Content-Disposition: filename="<taskId>.zip"
+            响应 Content-Length 5020 字节（项目16 抓包），典型大小（项目14 是 6540 字节）
 
-        ⚠️ 项目16 zip 无密码：
-            - 内部仍是 xlsx（OLE2 头是加密容器的"假象"——项目14 实证）
-            - 也可能是 xls（不加密 OLE2）—— 待真实数据验证
+        ⚠️ 与父类 download_encrypted_zip 的关键差异：
+            - **Referer 必须改为售后页面**（否则会被风控拦截）
+            - Accept 头需要更完整（浏览器默认值）
+            - Sec-Fetch-* 头要齐（模拟浏览器导航行为）
+            - X-Rp-Sdtoken / dsm-* 头 **不能带**（与项目14 一致）
+
+        ⚠️ 项目16 zip 无密码（实证！）：
+            - 5020 字节提示：可能是「带表头/表尾但无数据的售后明细 xlsx」
+            - 也可能是「正常大小的数据表」
+            - 反正不需要 msoffcrypto 解密（不像项目14 有密码）
 
         返回:
             tuple - (zip_bytes, filename)
         """
-        # ⚠️ 父类 download_encrypted_zip 完全可用（GET 接口只看 Cookie）
-        return self.download_encrypted_zip(task_id)
+        import requests as _requests
+
+        url = f"https://export.shop.jd.com/exportCenter/export.action?taskId={task_id}"
+
+        # ⚠️ 售后业务专属 Referer（项目14 是 ExprotList）
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Connection": "keep-alive",
+            "Cookie": self.cookie,
+            "Host": "export.shop.jd.com",
+            "Referer": self.REFERER,  # 售后页面 URL（不是 ExprotList）
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-site",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+            "User-Agent": self.USER_AGENT,
+            # ⚠️ 关键：不要带 X-Rp-Sdtoken / dsm-* 头 / h5st / X-Rp-Client
+        }
+
+        print(f"📥 [京麦售后明细] 第 3 步：下载 zip taskId={task_id}")
+        print(f"   URL: {url}")
+        print(f"   鉴权：仅 Cookie（不要 dsm-* 头、不要 h5st）")
+        print(f"   Referer: {self.REFERER}")
+
+        try:
+            resp = self.session.get(url, headers=headers, timeout=60, allow_redirects=True)
+        except _requests.exceptions.RequestException as e:
+            raise RuntimeError(f"❌ 京麦售后明细下载失败：{e}") from e
+
+        # 状态码判定
+        if resp.status_code == 401 or resp.status_code == 302:
+            raise CookieExpiredError(
+                f"❌ 京麦售后 Cookie 过期（下载返回 HTTP {resp.status_code}）\n"
+                f"   → 请浏览器重新登录 https://shop.jd.com/jdm/trade/after-sale/independent-after-sale/list，"
+                f"F12 抓 export.shop.jd.com 域 Cookie 写入 config/jm_cookie.txt"
+            )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"❌ 京麦售后明细下载 HTTP {resp.status_code}：{resp.text[:200]!r}"
+            )
+
+        zip_bytes = resp.content
+
+        # 文件大小校验
+        if len(zip_bytes) < 1024:
+            raise RuntimeError(
+                f"❌ 下载的 zip 太小（{len(zip_bytes)} 字节），可能任务未完成或已过期"
+            )
+
+        # 魔数校验：zip 是 PK\x03\x04
+        if not zip_bytes.startswith(b"PK\x03\x04"):
+            raise RuntimeError(
+                f"❌ 下载内容不是 zip（magic bytes={zip_bytes[:8].hex()}）\n"
+                f"   响应片段: {zip_bytes[:200]!r}"
+            )
+
+        # 提取文件名（Content-Disposition: form-data; name="attachment"; filename="xxx.zip"）
+        cd = resp.headers.get("Content-Disposition", "")
+        filename = f"{task_id}.zip"  # 兜底
+        import re as _re
+        m = _re.search(r'filename="([^"]+)"', cd)
+        if m:
+            filename = m.group(1)
+
+        print(
+            f"✅ [京麦售后明细] 下载成功：{filename}（{len(zip_bytes)} 字节，"
+            f"Content-Type={resp.headers.get('Content-Type', 'unknown')!r}）"
+        )
+        return zip_bytes, filename
 
     def extract_xlsx_from_after_sale_zip(
         self,
@@ -8297,23 +8380,105 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
         output_dir: str = None,
         date: str = None,
     ) -> str:
-        """第 4 步：解压售后 zip（项目16 阶段4，**无密码**）。
+        """第 4 步：解压售后 zip（项目16，**无密码**——绕过 msoffcrypto 直接解压）。
 
-        ⚠️ 与项目14 extract_xlsx_from_zip 的关键差异：
-            - password=None：父类会自动跳过 msoffcrypto 双层解密
-            - 只解压不加密的 zip（直接 zipfile.ZipFile.read()）
+        ⚠️ 与项目14 extract_xlsx_from_zip 的关键差异（2026-08-12 抓包实证）：
+            - 项目16 zip **无密码**：不调用 msoffcrypto
+            - 项目14 zip **有密码**：要先 zipfile 解压（带密码）+ msoffcrypto 二次解密
+            - 本方法**直接 zipfile 解压**，不解密（售后是普通 zip）
+
+        ⚠️ 5020 字节小文件处理：
+            - 如果内部 xlsx 是空表（5020 字节常见值）→ 仍正常保存空表
+            - 如果内部 xlsx 文件损坏 → 抛出 RuntimeError
 
         返回:
             str - 解压后 xlsx 的绝对路径
         """
-        # ⚠️ 父类 extract_xlsx_from_zip 已支持 password=None 路径
-        #    父类方法里有 msoffcrypto 双层解密分支，password=None 时会走 raw 解压分支
-        return self.extract_xlsx_from_zip(
-            zip_path=zip_path,
-            password=None,           # 售后无密码
-            output_dir=output_dir,
-            date=date,
+        import zipfile
+
+        if not os.path.isfile(zip_path):
+            raise RuntimeError(f"❌ zip 文件不存在：{zip_path}")
+
+        # 输出目录：output/京麦售后明细/{date}/订单明细_{date}.xlsx
+        # ⚠️ 项目14 用的"订单明细_{date}.xlsx"是订单明细的命名
+        #     项目16 应该是"售后明细_{date}.xlsx"（保持命名一致）
+        if output_dir is None:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            output_dir = os.path.join(base_dir, "output", "京麦售后明细")
+        os.makedirs(output_dir, exist_ok=True)
+
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                # 找第一个 .xlsx 或 .xls 条目
+                candidate_names = [n for n in zf.namelist() if n.lower().endswith((".xlsx", ".xls"))]
+                if not candidate_names:
+                    raise RuntimeError(
+                        f"❌ zip 内未找到 .xlsx/.xls 条目：{zip_path}\n"
+                        f"   zip 内文件列表：{zf.namelist()}"
+                    )
+                target_name = candidate_names[0]
+                print(
+                    f"📂 [京麦售后明细] 第 4 步：解压 zip\n"
+                    f"   源: {zip_path}\n"
+                    f"   密码: 无（项目16 zip 不加密）\n"
+                    f"   目标条目: {target_name}"
+                )
+                # ⚠️ 无密码直接读
+                extracted_bytes = zf.read(target_name)
+        except zipfile.BadZipFile as e:
+            raise RuntimeError(f"❌ zip 文件损坏或不是有效 zip：{e}") from e
+
+        # ⚠️ 项目16 zip 无密码，**直接读** xlsx（不走 msoffcrypto）
+        #     通用工具 read_excel_bytes 按 magic bytes 自动选引擎
+        try:
+            df = read_excel_bytes(extracted_bytes)
+            print(f"   ├─ 主表: {len(df)} 行 × {len(df.columns)} 列")
+            if not df.empty:
+                print(f"   ├─ 列名（前 8 列）: {list(df.columns[:8])}{'...' if len(df.columns) > 8 else ''}")
+        except Exception as e:
+            raise RuntimeError(
+                f"❌ 解压后文件读取失败：{e}\n"
+                f"   前 16 字节: {extracted_bytes[:16].hex()}"
+            ) from e
+
+        # Excel 后置统一规则
+        if date:
+            date_column, date_value = prepare_date_columns(df, date)
+        else:
+            date_column, date_value = None, None
+
+        df = safe_convert_numeric(df)
+
+        # 输出路径：output/京麦售后明细/{date}/售后明细_{date}.xlsx
+        if date is None:
+            import datetime as _dt
+            date = _dt.datetime.fromtimestamp(os.path.getmtime(zip_path)).strftime("%Y-%m-%d")
+
+        date_subdir = os.path.join(output_dir, date)
+        os.makedirs(date_subdir, exist_ok=True)
+        save_filename = f"售后明细_{date}.xlsx"
+        target_xlsx = os.path.join(date_subdir, save_filename)
+
+        df.to_excel(target_xlsx, index=False, engine="openpyxl")
+        if date_column:
+            apply_column_formats(target_xlsx, df, date_column=date_column, date_value=date_value)
+        else:
+            apply_column_formats(target_xlsx, df)
+
+        print(
+            f"✅ [京麦售后明细] 解压+转存成功：{target_xlsx}（{os.path.getsize(target_xlsx)} 字节，"
+            f"{len(df)}行 × {len(df.columns)}列）"
         )
+
+        # ⚠️ 用户决策 2026-08-11：删除中间 zip（只留解密后 xlsx）
+        #     即使项目16 无密码，也按项目14 策略统一删中间 zip
+        try:
+            os.remove(zip_path)
+            print(f"🗑️  [京麦售后明细] 中间 zip 已删除：{zip_path}")
+        except OSError as e:
+            print(f"⚠️ [京麦售后明细] 中间 zip 删除失败（不影响主流程）：{e}")
+
+        return target_xlsx
 
     def run_after_sale_full_export(
         self,
@@ -8381,24 +8546,18 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
                 f"   → 请检查轮询响应里任务记录的 taskId 字段路径"
             )
 
-        # 第 3 步：下载 zip（**待你提供下载抓包后适配**）
+        # 第 3 步：下载 zip（2026-08-12 真实抓包适配）
         print(f"📥 [京麦售后明细] 第 3 步：下载 zip taskId={task_id}")
-        print(f"   ⚠️ 下载接口尚未适配（待你提供下载抓包）")
-        print(f"   临时返回：未下载")
-        # ⚠️ 占位：等下载抓包后改为：
-        #   zip_bytes, filename = self.download_after_sale_zip(task_id)
-        #   zip_path = self.save_encrypted_zip(zip_bytes, filename)
-        zip_path = None
+        zip_bytes, filename = self.download_after_sale_zip(task_id)
+        zip_path = self.save_encrypted_zip(zip_bytes, filename)
 
-        # 第 4 步：解压（占位，等下载有数据后启用）
-        xlsx_path = None
-        if zip_path and os.path.isfile(zip_path):
-            print(f"📂 [京麦售后明细] 第 4 步：解压 zip（无密码）")
-            xlsx_path = self.extract_xlsx_from_after_sale_zip(
-                zip_path=zip_path,
-                output_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "京麦售后明细"),
-                date=date or start_date,
-            )
+        # 第 4 步：解压（无密码，售后业务无密码）
+        print(f"📂 [京麦售后明细] 第 4 步：解压 zip（无密码）")
+        xlsx_path = self.extract_xlsx_from_after_sale_zip(
+            zip_path=zip_path,
+            output_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "京麦售后明细"),
+            date=date or start_date,
+        )
 
         return {
             "code": self.CODE_OK,
