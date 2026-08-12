@@ -4038,14 +4038,17 @@ BUSINESS_REGISTRY = {
     },
     # 业务：京麦售后明细 - 完整4步一键（创建+轮询+下载+解压，**无短信无IMAP**，2026-08-11）
     #   ⚠️ 项目16 真实抓包确认（2026-08-12 用户提供 HTTP 报文）：
-    #     - api 路径：dsm.seller.afs.bff.ExportDsmService.createExportTask（项目14 不同！）
-    #     - appId：BHPQ4MHJBUOQZKTFTRNS（项目14 CQLEJWPYPFOVQBC8UFLQ 不同！）
-    #     - payload 嵌套：{"request":{"data":{"exportType":2602,"param":"<JSON>"}}, "accessContext":{"source":"web"}}
-    #     - 时间格式：毫秒时间戳（项目14 是 "YYYY-MM-DD HH:MM:SS"）
-    #     - exportType: 2602（固定）
-    #     - 响应 data 是 bool 不是 dict
-    #     - 响应头 X-Rp-Sdtoken 30 分钟有效，下次请求带上
-    #     - 请求头多一个 dsm-file-path: lineation-price
+    #     创建任务: api 路径 dsm.seller.afs.bff.ExportDsmService.createExportTask
+    #     轮询: api 路径 dsm.seller.afs.bff.ExportDsmService.getExportTaskPage（不是项目14 的 queryExportTaskInfo）
+    #     appId：BHPQ4MHJBUOQZKTFTRNS（项目14 CQLEJWPYPFOVQBC8UFLQ 不同！）
+    #     payload 嵌套：{"request":{"data":{...}}, "accessContext":{"source":"web"}}
+    #     创建时间格式：毫秒时间戳（项目14 是 "YYYY-MM-DD HH:MM:SS"）
+    #     exportType: 2602（创建），轮询时是 [2602,2601,38] 列表
+    #     创建响应 data 是 bool；轮询响应 data.content[] 是对象列表
+    #     创建响应头 X-Rp-Sdtoken 30 分钟有效，下次请求带上
+    #     请求头多一个 dsm-file-path: lineation-price
+    #     状态枚举（你文档一致）：exportStatusCode 1=生成中/2=成功/3=失败
+    #     匹配策略：exportTypeCode + exportCondition 文本（含"申请时间：YYYY-MM-DD至YYYY-MM-DD"）
     #   鉴权 2 次切换：sff.jd.com dsm/h5st/X-Rp-Sdtoken → export.shop.jd.com 仅Cookie（待下载抓包）
     "京麦售后明细_完整一键导出": {
         "api_class": None,
@@ -8130,36 +8133,61 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
         poll_interval: int = 3,
         max_poll_times: int = 20,
     ) -> dict:
-        """第 2 步：轮询售后任务状态（项目16，**待你提供轮询抓包**）。
+        """第 2 步：轮询售后任务状态（项目16，2026-08-12 真实抓包适配）。
 
-        ⚠️ 你目前只发了创建任务抓包，轮询接口的接口名 + payload + 响应结构都还不知道。
-        我先按项目14 模式占位，等你发轮询抓包后再适配。
+        ⚠️ 2026-08-12 抓包实证：
+            URL: POST .../api?api=dsm.seller.afs.bff.ExportDsmService.getExportTaskPage
+            Body: {"request":{"data":{"pageIndex":1,"pageSize":10,"exportType":[2602,2601,38]}}, "accessContext":{"source":"web"}}
+            响应:
+                {
+                    "msg":"成功","code":200,
+                    "data":{
+                        "totalNum":"41", "pageIndex":1, "pageSize":10,
+                        "content":[
+                            {
+                                "exportStatus":"已完成",
+                                "exportType":"售后(新)",
+                                "exportTypeCode":2602,
+                                "exportCondition":"tab页签：全部\\n申请时间：2026-08-06至2026-08-06",
+                                "taskId":"105884767567",
+                                "exportStatusCode":2,
+                                "createDate":"2026-08-12 14:35:37"
+                            },
+                            ...
+                        ]
+                    }
+                }
 
-        ⚠️ 项目16 与项目14 的差异（待验证）：
-            - 接口名可能不同（项目14 是 queryExportTaskInfo，项目16 可能是 queryExportTaskInfo / queryTaskStatus / 其他）
-            - payload 结构不同（项目16 是 {"request":{"data":{...}}} 嵌套）
-            - 响应字段路径不同（项目16 任务状态可能在 data.taskList / data.list / data 等不同位置）
-            - 状态枚举：项目16 文档说 1=生成中 / 2=成功 / 3=失败（项目14 是 taskStatus 0/1/2）
+        ⚠️ 与项目14 wait_for_task_ready 的关键差异：
+            - 接口名：queryExportTaskInfo → **getExportTaskPage**
+            - 响应字段路径：data.itemList[] → **data.content[]**
+            - payload 不带 applyTimeRange/tabCode（只带 pageIndex/pageSize/exportType）
+            - 状态字段：taskStatus → **exportStatusCode**（1=生成中/2=成功/3=失败）
+            - exportType 是 **列表** [2602,2601,38] 而非单值
+            - 任务 ID 字段：id → **taskId**
+
+        ⚠️ 匹配策略（基于 exportCondition 文本匹配）：
+            exportCondition 格式："tab页签：全部\\n申请时间：2026-08-06至2026-08-06"
+            用 createDate 时间字符串粗匹配（毫秒精度太低不好匹配）
+
+        返回:
+            dict - 命中任务记录（含 taskId / exportStatusCode / exportTypeCode 等）
         """
         import time as _time_local
         import datetime as _dt_local
 
-        # 毫秒时间戳
-        begin_dt = _dt_local.datetime.strptime(start_date, "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
-        end_dt = _dt_local.datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999000)
-        date_begin_ms = int(begin_dt.timestamp() * 1000)
-        date_end_ms = int(end_dt.timestamp() * 1000)
-
-        # ⚠️ 占位 payload（待你提供真实轮询抓包后调整）
+        # ⚠️ 项目16 真实 payload（2026-08-12 抓包实证）：
+        #     pageIndex / pageSize / exportType（**列表**，同时查 3 类业务）
         body = {
             "request": {
                 "data": {
-                    "exportType": self.EXPORT_TYPE_AFTER_SALE_DETAIL,
-                    "applyTimeRange": {"dateBegin": date_begin_ms, "dateEnd": date_end_ms},
-                    "tabCode": "all",
-                    "page": 1,
+                    "pageIndex": 1,
                     "pageSize": 10,
-                    # ⚠️ 待你提供轮询抓包后，补充其他筛选字段
+                    "exportType": [
+                        self.EXPORT_TYPE_AFTER_SALE_DETAIL,  # 2602 售后(新)
+                        2601,                                  # 售后(老)
+                        38,                                    # 待你确认（可能是另一种业务类型）
+                    ],
                 }
             },
             "accessContext": {"source": "web"},
@@ -8169,67 +8197,76 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
             f"⏳ [京麦售后明细] 轮询任务：start={start_date} ~ end={end_date}，"
             f"间隔 {poll_interval}s × 上限 {max_poll_times} 次（最多 {poll_interval * max_poll_times}s）"
         )
-        print(f"   ⚠️ 轮询接口 payload 是占位，待你提供真实抓包后调整")
         deadline_ts = _time.time() + poll_interval * max_poll_times
         attempt = 0
 
         while _time.time() < deadline_ts:
             attempt += 1
-            # ⚠️ 接口名占位：项目14 是 queryExportTaskInfo，项目16 待你确认
-            ret = self._post_dsm_after_sale("queryExportTaskInfo", body)
+            # 接口名：getExportTaskPage（2026-08-12 抓包实证）
+            ret = self._post_dsm_after_sale("getExportTaskPage", body)
 
-            # ⚠️ 响应字段路径占位（项目16 不知道 data 下面是什么结构）
+            # 响应字段路径：data.content[]（不是 data.itemList[]）
             data = ret.get("data", {})
-            if isinstance(data, dict):
-                # 尝试多种可能：data.taskList / data.list / data.items
-                item_list = (
-                    data.get("taskList")
-                    or data.get("list")
-                    or data.get("items")
-                    or data.get("itemList", [])
-                )
-            elif isinstance(data, list):
-                item_list = data
-            else:
-                item_list = []
+            if not isinstance(data, dict):
+                print(f"  [{attempt}/{max_poll_times}] 响应 data 不是 dict：{data}")
+                _time.sleep(poll_interval)
+                continue
 
-            # ⚠️ 时间戳匹配逻辑占位
+            content = data.get("content", [])
+            if not isinstance(content, list):
+                content = []
+            total_num = data.get("totalNum", "?")
+            print(f"  [{attempt}/{max_poll_times}] 拉到 {len(content)} 条任务（total={total_num}）")
+
+            # ⚠️ 匹配策略：双层匹配（保证正确率）
+            #   1. exportTypeCode 必须等于 EXPORT_TYPE_AFTER_SALE_DETAIL（2602）
+            #   2. exportCondition 含 "申请时间：{start_date}至{end_date}"
             target_item = None
-            for item in item_list:
-                # 项目16 用毫秒时间戳匹配（applyTime[0]/[1]）
-                if isinstance(item, dict):
-                    item_time = item.get("applyTime") or item.get("createTime")
-                    if isinstance(item_time, list) and len(item_time) >= 2:
-                        if item_time[0] == date_begin_ms and item_time[1] == date_end_ms:
-                            target_item = item
-                            break
+            target_cond_str = f"申请时间：{start_date}至{end_date}"
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                # 仅看售后明细（2602），不看售后(老 2601) 或其他(38)
+                if item.get("exportTypeCode") != self.EXPORT_TYPE_AFTER_SALE_DETAIL:
+                    continue
+                # exportCondition 含目标时间范围
+                if target_cond_str in item.get("exportCondition", ""):
+                    target_item = item
+                    break
 
             if not target_item:
-                print(f"  [{attempt}/{max_poll_times}] 暂未命中目标任务（item_list 共 {len(item_list)} 条）")
+                print(f"      暂未命中（目标条件：exportTypeCode=2602 且 exportCondition 含 '{target_cond_str}'）")
                 _time.sleep(poll_interval)
                 continue
 
-            # ⚠️ 状态字段名占位（项目16 文档说 status，父类用 taskStatus）
-            status = target_item.get("status") or target_item.get("taskStatus")
+            # ⚠️ 状态字段名：exportStatusCode（2026-08-12 抓包实证）
+            #    枚举：1=生成中 / 2=成功 / 3=失败（你文档一致）
+            status_code = target_item.get("exportStatusCode")
+            task_id = target_item.get("taskId")
 
-            if status == self.TASK_STATUS_SUCCESS:
+            if status_code == self.TASK_STATUS_SUCCESS:  # 2=成功
                 print(
-                    f"✅ [京麦售后明细] 轮询命中：taskId={target_item.get('id') or target_item.get('taskId')}, status={status}"
+                    f"✅ [京麦售后明细] 轮询命中：taskId={task_id}, "
+                    f"exportStatusCode={status_code}（{target_item.get('exportStatus')}）"
                 )
                 return target_item
-            elif status == self.TASK_STATUS_GENERATING:
+            elif status_code == self.TASK_STATUS_GENERATING:  # 1=生成中
                 print(
-                    f"  [{attempt}/{max_poll_times}] 任务生成中：taskId={target_item.get('id') or target_item.get('taskId')}, "
-                    f"status={status}（{poll_interval}s 后重试）"
+                    f"  [{attempt}/{max_poll_times}] 任务生成中：taskId={task_id}, "
+                    f"exportStatusCode={status_code}（{poll_interval}s 后重试）"
                 )
                 _time.sleep(poll_interval)
                 continue
-            elif status == self.TASK_STATUS_FAIL:
+            elif status_code == self.TASK_STATUS_FAIL:  # 3=失败
                 raise RuntimeError(
-                    f"❌ 京麦售后明细任务失败：taskId={target_item.get('id') or target_item.get('taskId')}, status={status}"
+                    f"❌ 京麦售后明细任务失败：taskId={task_id}, "
+                    f"exportStatusCode={status_code}（{target_item.get('exportStatus')}）"
                 )
             else:
-                print(f"  [{attempt}/{max_poll_times}] 任务状态未知：{status}（继续等）")
+                print(
+                    f"  [{attempt}/{max_poll_times}] 任务状态未知：exportStatusCode={status_code}"
+                    f"（继续等）"
+                )
                 _time.sleep(poll_interval)
 
         raise RuntimeError(
@@ -8336,11 +8373,12 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
             poll_interval=poll_interval,
             max_poll_times=max_poll_times,
         )
-        task_id = item.get("id") or item.get("taskId")
+        # ⚠️ 项目16 用 taskId 字段（不是项目14 的 id）
+        task_id = item.get("taskId") or item.get("id")
         if not task_id:
             raise RuntimeError(
                 f"❌ 京麦售后明细轮询命中但无 taskId：{item}\n"
-                f"   → 请检查轮询响应里任务记录的 ID 字段路径"
+                f"   → 请检查轮询响应里任务记录的 taskId 字段路径"
             )
 
         # 第 3 步：下载 zip（**待你提供下载抓包后适配**）
