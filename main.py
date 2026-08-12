@@ -8062,10 +8062,13 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
             if not end_date:
                 end_date = start_date
 
-        # 毫秒时间戳
+        # 毫秒时间戳 + 字符串时间区间（抓包实证）
+        # ⚠️ 抓包 2026-08-12：applyTime 是 [毫秒, 毫秒] 数组，applyTimeRange 是 {dateBegin, dateEnd} 对象
+        #     这两种格式都正确，但京东后端校验严格，必须**精确到毫秒**（不要少 1 毫秒）
         import time as _time_local
         import datetime as _dt_local
         begin_dt = _dt_local.datetime.strptime(start_date, "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
+        # ⚠️ end_dt 用 23:59:59.999（999 毫秒，覆盖完整一天）
         end_dt = _dt_local.datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999000)
         date_begin_ms = int(begin_dt.timestamp() * 1000)
         date_end_ms = int(end_dt.timestamp() * 1000)
@@ -8426,7 +8429,7 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
         #     通用工具 read_excel_bytes 按 magic bytes 自动选引擎
         try:
             df = read_excel_bytes(extracted_bytes)
-            print(f"   ├─ 主表: {len(df)} 行 × {len(df.columns)} 列")
+            print(f"   ├─ 主表（原始）: {len(df)} 行 × {len(df.columns)} 列")
             if not df.empty:
                 print(f"   ├─ 列名（前 8 列）: {list(df.columns[:8])}{'...' if len(df.columns) > 8 else ''}")
         except Exception as e:
@@ -8435,11 +8438,52 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
                 f"   前 16 字节: {extracted_bytes[:16].hex()}"
             ) from e
 
+        # ⚠️ 项目16 售后明细特殊结构（2026-08-12 实证）：
+        #     - 行1 = 大分组名（合并单元格：申请信息 / 订单信息 / 售后商品信息 / ...）
+        #     - 行2 = 字段名（服务单号 / 客户期望 / ...）
+        #     - 行3+ = 真实数据
+        #     pandas 默认 header=0 会把行1 当成列名（导致"申请信息.1/.2/.3"丢失真实数据）
+        #     修复：检测到特殊结构时，重新读 header=1（让行2 作为列名）
+        skip_rows = None
+        if len(df) >= 2:
+            # 检查行1（第 1 列值）是否是大分组名
+            first_row = df.iloc[0]
+            first_cell = str(first_row.iloc[0]) if not first_row.empty else ""
+            # 大分组名常见值
+            big_group_keywords = ["申请信息", "订单信息", "售后商品信息", "操作记录", "时间记录", "服务单信息"]
+            is_big_group_row = any(kw in first_cell for kw in big_group_keywords)
+            if is_big_group_row:
+                skip_rows = 1
+                print(f"   ├─ ⚠️ 检测到售后明细特殊结构：第1行=大分组名（{first_cell!r}），重新读 header=1")
+
+        # 重新读（header=1 让行2 作为列名）
+        if skip_rows is not None:
+            try:
+                import io as _io
+                import pandas as _pd
+                # ⚠️ header=1 表示"跳过第 1 行，用第 2 行做列名"
+                if extracted_bytes[:2] == b"PK":
+                    df = _pd.read_excel(_io.BytesIO(extracted_bytes), header=1, dtype=str, na_filter=False, engine="openpyxl")
+                else:
+                    df = _pd.read_excel(_io.BytesIO(extracted_bytes), header=1, dtype=str, na_filter=False)
+                print(f"   ├─ 重新读后: {len(df)} 行 × {len(df.columns)} 列")
+                print(f"   ├─ 新表头: {list(df.columns[:8])}{'...' if len(df.columns) > 8 else ''}")
+            except Exception as e:
+                raise RuntimeError(f"❌ 售后明细重读失败：{e}") from e
+
         # Excel 后置统一规则
-        if date:
+        # ⚠️ 项目16 售后明细已有「售后申请时间」字段（第9列），**不重复新增日期列**
+        #     （按 Excel 后置规则1：已有日期/时间字段禁止重复新增）
+        has_date_column = any(
+            col in df.columns for col in ["日期", "售后申请时间", "申请时间"]
+        )
+        if date and not has_date_column:
             date_column, date_value = prepare_date_columns(df, date)
         else:
+            # 不新增日期列，但记录现有的日期列用于格式化
             date_column, date_value = None, None
+            if has_date_column:
+                print(f"   ├─ ⚠️ 已有日期/时间字段，跳过新增（规则1：禁止重复）")
 
         df = safe_convert_numeric(df)
 
@@ -8453,11 +8497,36 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
         save_filename = f"售后明细_{date}.xlsx"
         target_xlsx = os.path.join(date_subdir, save_filename)
 
-        df.to_excel(target_xlsx, index=False, engine="openpyxl")
-        if date_column:
-            apply_column_formats(target_xlsx, df, date_column=date_column, date_value=date_value)
-        else:
-            apply_column_formats(target_xlsx, df)
+        # ⚠️ 项目16 售后明细特殊处理：
+        #     原始 xlsx 含合并单元格结构（行1 大分组 + 行2 字段名 + 行3+ 数据）
+        #     pandas 读取后这个结构就丢了
+        #     为了**保留原始结构**，**直接保存内层 xlsx 字节**到目标路径（不重新生成）
+        with open(target_xlsx, "wb") as _f:
+            _f.write(extracted_bytes)
+
+        # ⚠️ Excel 后置格式（日期/SKU/订单编号/冻结窗格等）需要先读后写
+        #     但我们用了"直接保存原文件"路径，所以**格式保持原始**（含合并单元格）
+        #     应用标准列宽 + 冻结窗格（不破坏合并单元格）
+        try:
+            import openpyxl as _op
+            _wb = _op.load_workbook(target_xlsx)
+            _ws = _wb.active
+            # 冻结首列+表头两行
+            _ws.freeze_panes = "B3"
+            # 设置列宽（项目16 默认列宽较窄，适度加宽）
+            from openpyxl.utils import get_column_letter
+            for _col_idx in range(1, _ws.max_column + 1):
+                _col_letter = get_column_letter(_col_idx)
+                _ws.column_dimensions[_col_letter].width = 18
+            # 日期列加宽
+            _ws.column_dimensions["A"].width = 14
+            # 订单编号、商品编号加宽
+            _ws.column_dimensions["K"].width = 22
+            _ws.column_dimensions["Q"].width = 16
+            _ws.column_dimensions["AB"].width = 22
+            _wb.save(target_xlsx)
+        except Exception as _e:
+            print(f"   ⚠️ 列宽/冻结窗格应用失败（不影响主流程）：{_e}")
 
         print(
             f"✅ [京麦售后明细] 解压+转存成功：{target_xlsx}（{os.path.getsize(target_xlsx)} 字节，"
