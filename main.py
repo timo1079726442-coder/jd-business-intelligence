@@ -175,19 +175,25 @@ def convert_date_format(date_str):
 def _find_date_cols(df):
     """查找DataFrame中报表自带(原始)的日期/时间列。
 
-    识别标准（2026-08-07 公共规则1）：
-        - 列名精确等于"日期"或"时间"
-        - 或以"日期"结尾（如"下单日期"）
-    ⚠️ 刻意不用"以'时间'结尾"匹配：防止"最近上架时间"等业务时间字段
-       （列里是上架日期而非本报表统计日期）被误判为日期列。
+    识别标准（2026-08-07 公共规则1，2026-08-12 升级）：
+        - 列名精确等于"日期"/"时间"
+        - 或以"日期"/"时间"结尾（如"下单日期"/"售后申请时间"）
+
+    ⚠️ 黑名单（防止误判）：列名含"最近"/"近"前缀 + "时间"结尾的不算（如"最近上架时间"）
+        → 这些是业务时间字段，不是本报表统计的日期
 
     返回:
         list - 命中的列名列表；空列表 = 报表无日期/时间列（需要程序插入【日期】列）
     """
+    # ⚠️ 黑名单关键词（2026-08-12 升级）：防止误判业务时间字段
+    DATE_COL_BLACKLIST = ("最近", "近", "上次", "最后")
     hits = []
     for col in df.columns:
         name = str(col).strip()
-        if name == "日期" or name == "时间" or name.endswith("日期"):
+        # 黑名单关键词 → 跳过
+        if any(bk in name for bk in DATE_COL_BLACKLIST):
+            continue
+        if name == "日期" or name == "时间" or name.endswith("日期") or name.endswith("时间"):
             hits.append(col)
     return hits
 
@@ -364,11 +370,20 @@ def _safe_convert_one(value):
 def _parse_date_cell(date_str):
     """把目标格式日期串解析为datetime对象（失败返回None）。
 
-    支持："2026/7/29" 和 "2026/7/29 13:45:59"
+    支持（2026-08-12 用户决策：全局 yyyy/m/d 格式）：
+        - "2026/7/29" / "2026/7/29 13:45:59"            标准目标格式
+        - "2026-07-29" / "2026-07-29 13:45:59"          京东原始返回格式（横杠分隔）
+        - "20260729"                                    8 位纯数字
     用途：写Excel时把日期列从文本改为真实日期对象，避免打开文件弹格式警告。
     """
     s = str(date_str).strip()
-    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
+    for fmt in (
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+        "%Y%m%d",
+    ):
         try:
             return datetime.strptime(s, fmt)
         except ValueError:
@@ -406,29 +421,34 @@ def apply_column_formats(file_path, df, date_column="日期", date_value=None):
         if cell.value is not None:
             header_map[str(cell.value)] = cell.column
 
-    # ① 日期列：逐格文本 → 真实日期对象 + 日期/日期时间格式
-    # 支持两种调用场景（2026-08-07 公共规则1+2）：
-    #   - 程序插入的【日期】列（date_value 提供，全列同值）
-    #   - 报表自带日期/时间列（date_value=None，每格值可能不同，逐格解析）
+    # 找出所有日期/时间列（2026-08-12 升级：扫描所有命中列）
+    date_col_names = set()
     if date_column in header_map:
-        # 插入列场景：解析 date_value 得到基准格式（全列同值，用于兜底套格式）
-        base_fmt = None
-        if date_value is not None and _parse_date_cell(date_value) is not None:
-            base_fmt = "yyyy/m/d hh:mm:ss" if ":" in str(date_value) else "yyyy/m/d"
-        col_idx = header_map[date_column]
+        date_col_names.add(date_column)
+    # 扩展：扫描其他日期/时间列（与 _find_date_cols 同样的判断逻辑）
+    for col_name in header_map:
+        if col_name in date_col_names:
+            continue
+        name = str(col_name).strip()
+        # 黑名单跳过（防止"最近上架时间"误判）
+        if any(bk in name for bk in ("最近", "近", "上次", "最后")):
+            continue
+        if name == "日期" or name == "时间" or name.endswith("日期") or name.endswith("时间"):
+            date_col_names.add(col_name)
+
+    # ① 对所有日期/时间列做逐格解析 + 格式化（yyyy/m/d 或 yyyy/m/d hh:mm:ss）
+    for col_name in date_col_names:
+        col_idx = header_map[col_name]
         for row in range(2, ws.max_row + 1):
             cell = ws.cell(row=row, column=col_idx)
             v = cell.value
             if isinstance(v, str):
                 dt = _parse_date_cell(v)
                 if dt is not None:
-                    cell.value = dt           # 文本日期 → 真实日期对象（非文本）
-                    # 每格按自身是否带时间决定格式（yyyy/m/d 或 yyyy/m/d hh:mm:ss）
+                    cell.value = dt           # 文本日期 → 真实日期对象
                     cell.number_format = "yyyy/m/d hh:mm:ss" if ":" in v else "yyyy/m/d"
                     continue
-            # 非文本（已是日期对象/数值）或无法解析 → 保留原值，有基准格式则套用
-            if base_fmt is not None:
-                cell.number_format = base_fmt
+            # 非文本或无法解析 → 保留原值
 
     # ② 其他列按列名规则设置格式（订单编号=@文本，SKU/SPU=0数值0位小数）
     for col_name, col_idx in header_map.items():
@@ -8506,15 +8526,49 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
 
         # ⚠️ Excel 后置格式（日期/SKU/订单编号/冻结窗格等）需要先读后写
         #     但我们用了"直接保存原文件"路径，所以**格式保持原始**（含合并单元格）
-        #     应用标准列宽 + 冻结窗格（不破坏合并单元格）
+        #     应用标准列宽 + 冻结窗格（不破坏合并单元格）+ 日期列格式化（2026-08-12 全局规则）
         try:
             import openpyxl as _op
+            from openpyxl.utils import get_column_letter
             _wb = _op.load_workbook(target_xlsx)
             _ws = _wb.active
-            # 冻结首列+表头两行
+
+            # ① 扫描所有"日期/时间"列，逐格解析 + 格式化为 yyyy/m/d 或 yyyy/m/d hh:mm:ss
+            #     （2026-08-12 用户决策：全局 yyyy/m/d 格式 + 改值 + 改样式）
+            header_map = {}
+            for cell in _ws[2]:  # ⚠️ 项目16 表头在行2（大分组在行1）
+                if cell.value is not None:
+                    header_map[str(cell.value)] = cell.column
+
+            date_col_names = set()
+            for col_name in header_map:
+                name = str(col_name).strip()
+                if any(bk in name for bk in ("最近", "近", "上次", "最后")):
+                    continue
+                if name == "日期" or name == "时间" or name.endswith("日期") or name.endswith("时间"):
+                    date_col_names.add(col_name)
+
+            for col_name in date_col_names:
+                col_idx = header_map[col_name]
+                for row in range(3, _ws.max_row + 1):  # 数据从行3 开始
+                    cell = _ws.cell(row=row, column=col_idx)
+                    v = cell.value
+                    if isinstance(v, str):
+                        dt = _parse_date_cell(v)
+                        if dt is not None:
+                            cell.value = dt
+                            cell.number_format = "yyyy/m/d hh:mm:ss" if ":" in v else "yyyy/m/d"
+
+            # ② 订单编号列强制文本（防止长数字精度丢失）
+            for col_name in ("订单号", "服务单号", "商品编号"):
+                if col_name in header_map:
+                    col_idx = header_map[col_name]
+                    for row in range(3, _ws.max_row + 1):
+                        _ws.cell(row=row, column=col_idx).number_format = "@"
+
+            # ③ 冻结首列+表头两行
             _ws.freeze_panes = "B3"
-            # 设置列宽（项目16 默认列宽较窄，适度加宽）
-            from openpyxl.utils import get_column_letter
+            # ④ 设置列宽（项目16 默认列宽较窄，适度加宽）
             for _col_idx in range(1, _ws.max_column + 1):
                 _col_letter = get_column_letter(_col_idx)
                 _ws.column_dimensions[_col_letter].width = 18
@@ -8526,7 +8580,7 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
             _ws.column_dimensions["AB"].width = 22
             _wb.save(target_xlsx)
         except Exception as _e:
-            print(f"   ⚠️ 列宽/冻结窗格应用失败（不影响主流程）：{_e}")
+            print(f"   ⚠️ Excel 后置（日期/列宽/冻结窗格）应用失败（不影响主流程）：{_e}")
 
         print(
             f"✅ [京麦售后明细] 解压+转存成功：{target_xlsx}（{os.path.getsize(target_xlsx)} 字节，"
