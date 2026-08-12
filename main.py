@@ -7855,8 +7855,15 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
             h5st        - 浏览器F12抓 createdExportTask 请求头 h5st（项目16 抓包实证必需）
             cookie_path - 京麦 Cookie 文件路径，默认 config/jm_cookie.txt
         """
-        # 直接调用父类构造，复用 dsm 头/Cookie/requests Session 等
-        super().__init__(h5st=h5st, cookie_path=cookie_path)
+        # ⚠️ 不用 super()（之前的 super().__init__() 在某些情况下未触发子类后续代码）
+        #    改用显式调用父类 __init__ + self.setattr 强制设值
+        JingMaiOrderExportAPI.__init__(self, h5st=h5st, cookie_path=cookie_path)
+
+        # 项目16 特有：X-Rp-Sdtoken 风控令牌（从响应里解析，下次请求带上）
+        # 30 分钟有效（响应头 set;1800 表示 1800 秒）
+        # ⚠️ 必须先初始化（_post_dsm_after_sale 会用到）
+        self.__dict__["_rp_sdtoken"] = None
+        self.__dict__["_rp_sdtoken_expire_ts"] = 0  # unix 时间戳
 
         # 项目16 特有：覆盖父类的 Referer / X-Referer-Page（售后页面）
         self.session.headers.update({
@@ -7864,11 +7871,6 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
             "X-Referer-Page": self.X_REFERER_PAGE,
             "dsm-file-path": self.DSM_FILE_PATH,
         })
-
-        # 项目16 特有：X-Rp-Sdtoken 风控令牌（从响应里解析，下次请求带上）
-        # 30 分钟有效（响应头 set;1800 表示 1800 秒）
-        self._rp_sdtoken = None
-        self._rp_sdtoken_expire_ts = 0  # unix 时间戳
 
     # ---- X-Rp-Sdtoken 风控令牌解析 ----
 
@@ -8004,16 +8006,8 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
     TASK_STATUS_SUCCESS = 2
     TASK_STATUS_FAIL = 3
 
-    def __init__(self, h5st: str = "", cookie_path: str = "config/jm_cookie.txt"):
-        """初始化京麦售后明细导出 API。
-
-        参数:
-            h5st        - 浏览器F12抓 createdExportTask 请求头 h5st（项目16 待验证）
-            cookie_path - 京麦 Cookie 文件路径，默认 config/jm_cookie.txt（项目14 BUG 已修复）
-        """
-        # 直接调用父类构造，复用 dsm 头/Cookie/requests Session 等
-        super().__init__(h5st=h5st, cookie_path=cookie_path)
-        # 售后导出报表名通常含 afterSaleOrderDetail / aftersale 标识（待抓包确认）
+    # ⚠️ __init__ 已在类顶部 7851 行定义（用显式 JingMaiOrderExportAPI.__init__ 替代 super）
+    #     这里不再重复定义（重复定义会让 Python 用最后一个覆盖，导致类顶部的新版本失效）
 
     def create_after_sale_export_task(
         self,
@@ -8173,7 +8167,7 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
         返回:
             dict - 命中任务记录（含 taskId / exportStatusCode / exportTypeCode 等）
         """
-        import time as _time_local
+        import time as _time
         import datetime as _dt_local
 
         # ⚠️ 项目16 真实 payload（2026-08-12 抓包实证）：
@@ -8563,7 +8557,7 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
             "code": self.CODE_OK,
             "msg": "成功",
             "taskId": task_id,
-            "taskStatus": item.get("status") or item.get("taskStatus"),
+            "taskStatus": item.get("exportStatusCode") or item.get("status") or item.get("taskStatus"),
             "zip_path": zip_path,
             "xlsx_path": xlsx_path,
             "rawItem": item,
