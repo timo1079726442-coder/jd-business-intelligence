@@ -535,6 +535,34 @@ class JDBaseRequest:
         else:
             self.cookie_path = cookie_path or os.path.join(project_root, "config", "sz_cookie.txt")
 
+        # ⚠️ 2026-08-13 升级：AuthLoader 接管 Cookie 读取（支持 JSON + 自动过期检查 + RPA 重抓）
+        # 触发条件：环境变量 AUTH_LOADER=1 显式启用，或 cookie_path 包含 ".json"
+        # 向后兼容：未启用时仍走 _read_cookie()（读 .txt）
+        self._use_auth_loader = (
+            os.getenv("AUTH_LOADER", "0") == "1" or
+            (cookie_path and cookie_path.endswith(".json"))
+        )
+        if self._use_auth_loader:
+            try:
+                from auth_loader import AuthLoader
+                _auth = AuthLoader(shop_id=os.getenv("SHOP_ID", "FYA箱包旗舰店"))
+                # 业务类型从 cookie_path 推断（默认 sz）
+                if "jm" in str(cookie_path or ""):
+                    _biz = "jm"
+                elif "jzt" in str(cookie_path or ""):
+                    _biz = "jzt"
+                else:
+                    _biz = "sz"
+                self.cookie_str = _auth.get_cookie_str(_biz, check_expire=True)
+                self.logger = self._init_logger()  # 先初始化 logger
+                self.logger.info(f"✅ AuthLoader 接管 Cookie 读取（shop_id={_auth.shop_id}, biz_type={_biz}）")
+            except Exception as e:
+                # 任何异常都 fallback 到 _read_cookie()（向后兼容）
+                self._use_auth_loader = False
+                print(f"[WARN] AuthLoader 加载失败，fallback 到 _read_cookie()：{e}")
+        if not self._use_auth_loader:
+            self.cookie_str = None  # 后面 _init_logger 之前会被 _read_cookie() 赋值
+
         # 输出目录
         output_dir_rel = self.config.get("输出目录", "output/")
         self.output_dir = output_dir_rel if os.path.isabs(output_dir_rel) else os.path.join(project_root, output_dir_rel)
@@ -558,8 +586,11 @@ class JDBaseRequest:
         self._current_ua_index = 0
 
         # Cookie 与日志
-        self.cookie_str = self._read_cookie()
-        self.logger = self._init_logger()
+        # ⚠️ 2026-08-13 升级：AuthLoader 已读取时跳过 _read_cookie()，避免重复读
+        if not self._use_auth_loader:
+            self.cookie_str = self._read_cookie()
+        if not hasattr(self, 'logger') or self.logger is None:
+            self.logger = self._init_logger()
         self.logger.info(f"签名盐值: {self.SIGN_SALT}")
 
         # 风控指纹字段 wlfstk_smdl 处理（AGENTS.md 京东接口风控相关参数归档）：
@@ -2804,16 +2835,33 @@ class JZTKuaicheAPI:
         # random 模块已在 main.py 顶层 import，此处可直接使用 random.uniform()
 
         # 1. 读取 Cookie（不存在即抛错，强制用户抓包填入）
-        cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
-        if not os.path.isfile(cookie_path_abs):
-            raise FileNotFoundError(
-                f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
-                f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt.jd.com 域 Cookie 写入此文件"
-            )
-        with open(cookie_path_abs, "r", encoding="utf-8") as f:
-            self.cookie = f.read().strip()
-        if not self.cookie:
-            raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
+        # ⚠️ 2026-08-13 升级：AuthLoader 接管（环境变量 AUTH_LOADER=1 启用或 cookie_path 包含 .json）
+        _use_auth_loader = (
+            os.getenv("AUTH_LOADER", "0") == "1" or
+            cookie_path.endswith(".json")
+        )
+        if _use_auth_loader:
+            try:
+                from auth_loader import AuthLoader
+                _auth = AuthLoader(shop_id=os.getenv("SHOP_ID", "FYA箱包旗舰店"))
+                self.cookie = _auth.get_cookie_str("jzt", check_expire=True)
+                # h5st 走 AuthLoader（如果没传 h5st 参数）
+                if not h5st:
+                    h5st = _auth._try_get_h5st_safe()
+            except Exception as e:
+                print(f"[WARN] AuthLoader 加载失败，fallback 到 txt：{e}")
+                _use_auth_loader = False
+        if not _use_auth_loader:
+            cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
+            if not os.path.isfile(cookie_path_abs):
+                raise FileNotFoundError(
+                    f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
+                    f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt.jd.com 域 Cookie 写入此文件"
+                )
+            with open(cookie_path_abs, "r", encoding="utf-8") as f:
+                self.cookie = f.read().strip()
+            if not self.cookie:
+                raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
 
         # 2. 接收 h5st（**可选**；阶段4 抓包实测 add 接口不校验 h5st，参数保留为未来扩展）
         self.h5st = h5st or ""
@@ -6251,6 +6299,20 @@ class JingMaiOrderExportAPI:
         import requests
 
         # 1. h5st 校验（必填，前端强签名一次性）
+        # ⚠️ 2026-08-13 升级：h5st 缺失时优先走 AuthLoader 读（如果启用）
+        _use_auth_loader = (
+            os.getenv("AUTH_LOADER", "0") == "1" or
+            cookie_path.endswith(".json")
+        )
+        if not h5st and _use_auth_loader:
+            try:
+                from auth_loader import AuthLoader
+                _auth = AuthLoader(shop_id=os.getenv("SHOP_ID", "FYA箱包旗舰店"))
+                h5st = _auth.get_h5st(check_expire=True)
+                if h5st:
+                    print(f"ℹ️  [京麦] 未传 h5st，AuthLoader 自动读取（{len(h5st)} 字符）")
+            except Exception as e:
+                print(f"[WARN] AuthLoader 读 h5st 失败：{e}")
         if not h5st:
             # 不强制必抛错——保留空字符串的可能（万一某些调用方想先做参数校验，
             # 实际创建任务时再报错）。但打印强提示让用户警觉。
@@ -6263,15 +6325,31 @@ class JingMaiOrderExportAPI:
         self.h5st = h5st
 
         # 2. 读 Cookie（不存在即抛错，强制用户抓包）
-        cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
-        if not os.path.isfile(cookie_path_abs):
-            raise FileNotFoundError(
-                f"❌ 京麦 Cookie 文件不存在：{cookie_path_abs}\n"
-                f"   请浏览器登录 https://shop.jd.com/jdm/trade/tools/export/ExprotList，"
-                f"F12 抓 sff.jd.com 域 Cookie 写入此文件"
-            )
-        with open(cookie_path_abs, "r", encoding="utf-8") as f:
-            self.cookie = f.read().strip()
+        # ⚠️ 2026-08-13 升级：AuthLoader 接管
+        if _use_auth_loader:
+            try:
+                from auth_loader import AuthLoader
+                if 'auth_loader' not in dir() or not isinstance(getattr(self, '_auth_instance', None), AuthLoader):
+                    _auth = AuthLoader(shop_id=os.getenv("SHOP_ID", "FYA箱包旗舰店"))
+                    self._auth_instance = _auth
+                _biz = "jm" if "jm" in str(cookie_path) else "sz"
+                self.cookie = self._auth_instance.get_cookie_str(_biz, check_expire=True)
+                if not hasattr(self, '_cookie_source_logged'):
+                    print(f"ℹ️  [京麦] AuthLoader 接管 Cookie 读取（shop_id={self._auth_instance.shop_id}, biz_type={_biz}）")
+                    self._cookie_source_logged = True
+            except Exception as e:
+                print(f"[WARN] AuthLoader 读 Cookie 失败，fallback 到 txt：{e}")
+                _use_auth_loader = False
+        if not _use_auth_loader:
+            cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
+            if not os.path.isfile(cookie_path_abs):
+                raise FileNotFoundError(
+                    f"❌ 京麦 Cookie 文件不存在：{cookie_path_abs}\n"
+                    f"   请浏览器登录 https://shop.jd.com/jdm/trade/tools/export/ExprotList，"
+                    f"F12 抓 sff.jd.com 域 Cookie 写入此文件"
+                )
+            with open(cookie_path_abs, "r", encoding="utf-8") as f:
+                self.cookie = f.read().strip()
         if not self.cookie:
             raise ValueError(f"❌ 京麦 Cookie 文件 {cookie_path_abs} 内容为空")
 
