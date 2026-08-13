@@ -1227,12 +1227,101 @@ orderStatusCategory=1, orderType="1,3", orderStatuses=[]
 - 阶段 4：容错适配（轮询循环 / 401/302 Cookie 过期 / 601 风控不重试 / 业务码识别）
 - 阶段 5：IMAP 监听 + msoffcrypto 双层解密 + Excel 后置统一规则 + 自查 9 维度 0 问题 0 警告
 
+## 项目16：京麦售后单明细导出（✅ 真实跑通上线 2026-08-12）
+
+### 业务要点
+- 售后单明细报表导出（申请信息/订单信息/...共 9 大分组、47 列字段），与项目14 订单明细同属京麦 export.shop.jd.com 异步导出体系
+- **关键差异：appId 不同** —— 项目16 用 `BHPQ4MHJBUOQZKTFTRNS`，项目14 用 `CQLEJWPYPFOVQBC8UFLQ`，两业务 appId 不通用
+- 业务类 `JingMaiAfterSaleExportAPI` 继承项目14 的 `JingMaiOrderExportAPI`，覆盖 `_build_api_url` / `__init__`，复用其下载/解压/Excel 后置能力
+- 4 步一键链路：创建任务 → 轮询就绪 → 下载 zip → 解压 xlsx + 后置处理
+
+### 关键接口（3 个）
+| 步骤 | 接口 | 说明 |
+|------|------|------|
+| 创建任务 | POST `sff.jd.com/api?v=1.0&appId=BHPQ4MHJBUOQZKTFTRNS&api=dsm.seller.afs.bff.ExportDsmService.createExportTask` | 毫秒时间戳 + 13 个售后筛选字段，`{"request":{"data":{"exportType":2602,"param":"<JSON字符串>"}},"accessContext":{"source":"web"}}` |
+| 轮询就绪 | POST `...&api=dsm.seller.afs.bff.ExportDsmService.getExportTaskPage` | payload `{"request":{"data":{"pageIndex":1,"pageSize":10,"exportType":[2602,2601,38]}}}` |
+| 下载 zip | GET `export.shop.jd.com/exportCenter/export.action?taskId=xxx` | **仅 Cookie + 售后页面 Referer**，无 h5st |
+
+### 鉴权要点（项目16 特有）
+- **X-Rp-Sdtoken**：约 30 分钟有效，从创建任务响应头 `set;1800;...` 解析（`;` 分段取第 3 段），每次创建后动态刷新，轮询/后续请求必须携带
+- h5st / Cookie 与项目14 同源（config/jm_cookie.txt + h5st 参数传入）
+- 轮询响应 `exportStatusCode`：**1=生成中 / 2=成功 / 3=失败**（不是项目14 的 taskStatus/status 字段）
+- 轮询 `data.content[]` 定位匹配：双层校验 `exportTypeCode==2602` + `exportCondition` 含「申请时间：{start}至{end}」
+
+### 售后明细 xlsx 特殊三层结构（核心坑）
+- 行1：**合并单元格大分组名**（申请信息/订单信息/...共 9 个）
+- 行2：47 列字段名（服务单号/客户期望/售后状态等）
+- 行3+：真实数据行
+- **处理方案：直接写内层 xlsx 字节到目标路径（保留合并单元格）**，不走 pandas 重写（pandas 会丢合并/分组结构）
+- pandas 读取时 `header=1`（行2 作列名），否则真实数据行会被吞
+
+### Excel 后置处理（项目16 手动应用）
+- 手动扫描「日期/时间」列名逐格格式化 `yyyy/m/d`（保留时分秒）
+- 「订单号/服务单号/商品编号」列强制文本格式（防长数字精度丢失）
+- 冻结窗格 B3、列宽自适应
+
+### 踩坑要点（2026-08-12 实证）
+1. **重复 `__init__` 覆盖坑**：类内写两个 `__init__` 时 Python 用最后一个覆盖，前面的 `super().__init__()` 后设值代码全丢 → 报 `AttributeError: no attribute '_rp_sdtoken'`。修复：删旧版，显式 `JingMaiOrderExportAPI.__init__(self, h5st=..., cookie_path=...)` + `self.__dict__["_rp_sdtoken"] = None`
+2. **`import time as _time` 被误改**：轮询方法内 `_time.time()` 与 import 不同步 → `NameError: name '_time' is not defined`。改名必须全局同步
+3. **轮询状态字段用错**：用了父类 `status`/`taskStatus`，实际项目16 用 `exportStatusCode` → 取值改为 `item.get("exportStatusCode") or item.get("status") or item.get("taskStatus")`
+4. **pandas header=0 读售后明细丢数据**：行1 大分组被当列名、行2 当数据、行3 真实数据全丢 → 检测行1 是分组名时用 `header=1` 重读
+5. **PowerShell 编码坑**：SearchReplace 改中文代码偶发未真正落盘（文件实际没变），改完必须 AST + 运行时双重验证
+6. **空数据合法**：2026-08-10 无售后单 → 轮询返回成功但 content 为空，视为业务无数据正常返回
+
+### 真实跑通（2026-08-12 实证）
+- 2026-08-06：1 单售后数据完整导出
+- 2026-08-10：空数据正常返回（不报错）
+
+### 关联文件
+- 业务类实现：`main.py`（`class JingMaiAfterSaleExportAPI`，继承项目14）
+- 踩坑记录：本 SKILL.md 京麦分区 + `全局复利的踩坑日志.md`
+- Cookie：`config/jm_cookie.txt`（与项目14 互通）
+
+## 项目17：多店铺管理 + RPA 自动化集成（2026-08-12 规划，骨架已落地）
+
+### 业务要点
+- 解决多店铺账号切换：每店铺独立 Cookie/h5st/配置，SQLite 统一管理
+- 配置文件管理：`config_manager.py`（ConfigManager 单例，SQLite + 文件双写）
+
+### 核心能力
+- SQLite 三表：`shops`（店铺）、`h5st_log`（h5st 记录+过期检查）、`export_history`（导出历史）
+- `register_shop(shop_id, pin, shop_name)` / `auto_register_from_disk()`（扫描 config/ 自动注册，提取 pin）
+- `save_h5st(shop_id, h5st_value)`：DB + 文件双写（config/{shop_id}/h5st.txt）
+- `get_h5st(shop_id)`：优先 DB，检查 30 分钟过期，再读文件
+- `save_cookie(shop_id, biz_type, cookie_content)`：按 sz/jzt/jm 分文件保存
+- CLI：`python config_manager.py scan/list/h5st <shop_id>`
+
+### 目录结构约定
+```
+config/{shop_id}/sz_cookie.txt  jzt_cookie.txt  jm_cookie.txt  h5st.txt  imap_config.ini
+```
+- `.gitignore` 已加 `config/*/sz_cookie.txt` 等多店铺子目录鉴权文件**不入仓**
+- 演示店铺 `config/FYA箱包旗舰店/` 已建立（cookie 迁移成功）
+
+### RPA 集成 3 种 h5st 抓取方案（详见 docs/多店铺管理_RPA自动化指南.md）
+- 方案 A：网络拦截（Playwright CDP，长期最优）
+- 方案 B：JS 执行（页面 evaluate 读 window 变量）
+- 方案 C：人工弹窗（最快可用，先落地）
+
+### 后续优化（待用户确认优先级）
+1. main.py 集成 ConfigManager（硬编码 cookie 路径 → `cm.get_cookie_path(shop_id, biz_type)` + `cm.get_h5st(shop_id)`）
+2. CLI 加 `--shop` 参数支持多店铺批量跑
+3. RPA 方案 C 完整流程脚本
+4. h5st 过期自动通知（websocket / Telegram）
+5. 导出历史仪表板（SQLite 统计）
+
+### 关联文件
+- `config_manager.py`（已入库，CLI 可跑）
+- `docs/多店铺管理_RPA自动化指南.md`（完整规划文档，378 行）
+
 ---
 
 ## 八、迭代更新记录（时间倒序）
 
 | 日期 | 改动概要 |
 |------|----------|
+| 2026-08-12 | **项目16：京麦售后单明细导出上线（JingMaiAfterSaleExportAPI，真实跑通 8/6 有数据 + 8/10 空数据）**：① **appId 独有** `BHPQ4MHJBUOQZKTFTRNS`（与项目14 的 CQLEJWPYPFOVQBC8UFLQ 不同，不通用）；② 3 接口异步链路——createExportTask（毫秒戳+13 筛选字段+`{"request":{"data":{"exportType":2602,"param":"<JSON>"}},"accessContext":{"source":"web"}}`）→ getExportTaskPage 轮询（`exportStatusCode` 1=生成中/2=成功/3=失败，双层匹配 exportTypeCode=2602 + exportCondition 含「申请时间：start至end」）→ export.action 仅 Cookie+Referer 下载 zip；③ **X-Rp-Sdtoken**（约30分钟）从创建响应头 `set;1800;...` 解析并动态刷新，轮询必带；④ 售后明细 xlsx **三层结构**（行1 合并单元格大分组名×9 / 行2 字段名×47 / 行3+ 数据）——直接写内层 xlsx 字节保留合并单元格，pandas 读取 header=1；⑤ 继承项目14 复用下载/解压/Excel 后置；⑥ **踩坑 6 条**：重复 `__init__` 覆盖丢 `_rp_sdtoken`（显式父类调用+`__dict__` 赋值）、`import time as _time` 改名不同步、轮询字段用 exportStatusCode 非 taskStatus、pandas header=0 吞数据、PowerShell 编码致 SearchReplace 未落盘（改完 AST+运行时双验证）、空数据合法不报错；⑦ **全局日期格式升级**：`_parse_date_cell` 支持 5 种格式（`%Y/%m/%d %H:%M:%S`、`%Y/%m/%d`、`%Y-%m-%d %H:%M:%S`、`%Y-%m-%d`、`%Y%m%d`）+ `_find_date_cols` 匹配日期/时间列+黑名单（最近/近/上次/最后）+ `apply_column_formats` 逐格解析格式化 |
+| 2026-08-12 | **项目17：多店铺管理 + RPA 自动化集成（规划+骨架落地）**：① `config_manager.py`（ConfigManager 单例，SQLite+文件双写）：shops/h5st_log/export_history 三表、`auto_register_from_disk()` 扫描自动注册、h5st 30 分钟过期检查、cookie 按 sz/jzt/jm 分文件、CLI `scan/list/h5st`；② 目录约定 `config/{shop_id}/`，`.gitignore` 加多店铺子目录鉴权文件不入仓，演示店铺 FYA箱包旗舰店 cookie 迁移成功；③ RPA 3 种 h5st 抓取方案（A 网络拦截/B JS 执行/C 人工弹窗）；④ 完整文档 `docs/多店铺管理_RPA自动化指南.md`（378 行）；⑤ 后续优化待决：main.py 集成 ConfigManager（`cm.get_cookie_path(shop_id, biz_type)`+`cm.get_h5st(shop_id)`）、CLI `--shop` 参数、RPA 方案C 脚本、h5st 过期通知、导出历史仪表板 |
 | 2026-08-11 | **项目14：京麦订单明细【加密】导出（JingMaiOrderExportAPI）上线（2026-08-11，远程提交 11e0b84）**：① **5 步异步链路**（区别于商智同步、京准通 3 步）—— createdExportTask → queryExportTaskInfo（**分页查列表按 startTime/endTime 匹配**拿 taskId）→ export.action 仅 Cookie 下载 → exportTaskPwdSend 触发短信（**不返回密码明文**）→ IMAP 监听 + msoffcrypto 双层解密；② **鉴权 3 次切换** —— 1/2/4 步 sff.jd.com h5st+dsm、3 步 export.shop.jd.com 仅 Cookie+Referer、5 步本地 zipfile+msoffcrypto；③ 业务类**不继承 JDBaseRequest**（h5st 与 UA 绑定，异步流程差异大）；④ 5 个业务 key（创建任务/创建并轮询/创建轮询下载zip/创建轮询下载并申请密码/完整一键导出）+ 4 个一键方法；⑤ CLI 新增 4 个项目14 专用参数（--h5st/--sms_password/--cookie_path/--imap_config_path）；⑥ IMAP 监听 QQ 邮箱（imaplib 标准库）+ iPhone 快捷指令自动转发短信（主题"京东密码转发"）；⑦ 关键发现：**msoffcrypto 双层解密**（zip ZipCrypto + 内部 xls msoffcrypto 加密，xlrd 2.0+ 不支持 password 参数）；⑧ 关键发现：**smsSendTip 号码脱敏**（`136****6794`，前 3+4 星+后 4）；⑨ 关键发现：**每次任务密码不同**（实证 `3WPFwj` → `4xkbWM`），不能跨任务复用；⑩ 关键发现：**IMAP 中文主题编码 bug**（`imaplib.search("SUBJECT 中文")` ASCII 编码炸，改 ALL + 客户端 decode_header + 客户端判断主题）；⑪ 关键发现：**每次任务都重新生成 taskId/password**；⑫ Excel 后置统一规则应用：日期列智能新增、yyyy/m/d 格式、SKU/SPU 整数 0、订单编号 @ 强制文本、合计行剔除、B2 冻结；⑬ 真实跑通 1 单（订单号 3586255013115624、金额 1049）写入 `output/京麦订单明细/2026-08-10/订单明细_2026-08-10.xlsx`（6843 字节）；⑭ 自查 9 维度 0 问题 0 警告；⑮ 新增 `config/jm_cookie.txt` + `config/imap_config.ini`（不入仓）+ `config/imap_config.ini.example`（入仓模板）；⑯ .gitignore 新加 `config/jm_cookie.txt` + `config/imap_config.ini` 白名单；⑰ `__init__` 业务 1（旧"项目1 暂停归档"）→ 升级为项目14 成功上线；⑱ BUSINESS_REGISTRY 第 14-18 业务（5 个） |
 | 2026-08-10 | **项目13：商智关键词分析导出（KeywordAnalysisAPI）上线（2026-08-10，远程提交 cd47f7b 同步）**：① 商智 downTable.ajax 家族新成员，按搜索词（lastSrcPageSearchKeyword）聚合；② **同步 xlsx 字节流**（无 taskId 无轮询，区别于京准通异步三步）；③ **服务端支持区间聚合**（day+DAY / month+MONTH，与项目1 搜索/推荐/购物车"不支持多日区间"不同，无需逐日拆分）；④ **双粒度实证坑**：day 粒度 date=`YYYY-MM-DD`（字段顺序 interval 在前）、month 粒度 date=`YYYYMM` 紧凑（字段顺序 dateType 在前）——dict 插入顺序精确匹配抓包；⑤ **原生 Excel 无时间列** → 手动插入时间区间列（day 插「日期」、month 插「日期范围」YYYY/M/D ~ YYYY/M/D）；⑥ UUID 完全随机（16hex-10hex，与项目4 同源，不依赖 UUID_PREFIX）；⑦ 固定参数 7 项（method=POST/target=_self/groupType/attributes/limit=300/sortField 浏览量/sortType=desc），可变参数 platformCate1=""；⑧ 空数据合法（warning 后保存空表）；⑨ 401/403 → CookieExpiredError，Content-Type 非 spreadsheetml → RuntimeError；⑩ 输出 `output/商智关键词分析/{startDate}/商智关键词分析_{startDate}_{day\|month}.xlsx`；⑪ BUSINESS_REGISTRY 第13业务，callable 注入 `_run_keyword_analysis_full`，注册表前向引用回填 api_class；⑫ 入口：`python main.py --biz_key "商智关键词分析" --date/--start_date/--end_date [--granularity day|month]` |
 | 2026-08-10 | **项目12：京准通全站营销全店推广效果导出（JZTQuanZhanEffectAllStoreAPI）上线（2026-08-10）**：① **URL 与项目10 完全相同** `POST /reweb/swa/effect/order/download`，**靠 campaignTypes=[118] 区分业务**（项目10 是 [101]）；② payload **13 项**（与项目10 字段结构完全一致：字符串/列表/bool 字段类型严格）；③ 报表名 `FYA8888_全站营销_效果报表_全店推广_{startDay}_{endDay}`（与项目10 `_效果报表_单品推广_` 后缀不同）；④ 响应同时含 downloadUrlZip + downloadUrlCsv；⑤ 复用项目10 的 csv 优先 + 8 次重试 + 空数据视为成功 + 严重告警日志 + Excel 增强（合计行去除/商品ID 0位小数/首列冻结）；⑥ 4 项开放入参与项目10/11 一致（order_status / is_daily / sku_id / spu_id）；⑦ 默认值与项目10 一致：`orderStatus="1"` 成交订单、`isDaily=False` 非日报；⑧ 复用 `config/jzt_cookie.txt`（与项目7-11 互通）；⑨ UA 沿用 v=151（项目10 一致）；⑩ 输出 `output/京准通全站营销全店推广效果/{date}/`；⑪ `BUSINESS_REGISTRY` 第13业务，callable 注入 `_run_jzt_quanzhan_effect_all_store_full`；⑫ mock 单测 **20/20 全过**（tests/jzt_quanzhan_effect_all_store_unittest.py） |
