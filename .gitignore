@@ -15,6 +15,18 @@ config/*/jzt_cookie.txt
 config/*/jm_cookie.txt
 config/*/h5st.txt
 config/*/imap_config.ini
+# 2026-08-13 多店铺 JSON 鉴权（项目18 AuthLoader，影刀 RPA 写入）
+config/*/sz_cookie.json
+config/*/jzt_cookie.json
+config/*/jm_cookie.json
+config/*/h5st.json
+
+# Excel 临时锁文件 + 副本（防止误提交）
+~$*.xlsx
+~$*.xls
+~$*.doc
+~$*.docx
+*.xlsx.bak
 
 # 输出和日志
 output/
