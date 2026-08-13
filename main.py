@@ -9049,28 +9049,51 @@ def _run_business_batch(biz_key_list, **kwargs):
     print()
 
     results = {}
+    import time as _batch_t
     for i, biz_key in enumerate(biz_key_list, 1):
         print(f"--- [{i}/{len(biz_key_list)}] 开始执行: {biz_key} ---")
+        _t0 = _batch_t.time()
         try:
             file_path = _run_single_business(biz_key, **kwargs)
-            results[biz_key] = file_path
+            _elapsed = _batch_t.time() - _t0
+            results[biz_key] = {"path": file_path, "elapsed": _elapsed, "error": None}
             print(f"--- [{i}/{len(biz_key_list)}] 完成: {biz_key} ---")
         except Exception as e:
+            _elapsed = _batch_t.time() - _t0
+            results[biz_key] = {"path": None, "elapsed": _elapsed, "error": str(e)}
             print(f"--- [{i}/{len(biz_key_list)}] 失败: {biz_key} ({e}) ---")
-            results[biz_key] = None
         print()
 
-    # 汇总
+    # 批量回执（2026-08-12 升级，docs/一键全部跑指南.md 第 4.3 节）
+    # Markdown 表格形式汇总，含耗时 + 输出文件路径
     print("=" * 70)
-    print(f"批量执行汇总（共 {len(biz_key_list)} 个）：")
+    print(f"批量回执：{len(biz_key_list)} 个业务执行结果")
     print("=" * 70)
+    print()
+    print("| # | 业务 | 状态 | 耗时 | 输出文件 |")
+    print("|---|------|------|------|---------|")
     success_count = 0
-    for biz_key, fp in results.items():
-        status = "[OK]" if fp else "[FAIL]"
-        if fp:
+    for i, (biz_key, info) in enumerate(results.items(), 1):
+        path = info["path"]
+        elapsed = info["elapsed"]
+        error = info["error"]
+        if path:
             success_count += 1
-        print(f"  {status} {biz_key}: {fp}")
-    print(f"\n总计: {success_count}/{len(biz_key_list)} 成功")
+            # 输出文件路径太长时省略中段
+            display_path = path if len(path) <= 60 else "..." + path[-57:]
+            print(f"| {i} | {biz_key} | ✅ 成功 | {elapsed:.1f}s | `{display_path}` |")
+        else:
+            print(f"| {i} | {biz_key} | ❌ 失败 | {elapsed:.1f}s | - |")
+    print()
+    print("=" * 70)
+    print(f"汇总：成功 {success_count} / 失败 {len(biz_key_list) - success_count}")
+    if success_count < len(biz_key_list):
+        print()
+        print("失败详情：")
+        for i, (biz_key, info) in enumerate(results.items(), 1):
+            if info["error"]:
+                print(f"  [{i}] {biz_key}: {info['error'][:200]}")
+    print("=" * 70)
     return results
 
 
@@ -9469,6 +9492,45 @@ def main():
     if args.imap_config_path:
         kwargs["imap_config_path"] = args.imap_config_path
         print(f"[INFO] --imap_config_path 已传入（{args.imap_config_path}）")
+
+    # h5st 预校验（2026-08-12 新增，docs/一键全部跑指南.md 第 4.2 节）
+    # 业务域关键字：含"京准通"/"京麦" 的 biz_key 通常需要 h5st（强校验）
+    # 已知例外（抓包实证不校验）：京准通快车订单效果明细 + 京准通全站营销4个（项目8-12）
+    if not args.h5st:
+        H5ST_OPTIONAL_KEYS = {
+            "京准通快车订单效果明细",          # 项目8 抓包实证不校验
+            "京准通全站营销单品计划",          # 项目9 实证不校验
+            "京准通全站营销单品推广效果",      # 项目10
+            "京准通全站营销全店计划",          # 项目11
+            "京准通全站营销全店推广效果",      # 项目12
+        }
+        need_h5st = [
+            k for k in biz_keys
+            if ("京准通" in k or "京麦" in k) and k not in H5ST_OPTIONAL_KEYS
+        ]
+        if need_h5st:
+            print()
+            print("=" * 70)
+            print("[WARN] 以下业务需要 --h5st，但 CLI 未传入：")
+            for k in need_h5st:
+                desc = BUSINESS_REGISTRY.get(k, {}).get("desc", "")
+                print(f"  - {k}（{desc}）")
+            print()
+            print("获取 h5st 步骤：")
+            print("  1. 浏览器登录对应域（jzt.jd.com / shop.jd.com）")
+            print("  2. F12 → Network → 抓 add / createExportTask 请求")
+            print("  3. 复制请求头 h5st 字段值")
+            print("  4. 重跑命令并加 --h5st \"<h5st值>\"")
+            print()
+            print("⚠️ 不传 h5st 跑这些业务可能 code=0 / 鉴权失败")
+            try:
+                ans = input("是否继续（不传 h5st 跑这些业务）？[y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "n"
+            if ans != "y":
+                print("[INFO] 用户取消，已退出。")
+                sys.exit(0)
+            print("[INFO] 用户选择继续（不传 h5st 跑这些业务）")
 
     # 执行
     try:
