@@ -222,24 +222,63 @@
 > - `sessionCookie: true`: 关闭浏览器即失效，auth_loader 跳过检查
 > - `expires: -1`: 永不过期（很多京东字段都是）
 
-### 4.2 h5st JSON
+### 4.2 h5st JSON（⚠️ 2026-08-14 改造：3 个独立文件）
 
 影刀写文件的内容（**必须是这个格式**）：
 
 ```json
 {
-  "h5st": "20260813145522965;ijn5jin75aebjn54;0248a;...",
-  "captured_at": 1786524917965,
-  "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "biz_domain": "shop.jd.com"
+  "h5st": "20260814145001718;ijn5jin75aebjn54;...",
+  "captured_at": 1786690196718,
+  "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0",
+  "biz_domain": "shop.jd.com",
+  "h5st_key": "jm_order"
 }
 ```
 
 > ⚠️ 关键：
 > - `captured_at` 必须是**毫秒时间戳**（13 位），不是秒（10 位）
-> - 影刀可用"获取当前时间"动作得到毫秒值（Date.now()）
 > - 30 分钟过期判断：`now * 1000 - captured_at > 30 * 60 * 1000`
-> - `biz_domain` 可选，但建议填上（项目区分用）
+> - `h5st_key` 标记 h5st 类型（`jm_order` / `jm_after_sale` / `jzt`）
+
+### 4.2.1 ⚠️ 3 个独立 h5st 文件（2026-08-14 实测）
+
+**关键发现**：同店同账号下，**不同业务页面的 h5st 不能跨业务复用**！
+
+| 业务 | h5st 文件 | 抓取页面 | appId | 用于 |
+|------|----------|---------|-------|------|
+| **订单明细** | `h5st_jm_order.json` | [ExprotList?exportTaskType=0](https://shop.jd.com/jdm/trade/tools/export/ExprotList?exportTaskType=0) 点订单导出 | `CQLEJWPYPFOVQBC8UFLQ` | 项目14（订单明细5 个业务） |
+| **售后明细** | `h5st_jm_after_sale.json` | [售后明细页](https://shop.jd.com/jdm/trade/after-sale/independent-after-sale/list?tabCode=all) 点售后导出 | `BHPQ4MHJBUOQZKTFTRNS` | 项目16（售后明细） |
+| **京准通** | `h5st_jzt.json` | [jzt.jd.com](https://jzt.jd.com/home) 任意按钮 | - | 项目1（快车自定义） |
+
+**实测结论**（2026-08-14）：
+- ✅ 售后页 h5st 跑售后明细：成功（`code=200, msg='成功', data=True`）
+- ❌ 售后页 h5st 跑订单明细：失败（`code=1001 未登录`）
+- ✅ 订单页 h5st 跑售后明细：成功（同样 `code=200`）
+
+**结论**：**每个 h5st 必须从对应业务页面触发抓取，不能跨业务复用**！
+
+### 4.2.2 影刀端抓 3 个 h5st 的命令
+
+```bash
+# 1. 京麦订单 h5st（在订单导出页抓）
+python auth_writer.py h5st --shop "FYA箱包旗舰店" \
+  --value "<订单页抓的h5st>" \
+  --biz_domain "shop.jd.com" \
+  --h5st_key jm_order
+
+# 2. 京麦售后 h5st（在售后明细页抓）
+python auth_writer.py h5st --shop "FYA箱包旗舰店" \
+  --value "<售后页抓的h5st>" \
+  --biz_domain "shop.jd.com" \
+  --h5st_key jm_after_sale
+
+# 3. 京准通 h5st（在 jzt.jd.com 抓）
+python auth_writer.py h5st --shop "FYA箱包旗舰店" \
+  --value "<jzt页抓的h5st>" \
+  --biz_domain "jzt.jd.com" \
+  --h5st_key jzt
+```
 
 ---
 

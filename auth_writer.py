@@ -39,6 +39,14 @@ BIZ_TYPE_MAP = {
     "jm": "jm_cookie",  # 京麦
 }
 
+# h5st 子类型（按业务页面区分，2026-08-14 实测：不同页面 h5st 不能跨业务）
+# 实证：售后页 h5st 跑订单明细 → 服务端 code=1001 未登录
+H5ST_KEY_MAP = {
+    "jm_order": "h5st_jm_order.json",       # 京麦订单明细（项目14）
+    "jm_after_sale": "h5st_jm_after_sale.json",  # 京麦售后明细（项目16）
+    "jzt": "h5st_jzt.json",                 # 京准通（项目1，项目8-12 不需要）
+}
+
 
 def validate_shop_id(shop_id: str) -> str:
     """校验店铺名（防路径注入）"""
@@ -84,7 +92,7 @@ def write_cookie(shop_id: str, biz_type: str, cookie_data) -> str:
     return file_path
 
 
-def write_h5st(shop_id: str, h5st_value: str, ua: str = "", biz_domain: str = "") -> str:
+def write_h5st(shop_id: str, h5st_value: str, ua: str = "", biz_domain: str = "", h5st_key: str = "jm_order") -> str:
     """写 h5st JSON（自动加 captured_at 毫秒时间戳）
 
     参数:
@@ -92,25 +100,38 @@ def write_h5st(shop_id: str, h5st_value: str, ua: str = "", biz_domain: str = ""
         h5st_value - h5st 字符串值
         ua - User-Agent（可选）
         biz_domain - 业务域（可选，如 shop.jd.com）
+        h5st_key - h5st 子类型（必填）：
+            "jm_order"      → 写入 h5st_jm_order.json（京麦订单明细）
+            "jm_after_sale" → 写入 h5st_jm_after_sale.json（京麦售后明细）
+            "jzt"           → 写入 h5st_jzt.json（京准通）
 
     返回:
         str - 写入的文件绝对路径
+
+    关键（2026-08-14 实测）：
+        不同业务页面的 h5st 不能跨业务复用（售后页 h5st 跑订单明细 → code=1001 未登录）
+        必须从对应业务页面分别抓 h5st 单独存
     """
     if not h5st_value:
         raise ValueError("h5st_value 不能为空")
+    if h5st_key not in H5ST_KEY_MAP:
+        raise ValueError(f"未知 h5st_key={h5st_key!r}，合法值: {list(H5ST_KEY_MAP.keys())}")
 
     data = {
         "h5st": h5st_value,
         "captured_at": int(time.time() * 1000),  # ⚠️ 关键：13 位毫秒时间戳
         "ua": ua,
         "biz_domain": biz_domain,
+        "h5st_key": h5st_key,  # ⚠️ 标记这是哪种 h5st
     }
 
     shop_dir = get_shop_dir(shop_id)
-    file_path = os.path.join(shop_dir, "h5st.json")
+    filename = H5ST_KEY_MAP[h5st_key]
+    file_path = os.path.join(shop_dir, filename)
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     print(f"[OK] h5st 已写入: {file_path}")
+    print(f"     类型: {h5st_key}")
     print(f"     captured_at: {data['captured_at']}（{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(data['captured_at']/1000))}）")
     return file_path
 
@@ -159,6 +180,12 @@ def main(argv=None):
     h5st_parser.add_argument("--value", required=True, help="h5st 字符串值")
     h5st_parser.add_argument("--ua", default="", help="User-Agent（可选）")
     h5st_parser.add_argument("--biz_domain", default="", help="业务域（可选）")
+    h5st_parser.add_argument(
+        "--h5st_key",
+        required=True,
+        choices=["jm_order", "jm_after_sale", "jzt"],
+        help="h5st 子类型：jm_order=订单明细 / jm_after_sale=售后明细 / jzt=京准通",
+    )
 
     # 子命令 3: raw（从临时文件读）
     raw_parser = subparsers.add_parser("raw", help="从影刀临时文件读 Cookie 再写")
@@ -176,7 +203,7 @@ def main(argv=None):
         if args.command == "cookie":
             write_cookie(args.shop, args.biz, args.json)
         elif args.command == "h5st":
-            write_h5st(args.shop, args.value, args.ua, args.biz_domain)
+            write_h5st(args.shop, args.value, args.ua, args.biz_domain, args.h5st_key)
         elif args.command == "raw":
             write_from_raw_file(args.shop, args.raw_file, args.biz)
         return 0

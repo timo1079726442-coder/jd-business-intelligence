@@ -8776,14 +8776,17 @@ def _run_jm_create_task(**kwargs) -> dict:
     ⚠️ 注册到 BUSINESS_REGISTRY["京麦订单明细_创建任务"]["callable"]。
     设计动机：JingMaiOrderExportAPI.__init__ 需要 h5st 必填，
               标准调度路径不支持构造参数注入，本函数手动构造实例并调用 create_export_task。
+
+    ⚠️ 2026-08-14 改造：优先取 --jm_order_h5st（项目14 专用 h5st），fallback --h5st（旧版兼容）
     """
     # 提取透传参数
-    h5st = kwargs.get("h5st", "")
+    h5st = kwargs.get("jm_order_h5st") or kwargs.get("h5st", "")
     if not h5st:
         raise ValueError(
-            "❌ 京麦订单明细_创建任务 必须传 h5st（浏览器F12抓 createdExportTask 请求头）\n"
-            "   → 请浏览器登录 https://shop.jd.com/jdm/trade/tools/export/ExprotList，\n"
-            "     F12 抓 createdExportTask 请求头 h5st 复制传入"
+            "❌ 京麦订单明细_创建任务 必须传 --jm_order_h5st（项目14 专用 h5st）\n"
+            "   → 请浏览器登录 https://shop.jd.com/jdm/trade/tools/export/ExprotList?exportTaskType=0，\n"
+            "     F12 抓 createdExportTask 请求头 h5st 复制传入\n"
+            "   → 或配置 config/{店铺名}/h5st_jm_order.json"
         )
 
     # cookie_path 可选
@@ -8816,7 +8819,8 @@ def _run_jm_create_and_wait(**kwargs) -> dict:
 
     ⚠️ 注册到 BUSINESS_REGISTRY["京麦订单明细_创建并轮询"]["callable"]。
     """
-    h5st = kwargs.get("h5st", "")
+    # ⚠️ 2026-08-14 改造：优先取 jm_order_h5st（项目14 专用），fallback h5st
+    h5st = kwargs.get("jm_order_h5st") or kwargs.get("h5st", "")
     if not h5st:
         raise ValueError(
             "❌ 京麦订单明细_创建并轮询 必须传 h5st\n"
@@ -8850,7 +8854,8 @@ def _run_jm_create_wait_download(**kwargs) -> dict:
 
     ⚠️ 注册到 BUSINESS_REGISTRY["京麦订单明细_创建轮询并下载zip"]["callable"]。
     """
-    h5st = kwargs.get("h5st", "")
+    # ⚠️ 2026-08-14 改造：优先取 jm_order_h5st（项目14 专用），fallback h5st
+    h5st = kwargs.get("jm_order_h5st") or kwargs.get("h5st", "")
     if not h5st:
         raise ValueError(
             "❌ 京麦订单明细_创建轮询并下载zip 必须传 h5st\n"
@@ -8885,7 +8890,8 @@ def _run_jm_full_with_pwd(**kwargs) -> dict:
     ⚠️ 注册到 BUSINESS_REGISTRY["京麦订单明细_创建轮询下载并申请密码"]["callable"]。
     设计动机：4 步链路，每步鉴权头不同（h5st/dsm vs Cookie-only），需要单一入口编排。
     """
-    h5st = kwargs.get("h5st", "")
+    # ⚠️ 2026-08-14 改造：优先取 jm_order_h5st（项目14 专用），fallback h5st
+    h5st = kwargs.get("jm_order_h5st") or kwargs.get("h5st", "")
     if not h5st:
         raise ValueError(
             "❌ 京麦订单明细_创建轮询下载并申请密码 必须传 h5st\n"
@@ -8920,7 +8926,8 @@ def _run_jm_run_full_export(**kwargs) -> dict:
     ⚠️ 注册到 BUSINESS_REGISTRY["京麦订单明细_完整一键导出"]["callable"]。
     设计动机：5 步链路最完整，密码获取两路（sms_password 优先 / IMAP 兜底）。
     """
-    h5st = kwargs.get("h5st", "")
+    # ⚠️ 2026-08-14 改造：优先取 jm_order_h5st（项目14 专用），fallback h5st
+    h5st = kwargs.get("jm_order_h5st") or kwargs.get("h5st", "")
     if not h5st:
         raise ValueError(
             "❌ 京麦订单明细_完整一键导出 必须传 h5st\n"
@@ -8960,7 +8967,8 @@ def _run_jm_after_sale_full(**kwargs) -> dict:
     ⚠️ 注册到 BUSINESS_REGISTRY["京麦售后明细_完整一键导出"]["callable"]。
     设计动机：售后业务无短信/IMAP，4 步链路直接走 run_after_sale_full_export。
     """
-    h5st = kwargs.get("h5st", "")
+    # ⚠️ 2026-08-14 改造：优先取 jm_after_sale_h5st（项目16 专用），fallback h5st
+    h5st = kwargs.get("jm_after_sale_h5st") or kwargs.get("h5st", "")
     if not h5st:
         raise ValueError(
             "❌ 京麦售后明细_完整一键导出 必须传 h5st\n"

@@ -93,7 +93,22 @@ def parse_module_args(argv=None):
     parser.add_argument(
         "--h5st",
         default=None,
-        help="h5st 值（不传则从 AuthLoader 读 h5st.json）",
+        help="[兼容旧版] 单个 h5st 值，对所有京麦业务生效（不推荐，建议用 --jm_order_h5st/--jm_after_sale_h5st/--jzt_h5st 分别传）",
+    )
+    parser.add_argument(
+        "--jm_order_h5st",
+        default=None,
+        help="京麦订单明细 h5st（项目14）。覆盖从 h5st_jm_order.json 自动读",
+    )
+    parser.add_argument(
+        "--jm_after_sale_h5st",
+        default=None,
+        help="京麦售后明细 h5st（项目16）。覆盖从 h5st_jm_after_sale.json 自动读",
+    )
+    parser.add_argument(
+        "--jzt_h5st",
+        default=None,
+        help="京准通 h5st（项目1）。覆盖从 h5st_jzt.json 自动读",
     )
     parser.add_argument(
         "--cookie_path",
@@ -144,6 +159,12 @@ def main(argv=None):
         kwargs["range"] = args.range
     if args.h5st:
         kwargs["h5st"] = args.h5st
+    if args.jm_order_h5st:
+        kwargs["jm_order_h5st"] = args.jm_order_h5st
+    if args.jm_after_sale_h5st:
+        kwargs["jm_after_sale_h5st"] = args.jm_after_sale_h5st
+    if args.jzt_h5st:
+        kwargs["jzt_h5st"] = args.jzt_h5st
     if args.cookie_path:
         kwargs["cookie_path"] = args.cookie_path
     if args.sms_password:
@@ -157,7 +178,41 @@ def main(argv=None):
         print("[ERR] --biz_keys 解析为空，至少需要 1 个业务 key")
         return EXIT_BIZ_FAIL
 
-    # 5. 调 main.run_business()（延迟 import，避免循环引用）
+    # 5. ⚠️ 2026-08-14 升级：按 biz_key 自动选 h5st
+    #   实证：不同业务页面的 h5st 不能跨业务复用
+    #   如果用户没显式传 --xxx_h5st，从 h5st_xxx.json 自动读
+    if any("京麦" in k and "售后" in k for k in biz_keys):
+        # 含项目16 售后明细：需要 jm_after_sale h5st
+        if not kwargs.get("jm_after_sale_h5st"):
+            try:
+                from auth_loader import AuthLoader
+                _auth = AuthLoader(shop_id=args.shop)
+                kwargs["jm_after_sale_h5st"] = _auth.get_h5st(check_expire=True, h5st_key="jm_after_sale")
+                print(f"✅ 自动读取 jm_after_sale h5st")
+            except Exception as e:
+                print(f"[WARN] 自动读取 jm_after_sale h5st 失败：{e}")
+    if any(k.startswith("京麦订单明细") for k in biz_keys):
+        # 含项目14 订单明细：需要 jm_order h5st
+        if not kwargs.get("jm_order_h5st"):
+            try:
+                from auth_loader import AuthLoader
+                _auth = AuthLoader(shop_id=args.shop)
+                kwargs["jm_order_h5st"] = _auth.get_h5st(check_expire=True, h5st_key="jm_order")
+                print(f"✅ 自动读取 jm_order h5st")
+            except Exception as e:
+                print(f"[WARN] 自动读取 jm_order h5st 失败：{e}")
+    if any(k == "京准通快车自定义报表" for k in biz_keys):
+        # 含项目1 强校验京准通：需要 jzt h5st
+        if not kwargs.get("jzt_h5st"):
+            try:
+                from auth_loader import AuthLoader
+                _auth = AuthLoader(shop_id=args.shop)
+                kwargs["jzt_h5st"] = _auth.get_h5st(check_expire=True, h5st_key="jzt")
+                print(f"✅ 自动读取 jzt h5st")
+            except Exception as e:
+                print(f"[WARN] 自动读取 jzt h5st 失败：{e}")
+
+    # 6. 调 main.run_business()（延迟 import，避免循环引用）
     try:
         from main import run_business
     except ImportError as e:

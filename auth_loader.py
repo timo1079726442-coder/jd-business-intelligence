@@ -43,6 +43,13 @@ CONFIG_DIR = os.path.join(BASE_DIR, "config")
 # h5st 有效期（30 分钟，配合抓包时限，参考 .trae/skills/jd-api-analyze/SKILL.md）
 H5ST_EXPIRE_SECONDS = 30 * 60
 
+# h5st 子类型文件映射（2026-08-14 实测：不同业务页面的 h5st 不能跨业务复用）
+H5ST_KEY_MAP = {
+    "jm_order": "h5st_jm_order.json",          # 京麦订单明细（项目14）
+    "jm_after_sale": "h5st_jm_after_sale.json", # 京麦售后明细（项目16）
+    "jzt": "h5st_jzt.json",                    # 京准通（项目1）
+}
+
 # 业务域 → 业务类型 / Cookie 文件名映射
 BIZ_TYPE_MAP = {
     "sz": "sz_cookie",  # 商智（sz.jd.com）
@@ -164,8 +171,11 @@ class AuthLoader:
             f"\n请 RPA 抓取后写入 {candidates[0]}"
         )
 
-    def _find_h5st_file(self) -> str:
+    def _find_h5st_file(self, h5st_key: str = "jm_order") -> str:
         """查找 h5st 文件（json 优先，txt fallback）
+
+        参数:
+            h5st_key - h5st 子类型（默认 jm_order）
 
         返回:
             str - h5st 文件路径
@@ -173,9 +183,19 @@ class AuthLoader:
         异常:
             AuthFileNotFound - 文件不存在
         """
+        # ⚠️ 2026-08-14 改造：3 个独立 h5st 文件（按 h5st_key 区分）
+        # 兼容旧版 h5st.json / h5st.txt（无 h5st_key 时 fallback 到旧文件）
+        if h5st_key in H5ST_KEY_MAP:
+            primary_filename = H5ST_KEY_MAP[h5st_key]
+        else:
+            primary_filename = "h5st.json"
+
         candidates = [
+            # 优先级 1：新版独立 h5st 文件
+            os.path.join(self.config_dir, self.shop_id, primary_filename),
+            # 优先级 2：旧版兼容 h5st.json
             os.path.join(self.config_dir, self.shop_id, "h5st.json"),
-            os.path.join(self.config_dir, self.shop_id, "h5st.txt"),
+            # 优先级 3：根目录 h5st.json（向后兼容）
             os.path.join(self.config_dir, "h5st.json"),
             os.path.join(self.config_dir, "h5st.txt"),
         ]
@@ -292,11 +312,15 @@ class AuthLoader:
 
     # ====================== h5st 读取 ======================
 
-    def get_h5st(self, check_expire: bool = True) -> str:
+    def get_h5st(self, check_expire: bool = True, h5st_key: str = "jm_order") -> str:
         """获取 h5st 字符串
 
         参数:
             check_expire - 是否检查 30 分钟过期（默认 True）
+            h5st_key - h5st 子类型（默认 jm_order）：
+                "jm_order"      → 京麦订单明细（项目14）
+                "jm_after_sale" → 京麦售后明细（项目16）
+                "jzt"           → 京准通（项目1）
 
         返回:
             str - h5st 字符串
@@ -304,14 +328,20 @@ class AuthLoader:
         异常:
             AuthFileNotFound - 文件不存在
             H5stExpiredError - h5st 过期
+
+        关键（2026-08-14 实测）：
+            不同业务页面的 h5st 不能跨业务复用！必须传正确的 h5st_key。
+            错误使用售后页 h5st 跑订单明细 → 服务端返回 code=1001 未登录
         """
-        cache_key = f"h5st:{check_expire}"
+        if h5st_key not in H5ST_KEY_MAP:
+            raise ValueError(f"未知 h5st_key={h5st_key!r}，合法值: {list(H5ST_KEY_MAP.keys())}")
+        cache_key = f"h5st:{check_expire}:{h5st_key}"  # ⚠️ 加 h5st_key 避免缓存串
         if self._is_cache_valid(cache_key):
             return self._cache[cache_key]
 
         # 1. 尝试读 JSON（带 captured_at 字段）
         try:
-            json_path = self._find_h5st_file()
+            json_path = self._find_h5st_file(h5st_key)
             if json_path.endswith(".json"):
                 with open(json_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -356,22 +386,25 @@ class AuthLoader:
         except AuthFileNotFound:
             raise
 
-    def is_h5st_expired(self) -> bool:
+    def is_h5st_expired(self, h5st_key: str = "jm_order") -> bool:
         """判断 h5st 是否过期（不抛异常版本）"""
         try:
-            self.get_h5st(check_expire=True)
+            self.get_h5st(check_expire=True, h5st_key=h5st_key)
             return False
         except H5stExpiredError:
             return True
 
-    def get_h5st_age_seconds(self) -> Optional[float]:
+    def get_h5st_age_seconds(self, h5st_key: str = "jm_order") -> Optional[float]:
         """获取 h5st 已捕获的秒数（用于日志/UI）
+
+        参数:
+            h5st_key - h5st 子类型（默认 jm_order）
 
         返回:
             float - 距捕获的秒数；文件不存在返回 None
         """
         try:
-            json_path = self._find_h5st_file()
+            json_path = self._find_h5st_file(h5st_key)
             if json_path.endswith(".json"):
                 with open(json_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -409,10 +442,10 @@ class AuthLoader:
             "h5st": self._try_get_h5st_safe(),
         }
 
-    def _try_get_h5st_safe(self) -> str:
+    def _try_get_h5st_safe(self, h5st_key: str = "jm_order") -> str:
         """尝试获取 h5st，失败返回空字符串（不抛异常）"""
         try:
-            return self.get_h5st(check_expire=True)
+            return self.get_h5st(check_expire=True, h5st_key=h5st_key)
         except (H5stExpiredError, AuthFileNotFound):
             return ""
 
