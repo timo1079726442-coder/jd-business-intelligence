@@ -25,6 +25,10 @@ config/*/sz_cookie.json
 config/*/jzt_cookie.json
 config/*/jm_cookie.json
 config/*/h5st.json
+# 2026-08-14 3域独立 h5st JSON（项目20，敏感鉴权，禁止入仓）
+config/*/h5st_*.json
+# 2026-08-14 影刀 CDP 浏览器数据目录（含 Cookie/登录数据，敏感，禁止入仓）
+browser_data/
 
 # Excel 临时锁文件 + 副本（防止误提交）
 ~$*.xlsx
@@ -32,6 +36,8 @@ config/*/h5st.json
 ~$*.doc
 ~$*.docx
 *.xlsx.bak
+* - 副本.xlsx
+* - 副本.xls
 
 # 输出和日志
 output/
