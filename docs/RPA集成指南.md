@@ -428,6 +428,58 @@ echo $LASTEXITCODE
 
 ## 9. 快速开始
 
+### 9.0 推荐路径约定（影刀端）
+
+**中间文件（影刀 ↔ Python 通信）放在项目目录下**：
+
+```
+D:\CODE\trae\traespace\FYA箱包旗舰店\rpa_temp\
+├─ req_list_jm_order.json       ← 订单明细监听结果
+├─ req_list_jm_after_sale.json  ← 售后明细监听结果
+└─ req_list_jzt.json            ← 京准通监听结果
+```
+
+**为什么不放 C 盘**：
+- C 盘是系统盘，多用户/重装系统会丢
+- 项目目录跟代码一起备份/迁移
+- 路径里直接复用 `{shop_id}` 和 `{biz}` 变量，方便多店铺
+
+**影刀端"保存变量到文件"配置**：
+
+```
+路径: D:\CODE\trae\traespace\FYA箱包旗舰店\rpa_temp\req_list_jm_order.json
+变量: req_list（监听结果）
+```
+
+**影刀端"调模块"配置**：
+
+```bash
+# 订单明细
+python auth_writer.py h5st_extract \
+  --input_file "D:\CODE\trae\traespace\FYA箱包旗舰店\rpa_temp\req_list_jm_order.json" \
+  --shop "FYA箱包旗舰店" \
+  --h5st_key jm_order
+
+# 售后明细
+python auth_writer.py h5st_extract \
+  --input_file "D:\CODE\trae\traespace\FYA箱包旗舰店\rpa_temp\req_list_jm_after_sale.json" \
+  --shop "FYA箱包旗舰店" \
+  --h5st_key jm_after_sale
+
+# 京准通
+python auth_writer.py h5st_extract \
+  --input_file "D:\CODE\trae\traespace\FYA箱包旗舰店\rpa_temp\req_list_jzt.json" \
+  --shop "FYA箱包旗舰店" \
+  --h5st_key jzt
+```
+
+**.gitignore 加一行**（不入仓）：
+
+```
+# RPA 中间文件（影刀 ↔ Python 通信）
+rpa_temp/
+```
+
 ### 9.1 影刀端最小配置（10 步可跑）
 
 ```
