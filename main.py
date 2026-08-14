@@ -1517,7 +1517,26 @@ class OfflineChannelAPI(JDBaseRequest):
         filename = f"店铺来源_三级渠道_{date}.xlsx"
 
         # 8. 后置处理：复用基类 _save_flow_excel（与商品流量来源同样的 Excel 处理流程）
-        return self._save_flow_excel(response, filename, date)
+        target_path = self._save_flow_excel(response, filename, date)
+
+        # 9. 数据库入库（2026-08-14 新增项目21：DB 集成 MVP）
+        #    ⚠️ 重新读 xlsx 拿 DataFrame 入库；Excel 保存失败 DB 也不跑；DB 失败仅警告
+        try:
+            import io
+            import pandas as pd
+            df_db = pd.read_excel(target_path, dtype=str, na_filter=False)
+
+            from db_utils import save_to_db
+            save_to_db(
+                biz_key="店铺来源_三级渠道",
+                df=df_db,
+                report_date=date,
+                granularity=None,
+            )
+        except Exception as e:
+            self.logger.warning(f"⚠️ DB 入库失败（不影响 Excel）：{e}")
+
+        return target_path
 
     # ---------- 阶段 4 新增：风控 / 空响应辅助方法（业务内自实现）----------
 
@@ -6202,6 +6221,21 @@ class KeywordAnalysisAPI(JDBaseRequest):
             f"✅ 文件已保存：{target_path}\n"
             f"   （{os.path.getsize(target_path)}字节，{len(df)}行 × {len(df.columns)}列，{granularity}粒度）"
         )
+
+        # 6. 数据库入库（2026-08-14 新增项目21：DB 集成 MVP）
+        #    ⚠️ Excel 保存失败也不影响 DB 入库；DB 入库失败仅警告不报错（不影响 Excel）
+        #    granularity 入参：day/month（关键词分析专用，其他业务 None）
+        try:
+            from db_utils import save_to_db
+            save_to_db(
+                biz_key="商智关键词分析",
+                df=df,
+                report_date=clean_date,
+                granularity=granularity,
+            )
+        except Exception as e:
+            self.logger.warning(f"⚠️ DB 入库失败（不影响 Excel）：{e}")
+
         return target_path
 
 
