@@ -159,6 +159,135 @@ def write_from_raw_file(shop_id: str, raw_cookie_path: str, biz_type: str = None
     return write_cookie(shop_id, biz_type, raw_data)
 
 
+# ============================ h5st 提取（影刀监听结果）============================
+
+# 不同 h5st_key 默认的 API 关键词（URL 包含此关键词即认为是目标请求）
+DEFAULT_API_KEYWORDS = {
+    "jm_order": ["createdExportTask"],          # 京麦订单明细
+    "jm_after_sale": ["ExportDsmService.createExportTask"],  # 京麦售后明细
+    "jzt": ["customreport/v2/report/report"],   # 京准通 add 接口
+}
+
+
+def extract_h5st_from_list(
+    input_file: str,
+    shop_id: str,
+    h5st_key: str,
+    api_keyword: str = None,
+    ua: str = "",
+) -> str:
+    """从影刀监听结果文件提取 h5st，写入对应 JSON 文件
+
+    输入文件格式（影刀"获取网页监听结果"输出的）：
+        - JSON 字符串数组（每个元素是一个请求的字典）
+        - 或 单个请求字典
+        - 或 已转换的字符串（影刀 req_list 变量）
+
+    提取逻辑：
+        1. 解析输入文件为请求列表
+        2. 找到 URL 含 api_keyword 的 POST 请求
+        3. 从请求头 'h5st' 字段提取值
+        4. 调 write_h5st 写入对应 JSON 文件
+
+    参数:
+        input_file  - 影刀监听结果 JSON 文件路径
+        shop_id     - 店铺 ID
+        h5st_key    - h5st 子类型
+        api_keyword - URL 关键词（默认按 h5st_key 选）
+        ua          - User-Agent（可选）
+
+    返回:
+        str - 写入的 h5st JSON 文件绝对路径
+    """
+    # ⚠️ 兼容 Windows UTF-8 BOM（PowerShell echo 会写 BOM）
+    with open(input_file, "r", encoding="utf-8-sig") as f:
+        content = f.read().strip()
+
+    if not content:
+        raise ValueError(f"输入文件 {input_file} 为空")
+
+    # 尝试解析 JSON
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"输入文件不是合法 JSON：{e}\n前 200 字符：{content[:200]!r}")
+
+    # 统一为列表格式
+    if isinstance(data, dict):
+        req_list = [data]
+    elif isinstance(data, list):
+        req_list = data
+    else:
+        raise ValueError(f"输入 JSON 不是 dict 或 list，实际类型：{type(data).__name__}")
+
+    # 选 API 关键词
+    if not api_keyword:
+        candidates = DEFAULT_API_KEYWORDS.get(h5st_key, ["createdExportTask"])
+        api_keyword = candidates[0]
+
+    print(f"[INFO] h5st_key={h5st_key}, api_keyword={api_keyword!r}")
+    print(f"[INFO] 共 {len(req_list)} 个请求，搜索 URL 含 {api_keyword!r} 的 POST 请求")
+
+    # 找目标请求（POST + URL 含 api_keyword）
+    target_req = None
+    for req in req_list:
+        url = req.get("url", "") or req.get("requestUrl", "")
+        method = (req.get("method", "POST") or "POST").upper()
+        if method == "POST" and api_keyword in url:
+            target_req = req
+            break
+
+    if not target_req:
+        raise ValueError(
+            f"未找到 URL 含 {api_keyword!r} 的 POST 请求。"
+            f"共 {len(req_list)} 个请求，请检查影刀监听结果是否正确保存。"
+        )
+
+    print(f"[OK] 找到目标请求：URL={target_req.get('url', '')[:120]}...")
+
+    # 从请求头提取 h5st（兼容多种头字段命名）
+    headers = target_req.get("headers", {}) or target_req.get("requestHeaders", {})
+    if isinstance(headers, str):
+        # 字符串格式："h5st: value\r\n..." → 解析
+        import re
+        m = re.search(r"h5st\s*[:=]\s*([^\r\n;]+)", headers)
+        h5st_value = m.group(1).strip() if m else ""
+    elif isinstance(headers, dict):
+        # dict 格式（影刀 CDP 输出常见）
+        h5st_value = (
+            headers.get("h5st")
+            or headers.get("H5st")
+            or headers.get("H5ST")
+            or ""
+        )
+        if isinstance(h5st_value, list):
+            h5st_value = h5st_value[0] if h5st_value else ""
+        h5st_value = str(h5st_value).strip()
+    else:
+        h5st_value = ""
+
+    if not h5st_value:
+        raise ValueError(
+            f"目标请求未找到 h5st 头。请求 URL={target_req.get('url', '')[:120]}\n"
+            f"headers 字段 keys: {list(headers.keys()) if isinstance(headers, dict) else type(headers).__name__}"
+        )
+
+    # 推断 biz_domain
+    biz_domain = ""
+    url = target_req.get("url", "")
+    if "shop.jd.com" in url:
+        biz_domain = "shop.jd.com"
+    elif "jzt.jd.com" in url:
+        biz_domain = "jzt.jd.com"
+    elif "sz.jd.com" in url:
+        biz_domain = "sz.jd.com"
+
+    print(f"[OK] h5st 提取成功：长度 {len(h5st_value)} 字符，biz_domain={biz_domain}")
+
+    # 写文件（复用 write_h5st）
+    return write_h5st(shop_id, h5st_value, ua=ua, biz_domain=biz_domain, h5st_key=h5st_key)
+
+
 # ============================ CLI 入口 ============================
 
 def main(argv=None):
@@ -193,6 +322,30 @@ def main(argv=None):
     raw_parser.add_argument("--raw_file", required=True, help="影刀临时 Cookie 文件路径")
     raw_parser.add_argument("--biz", default=None, choices=["sz", "jzt", "jm"], help="业务类型（可选，不传则从文件名推断）")
 
+    # 子命令 4: h5st_extract（从影刀监听结果 JSON 提取 h5st）
+    extract_parser = subparsers.add_parser(
+        "h5st_extract",
+        help="从影刀监听到的请求列表中提取 h5st（推荐方案 B）",
+    )
+    extract_parser.add_argument("--input_file", required=True, help="影刀监听结果保存的 JSON 文件路径")
+    extract_parser.add_argument("--shop", required=True, help="店铺 ID")
+    extract_parser.add_argument(
+        "--h5st_key",
+        required=True,
+        choices=["jm_order", "jm_after_sale", "jzt"],
+        help="h5st 子类型（决定写哪个文件）",
+    )
+    extract_parser.add_argument(
+        "--api_keyword",
+        default=None,
+        help="用于匹配请求 URL 的关键词（如 'createdExportTask' / 'add' / 'ExportDsmService'），默认按 h5st_key 自动选",
+    )
+    extract_parser.add_argument(
+        "--ua",
+        default="",
+        help="User-Agent（可选，影刀提供则记录到 h5st.json）",
+    )
+
     args = parser.parse_args(argv)
 
     if not args.command:
@@ -206,6 +359,14 @@ def main(argv=None):
             write_h5st(args.shop, args.value, args.ua, args.biz_domain, args.h5st_key)
         elif args.command == "raw":
             write_from_raw_file(args.shop, args.raw_file, args.biz)
+        elif args.command == "h5st_extract":
+            extract_h5st_from_list(
+                args.input_file,
+                args.shop,
+                args.h5st_key,
+                args.api_keyword,
+                args.ua,
+            )
         return 0
     except Exception as e:
         print(f"[ERR] {e}", file=sys.stderr)
