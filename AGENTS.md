@@ -31,6 +31,26 @@
 3. SKU、SPU转为数字，单元格小数位数设0；**订单编号列强制保持文本格式，禁止转换数字，防止长数字精度丢失**。
 4. 输出目录规则：按业务模块建立文件夹，内部按日期子文件夹存放对应报表，方便检索。
 
+### 数据库操作底线（SQLite，2026-08-14 项目21新增）
+> 详细使用见 `DB_USAGE.md`；本节只列**不可违反的红线**。
+1. 所有数据库操作统一封装在 `db_utils.py`，**业务类仅调用 `save_to_db` 方法**，禁止在业务类中直接写原生 SQL。
+2. 表名规范：`biz_{业务英文短名}`（如 `biz_keyword_analysis`），**禁止使用中文表名**。
+3. 每张表必须包含 `report_date`（TEXT）和 `etl_time`（TEXT）两个公共字段，且 `(report_date, 主键列)` 必须建立联合唯一约束（用于 Upsert）。
+4. 主键配置优先从 `config.xlsx` 读取 `<业务名> primary_key_column`（单主键）或 `primary_key_columns`（复合主键，逗号分隔）。
+5. 入库时自动处理字段类型映射（pandas dtype → SQLite 类型），**不允许手动拼接 SQL 字符串**，防止注入。
+6. 批量插入使用 `executemany`，**禁止逐条 INSERT 循环**，保证性能。
+
+### 每日定时与补录调度约定（影刀 RPA 专用，2026-08-14 新增）
+1. 每日自动任务入口为 `daily_update.py`，固定拉取 **`今天 - 30天` 到 `今天 - 1天`**（不含当天，因为今天数据未生成），由影刀每日凌晨触发。
+2. 补录入口为 `fill_missing.py`，支持 `--start_date` 参数扩展历史窗口；两者共用 `db_utils.get_existing_dates` 检测缺失逻辑。
+3. 所有调度脚本必须支持 `--dry-run` 模式（仅预览计划，不实际下载/入库），用于人工验证。
+4. **退出码约定**：
+   - `0`：全部成功
+   - `1`：部分业务失败（日志记录具体失败项）
+   - `2`：鉴权过期（Cookie / h5st，触发影刀重抓）
+   - `3`：参数错误（用户输入不合法）
+5. 日志统一写入 `logs/jd_api_YYYYMMDD.log`，调度脚本不向 stdout 输出冗余内容（仅输出关键进度和最终汇总）。
+
 ### 京东接口风控相关参数归档
 > 说明：h5st、uuid、wlfstk_smdl 均为京东反爬校验字段；部分接口强校验、部分接口可缺省，不要统一写死，按抓包真实请求适配。
 - **h5st**
@@ -78,6 +98,14 @@
    - 【商智 szgateway.jd.com 模块】
    - 【京麦 seller-v10.shop.jd.com 模块（订单/售后）】
    - 【京准通 jzt.jd.com 模块（广告报表）】
+   - 【数据库集成模块（SQLite，2026-08-14 项目21新增）】
+     - 表命名：`biz_{业务英文短名}`
+     - 公共字段：`report_date`（业务日期）、`etl_time`（入库时间戳）
+     - 主键配置：`config.xlsx` 中 `primary_key_column` / `primary_key_columns`（支持单/复合）
+     - 入库时机：业务类 `_post_process_xlsx` 或 `download_xxx` 末尾、`return` 之前调用 `save_to_db`
+     - 调度脚本：`daily_update.py`（30 天滚动更新）、`fill_missing.py`（缺失补录）
+     - 特殊约束：关键词分析需区分 `day` / `month` 粒度，粒度字段需入表；`day` 粒度不支持区间，必须逐日循环
+     - 详细使用见根目录 `DB_USAGE.md`
    - 不同业务记录分章节存放，防止内容混杂混乱。
 5. Skill.md只存放**精炼业务要点**：业务说明、关键接口域名、核心鉴权参数、踩坑要点、改动重点；禁止粘贴完整原始大段对话流水。原始完整对话历史保留在 `agents_old_backup.md`，仅用于人工查阅，不进入skill。
 6. 监控skill文件体量，若后续 `jd-api-analyze/SKILL.md` 膨胀超过2000行，再评估拆分子skill，现阶段维持单skill+内部分区模式。
@@ -94,3 +122,5 @@
 ## 禁止行为
 1. 禁止往agents.md追加大量接口文档、字段说明、长业务SOP，全部迁移至对应skill。
 2. 加载skill后必须完整遵守skill全部内容，不能忽略skill后半段规则。
+3. **禁止在 `daily_update.py` 或 `fill_missing.py` 中硬编码业务列表**；所有业务配置从 `config.xlsx`「全局配置」sheet 读取，通过 `biz_key` 匹配。
+4. **禁止将数据库文件 `data/jd_report.db` 提交到 Git**（已在 `.gitignore` 排除 `data/`）；只提交 `db_utils.py` 和调度脚本源码。
