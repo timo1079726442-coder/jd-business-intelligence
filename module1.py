@@ -91,6 +91,11 @@ def parse_module_args(argv=None):
         help="快捷区间（与 --date/--start_date/--end_date 互斥）",
     )
     parser.add_argument(
+        "--yesterday",
+        action="store_true",
+        help="自动用昨天日期（YYYY-MM-DD），适合影刀每天定时跑（与 --date/--range 互斥）",
+    )
+    parser.add_argument(
         "--h5st",
         default=None,
         help="[兼容旧版] 单个 h5st 值，对所有京麦业务生效（不推荐，建议用 --jm_order_h5st/--jm_after_sale_h5st/--jzt_h5st 分别传）",
@@ -143,7 +148,15 @@ def main(argv=None):
     os.environ["SHOP_ID"] = args.shop
     # 注：环境变量已在 import 前设默认值（line 30-32），这里再次覆盖
 
-    # 2. 打印启动信息（影刀可读 stdout 判断）
+    # 2. ⚠️ 2026-08-14 升级：--yesterday 自动算日期（昨天）
+    #    适用：影刀每天定时跑，自动用"今天-1 天"
+    if args.yesterday:
+        from datetime import datetime, timedelta
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        args.date = yesterday
+        print(f"[DATE] --yesterday 模式，自动用昨天日期: {yesterday}")
+
+    # 3. 打印启动信息（影刀可读 stdout 判断）
     print(f"[SHOP] {args.shop} / 业务: {args.biz_keys} / 日期: {args.date or args.start_date or args.range}")
     print(f"[AUTH_LOADER] enabled=1, SHOP_ID={args.shop}, h5st={'传' if args.h5st else '从JSON读'}")
 

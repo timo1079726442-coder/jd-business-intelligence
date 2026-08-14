@@ -4,6 +4,8 @@ config/sz_cookie.txt
 
 # 2026-08-14：RPA 中间文件（影刀 ↔ Python 通信，监听结果 JSON 临时存放）
 rpa_temp/
+# 2026-08-14：RPA 辅助脚本（影刀调用的 .bat 批处理，封装 Python 调用）
+rpa_*.bat
 config/cookie.txt.bak
 # 京准通独立 Cookie（与商智不互通，项目7）
 config/jzt_cookie.txt
