@@ -1,0 +1,41 @@
+# 统一文本文件行尾为 LF，避免 Windows CRLF 污染仓库
+# 适用文件类型：
+#   *.py    Python 源码
+#   *.md    Markdown 文档
+#   *.json  JSON 配置
+#   *.yml / *.yaml  YAML 配置
+#   *.sh    Shell 脚本
+#   *.bat / *.cmd  批处理（保留 CRLF，Windows 必需）
+#   *.txt   纯文本
+
+# Python 源码（必须 LF，避免 import 与 shebang 异常）
+*.py text eol=lf
+
+# Markdown 文档（统一 LF，避免 GitHub diff 噪音）
+*.md text eol=lf
+
+# 配置文件
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.ini text eol=lf
+*.toml text eol=lf
+
+# 脚本
+*.sh text eol=lf
+
+# Windows 批处理保留 CRLF（cmd.exe 依赖 CRLF）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 纯文本默认 LF
+*.txt text eol=lf
+
+# 二进制文件（无需 eol 处理）
+*.xlsx binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.zip binary
