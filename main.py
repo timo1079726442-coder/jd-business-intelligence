@@ -538,6 +538,17 @@ class JDBaseRequest:
         # ⚠️ 2026-08-13 升级：AuthLoader 接管 Cookie 读取（支持 JSON + 自动过期检查 + RPA 重抓）
         # 触发条件：环境变量 AUTH_LOADER=1 显式启用，或 cookie_path 包含 ".json"
         # 向后兼容：未启用时仍走 _read_cookie()（读 .txt）
+        # 输出目录
+        output_dir_rel = self.config.get("输出目录", "output/")
+        self.output_dir = output_dir_rel if os.path.isabs(output_dir_rel) else os.path.join(project_root, output_dir_rel)
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # 日志目录
+        # ⚠️ 2026-08-17 修复：log_dir 必须先于 AuthLoader 块初始化，
+        # 否则 _init_logger() 抛 AttributeError 被 except 捕获 → fallback 到旧 txt Cookie → 401
+        self.log_dir = log_dir or os.path.join(project_root, "logs")
+        os.makedirs(self.log_dir, exist_ok=True)
+
         self._use_auth_loader = (
             os.getenv("AUTH_LOADER", "0") == "1" or
             (cookie_path and cookie_path.endswith(".json"))
@@ -562,15 +573,6 @@ class JDBaseRequest:
                 print(f"[WARN] AuthLoader 加载失败，fallback 到 _read_cookie()：{e}")
         if not self._use_auth_loader:
             self.cookie_str = None  # 后面 _init_logger 之前会被 _read_cookie() 赋值
-
-        # 输出目录
-        output_dir_rel = self.config.get("输出目录", "output/")
-        self.output_dir = output_dir_rel if os.path.isabs(output_dir_rel) else os.path.join(project_root, output_dir_rel)
-        os.makedirs(self.output_dir, exist_ok=True)
-
-        # 日志目录
-        self.log_dir = log_dir or os.path.join(project_root, "logs")
-        os.makedirs(self.log_dir, exist_ok=True)
 
         # 控制参数（严格从config读取，无业务默认值，避免硬编码）
         self.REQUEST_INTERVAL = int(self.config.get("请求间隔(秒)", "30"))
@@ -2622,12 +2624,11 @@ class LossProductAPI(JDBaseRequest):
 #  中文说明（小白必读）：
 #    京准通 jzt.jd.com 广告报表导出，与商智/京麦 Cookie 不互通，必须独立 Cookie 文件。
 #    ⚠️ 核心差异（与项目1-6对比）：
-#      - 鉴权用 h5st（请求头），不是商智域 User-mnp/uuid 体系
+#      - 鉴权仅用 Cookie，不需要 h5st（2026-08-15 实测 list/add 均 HTTP 200）
 #      - 三步异步：创建任务 → 轮询列表 → CDN 下载 CSV
 #      - downloadUrl 一次性签名，过期需重新轮询刷新
 #    本阶段（阶段3骨架）：
 #      - 仅 3 个接口方法，不做轮询循环/Excel 解析（阶段5再补）
-#      - 不实现 h5st 算法，__init__ 接收外部传入
 #      - 不写 uuid 字段（京准通域未校验，已抓包确认）
 # ============================================================
 
@@ -2638,7 +2639,7 @@ JZT_KUAICHE_PAYLOAD_TEMPLATE = {
     # ⚠️ 注意：若接口报参数错误，可能：
     #   1. checkSum 是页面 JS 动态计算（故障排查：用真实浏览器 page.evaluate() 提取原始 payload 比对）
     #   2. 当前账户在 customDimensionOptions 中未勾选（默认 FYA8888 已 checked:True）
-    #   3. h5st 校验（当前 add 接口不校验，但其他接口可能校验，靠 window.ParamsSign.sign 实时生成）
+    #   3. payload 参数类型/字段与页面实际不符（2026-08-15 修订：h5st 已实测不需要）
     "caliberSettings": [
         {"checked": True, "desc": "转化周期：平台建议选择15天/30天转化周期进行数据观测", "hidden": False,
          "key": "clickOrOrderDay",
@@ -2813,13 +2814,11 @@ class JZTKuaicheAPI:
     """京准通快车自定义报表导出 API（基础骨架，2026-08-07 上线）。
 
     ⚠️ 本类**不继承 JDBaseRequest**（业务模型差异大）：
-        - 鉴权体系不同（h5st + 独立 Cookie 文件，不是商智 User-mnp/uuid）
+        - 鉴权体系不同（仅 Cookie，不需要 h5st；不是商智 User-mnp/uuid）
         - 异步三步流程（创建/轮询/下载），不适合基类 30秒重试模型
-        - UA 与 h5st 绑定，禁用基类 UA 切换（会致 h5st 失效）
+        - UA 与 h5st 绑定是京麦 sff 的特征；京准通 jzt-api 实测无 h5st（2026-08-15 验证）
 
     参数:
-        h5st       - **可选**。浏览器抓 add 接口请求头复制（如有）。项目7 抓包实测 add 接口不校验 h5st 字段
-                      （与京麦 sff.jd.com 不同），但保留参数为后续接口（如未来 list/downloadUrl）增加 h5st 校验时使用
         cookie_path - 京准通 Cookie 文件路径，默认 config/jzt_cookie.txt（与商智 Cookie 不互通）
     """
 
@@ -2840,14 +2839,13 @@ class JZTKuaicheAPI:
     MAX_DOWNLOAD_RETRY = 3       # CDN 404 重试最大次数（重刷 URL 后随机退避 3-10s）
 
     # ---- 京东业务码约定（与项目4/5/6 对齐）----
-    # code=0 成功；code=601 h5st过期（不重试）；code=-407/-402 签名错（重试）；
+    # code=0 成功；code=601 操作频繁/风控（不重试）；code=-407/-402 签名错（重试）；
     # 业务码非0 且 message/msg 含"未登录/登录" → CookieExpiredError（不重试）
 
-    def __init__(self, h5st: str = "", cookie_path: str = "config/jzt_cookie.txt"):
+    def __init__(self, cookie_path: str = "config/jzt_cookie.txt"):
         """初始化京准通 API。
 
         参数:
-            h5st       - 浏览器F12抓 add 接口请求头的 h5st 值（手动复制，脚本不实现 JS 签名）
             cookie_path - 京准通 Cookie 文件路径（默认 config/jzt_cookie.txt；与商智 Cookie 不互通）
         """
         import requests  # 本类独立按需导入，避免污染顶层 namespace
@@ -2864,9 +2862,6 @@ class JZTKuaicheAPI:
                 from auth_loader import AuthLoader
                 _auth = AuthLoader(shop_id=os.getenv("SHOP_ID", "FYA箱包旗舰店"))
                 self.cookie = _auth.get_cookie_str("jzt", check_expire=True)
-                # h5st 走 AuthLoader（如果没传 h5st 参数）
-                if not h5st:
-                    h5st = _auth._try_get_h5st_safe()
             except Exception as e:
                 print(f"[WARN] AuthLoader 加载失败，fallback 到 txt：{e}")
                 _use_auth_loader = False
@@ -2882,10 +2877,7 @@ class JZTKuaicheAPI:
             if not self.cookie:
                 raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
 
-        # 2. 接收 h5st（**可选**；阶段4 抓包实测 add 接口不校验 h5st，参数保留为未来扩展）
-        self.h5st = h5st or ""
-
-        # 3. requests Session（不继承基类 UA 切换逻辑，h5st 绑定 UA）
+        # 2. requests Session（京准通 jzt-api 实测不需要 h5st，2026-08-15 验证）
         self.session = requests.Session()
         session_headers = {
             "User-Agent": self.USER_AGENT,
@@ -2898,9 +2890,6 @@ class JZTKuaicheAPI:
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Cookie": self.cookie,
         }
-        # h5st 非空才注入（抓包实测多数 add 请求无 h5st 字段）
-        if self.h5st:
-            session_headers["h5st"] = self.h5st
         self.session.headers.update(session_headers)
 
         # 4. 输出路径（按 AGENTS.md Excel规则4：业务子目录 + 日期子目录）
@@ -3003,7 +2992,7 @@ class JZTKuaicheAPI:
             dict - 原始响应（成功时透传，失败抛异常）
         异常:
             CookieExpiredError - Cookie 过期（不重试，立即停）
-            RuntimeError       - 业务码 601（h5st 过期）/-407/-402（签名错）/其他非0
+            RuntimeError       - 业务码 601（操作频繁/风控）/-407/-402（签名错）/其他非0
         """
         code = ret.get("code")
         success = ret.get("success", True)  # 缺省视为 True（兼容旧响应）
@@ -3019,11 +3008,13 @@ class JZTKuaicheAPI:
                 f"   → 请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt.jd.com 域 Cookie 写入 config/jzt_cookie.txt"
             )
 
-        # 3. h5st 过期（601）→ 不重试，直接抛
+        # 3. code=601（操作频繁/风控）→ 不重试，直接抛
+        #    ⚠️ 2026-08-15 修订：京准通 jzt-api 实测不需要 h5st，
+        #       601 不再解读为"h5st 过期"，而是"操作频繁/风控"
         if code == 601:
             raise RuntimeError(
-                f"❌ 京准通 h5st 过期（{op_desc}返回 code=601）：\n"
-                f"   → 请浏览器F12抓 add 接口最新 h5st 重新构造实例：api = JZTKuaicheAPI(h5st='新值')"
+                f"❌ 京准通操作频繁/风控（{op_desc}返回 code=601）：\n"
+                f"   → 请等待冷却后重试，或检查 Cookie 是否被风控（重抓 jzt.jd.com 域 Cookie）"
             )
 
         # 4. 签名错（-407/-402）→ 抛 RuntimeError 让外层决定重试
@@ -3031,7 +3022,7 @@ class JZTKuaicheAPI:
             raise RuntimeError(
                 f"❌ 京准通签名校验失败（{op_desc}返回 code={code}）：\n"
                 f"   msg={ret.get('msg')}\n"
-                f"   → 可能 h5st 不匹配当前 UA，请重新抓 add 接口最新 h5st"
+                f"   → 可能 payload 参数错或 Cookie 失效，请重抓 jzt.jd.com 域 Cookie"
             )
 
         # 5. 其他非0 → 完整响应回显便于排查
@@ -3914,15 +3905,15 @@ BUSINESS_REGISTRY = {
     # 业务：京准通快车自定义报表（阶段10：完整三步流程接入调度器）
     # ⚠️ 调度器支持两种注册方式：
     #   1. 标准方式：api_class + method（基类方法自动实例化）
-    #   2. callable 方式：本业务因 h5st/cookie_path 需动态注入，采用自定义函数直接注册
+    #   2. callable 方式：本业务因 cookie_path 需动态注入，采用自定义函数直接注册
     #   get_business_handler() 检测到 info.get("callable") 时优先返回该函数
+    #   ⚠️ 2026-08-15 修订：京准通 jzt-api 实测不需要 h5st（list/add 均 HTTP 200）
     "京准通快车自定义报表": {
         "api_class": JZTKuaicheAPI,  # 兼容老调用；实际调度走 callable
         "method": "run_full_export",  # 实例化后也支持直调
         "callable": None,  # 占位：下方 _run_jzt_kuaiche_full 函数定义后注入（避免前向引用错误）
-        "desc": "京准通快车自定义报表导出（h5st鉴权，独立Cookie，三步异步：add→轮询→CDN下载）",
+        "desc": "京准通快车自定义报表导出（仅Cookie鉴权，无需h5st，三步异步：add→轮询→CDN下载）",
         "params": {
-            "h5st": "必填，浏览器F12抓add接口请求头复制（外部传入）",
             "start_date": "开始日期YYYY-MM-DD",
             "end_date": "结束日期YYYY-MM-DD",
             "cookie_path": "京准通Cookie路径（默认config/jzt_cookie.txt，可选）",
@@ -4168,13 +4159,12 @@ def _run_jzt_kuaiche_full(**kwargs) -> str:
 
     ⚠️ 注册到 BUSINESS_REGISTRY["京准通快车自定义报表"]["callable"]，
        get_business_handler 检测到 callable 字段时优先返回本函数。
-    设计动机：JZTKuaicheAPI.__init__ 需要 h5st 和 cookie_path 参数，
+    设计动机：JZTKuaicheAPI.__init__ 需要 cookie_path 参数，
               而基类的标准调度路径只支持无参 __init__ → 实例化 → 调方法，
-              无法透传这两个值。本函数手动构造实例并调用 run_full_export。
+              无法透传该值。本函数手动构造实例并调用 run_full_export。
 
     参数:
         kwargs - 来自 run_business 的透传参数：
-            h5st       (str): 必填，浏览器F12抓 add 接口请求头的 h5st 值
             start_date (str): 开始日期 YYYY-MM-DD
             end_date   (str): 结束日期 YYYY-MM-DD
             date       (str): 单日查询（start/end 默认=date）
@@ -4183,18 +4173,11 @@ def _run_jzt_kuaiche_full(**kwargs) -> str:
     返回:
         str - 保存的文件绝对路径
     异常:
-        ValueError - 缺 h5st 或日期参数时
+        ValueError - 缺日期参数时
         CookieExpiredError / TimeoutError / RuntimeError
     """
-    # ⚠️ h5st **可选**（2026-08-07 抓包实证：add 接口不校验 h5st）
-    #   - 不传 h5st：可跑通 add/list/downloadById 三步（最常见情况）
-    #   - 传 h5st：增强未来接口升级风控时的兼容性
-    #   - 何时需要：若 list/downloadById 返回 code=601 "操作频繁"，说明接口开始校验 h5st，
-    #                此时浏览器F12抓 add 接口请求头的 h5st 值传入即可
-    h5st = kwargs.get("h5st", "")
-    # 不再强制必传，但给个温和提醒
-    if not h5st:
-        print("ℹ️  未传 h5st（add 接口抓包实测不校验，可正常跑；若报 601 请浏览器F12抓 add 接口的 h5st 重试）")
+    # ⚠️ 2026-08-15 修订：京准通 jzt-api 实测不需要 h5st（list/add 均 HTTP 200）
+    #    - 不再从 kwargs 读取/注入 h5st，仅 Cookie 鉴权即可跑通 add/list/download 三步
 
     # 提取透传给 run_full_export 的参数
     # ⚠️ 2026-08-10 bug fix：用户决策补能力——支持 --range 透传
@@ -4207,7 +4190,7 @@ def _run_jzt_kuaiche_full(**kwargs) -> str:
     if not forward_kwargs.get("start_date") and not forward_kwargs.get("end_date") and not forward_kwargs.get("date"):
         raise ValueError("❌ 至少需要传入 date 或 start_date/end_date")
 
-    api = JZTKuaicheAPI(h5st=h5st, cookie_path=kwargs.get("cookie_path", "config/jzt_cookie.txt"))
+    api = JZTKuaicheAPI(cookie_path=kwargs.get("cookie_path", "config/jzt_cookie.txt"))
     return api.run_full_export(**forward_kwargs)
 
 
@@ -4528,7 +4511,7 @@ class JZTQuanZhanCampaignAPI:
             # ⚠️ 用户决策 2026-08-10 补充：空数据视为成功（**仅项目9 启用**，与项目10/11 行为一致）
             #   场景：与服务端确认结果一致的空数据报表视为「没有投放该推广工具」，
             #         不视为代码 bug，写入空 xlsx（含表头）+ 返回成功路径
-            #   注意：项目7、8 仍保留原抛错行为（项目7 由 h5st/轮询控制、项目8 链路复杂）
+            #   注意：项目7、8 仍保留原抛错行为（项目7 由轮询控制、项目8 链路复杂）
             print(
                 f"   ├─ ⚠️ CSV 数据为空（{len(df.columns)}列 0行）"
                 f"—— 视为业务无数据，写入空 xlsx"

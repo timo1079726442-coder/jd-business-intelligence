@@ -16,7 +16,8 @@
 
 **完整流程由 `run_full_export()` 一键封装**：
 ```python
-api = JZTKuaicheAPI(h5st="从F12抓的h5st值")
+# ⚠️ 2026-08-15 修订：京准通仅 Cookie 鉴权，不需要 h5st（list/add 均 HTTP 200）
+api = JZTKuaicheAPI()
 api.run_full_export(start_date="2026-08-07", end_date="2026-08-07")
 # → 自动跑完：add → 轮询 → downloadById → urlCsv → 保存 output/京准通快车/*.csv
 ```
@@ -93,10 +94,10 @@ main.py → JZT_KUAICHE_PAYLOAD_TEMPLATE["customDimensionOptions"][0]["options"]
 
 | 维度 | 商智 | **京准通（本项目）** |
 |---|---|---|
-| 鉴权字段 | User-mnp（MD5） | **h5st（请求头）** |
+| 鉴权字段 | User-mnp（MD5） | **仅 Cookie**（不需要 h5st，2026-08-15 实测：list/add 均 HTTP 200）|
 | Cookie 文件 | `config/cookie.txt` | `config/jzt_cookie.txt`（**不互通**） |
 | 抓包 URL | sz.jd.com 任意页 | **必须** jzt.jd.com 域 |
-| UA 切换 | Edge ↔ Chrome 自动 | **禁用**（h5st 与 UA 绑定） |
+| UA 切换 | Edge ↔ Chrome 自动 | **固定 UA**（京准通无 h5st 绑定约束，保留习惯） |
 | wlfstk_smdl | 可选 | 可选（与项目4-6一致，缺失仅警告） |
 
 ### Cookie 抓取路径
@@ -106,13 +107,7 @@ main.py → JZT_KUAICHE_PAYLOAD_TEMPLATE["customDimensionOptions"][0]["options"]
 → 整段复制写入 config/jzt_cookie.txt
 ```
 
-### h5st 抓取路径
-```
-任意 add 接口请求 → Request Headers → 找 "h5st" 字段
-→ 复制值传入 JZTKuaicheAPI(h5st="xxx") 或 run_business(h5st="xxx", ...)
-```
-
-⚠️ **h5st 会过期**，每次跑任务前最好重新抓；过期会返回 `code=601`（不重试）。
+⚠️ **不需要抓 h5st**（2026-08-15 实测反证）：京准通 jzt-api 的 list/add 接口不带 h5st 均返回 HTTP 200（add 返 code=400 参数错误，非登录/风控错误），仅 Cookie 即可跑通三步链路。曾误判为"必须 h5st"，已在 main.py / auth_loader.py / auth_writer.py 全量移除 jzt h5st 支持。
 
 ---
 

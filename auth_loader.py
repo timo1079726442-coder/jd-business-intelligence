@@ -44,18 +44,51 @@ CONFIG_DIR = os.path.join(BASE_DIR, "config")
 H5ST_EXPIRE_SECONDS = 30 * 60
 
 # h5st 子类型文件映射（2026-08-14 实测：不同业务页面的 h5st 不能跨业务复用）
+# ⚠️ 2026-08-15 现场命名：用户保留拼音文件名 (jm_dingdan_h5st.json / jm_shouhou_h5st.json)
+#    与英文语义 key（jm_order / jm_after_sale）通过映射解耦
+# ⚠️ 2026-08-15 用户决策：京准通 add/list 接口实测不需要 h5st（HTTP 200 不被拦截），
+#    所以 H5ST_KEY_MAP 不再包含 jzt 项。如未来京准通新增业务又需要 h5st，再补回。
 H5ST_KEY_MAP = {
-    "jm_order": "h5st_jm_order.json",          # 京麦订单明细（项目14）
-    "jm_after_sale": "h5st_jm_after_sale.json", # 京麦售后明细（项目16）
-    "jzt": "h5st_jzt.json",                    # 京准通（项目1）
+    "jm_order": "jm_dingdan_h5st.json",          # 京麦订单明细（项目14）
+    "jm_after_sale": "jm_shouhou_h5st.json",     # 京麦售后明细（项目16）
 }
 
-# 业务域 → 业务类型 / Cookie 文件名映射
+# 业务域 → Cookie 文件名候选列表（按优先级查找）
+# ⚠️ 2026-08-15 现场命名：京麦域 cookie 拆成拼音命名 (jm_dingdan_cookie.json / jm_shouhou_cookie.json)
+#    旧命名 jm_cookie.json 仍作为兜底
 BIZ_TYPE_MAP = {
-    "sz": "sz_cookie",  # 商智（sz.jd.com）
-    "jzt": "jzt_cookie",  # 京准通（jzt.jd.com）
-    "jm": "jm_cookie",  # 京麦（shop.jd.com）
+    "sz":  ["sz_cookie"],                                    # 商智（sz.jd.com）
+    "jzt": ["jzt_cookie"],                                   # 京准通（jzt.jd.com）
+    "jm":  ["jm_dingdan_cookie", "jm_shouhou_cookie", "jm_cookie"],  # 京麦（shop.jd.com）
 }
+
+# ⚠️ 2026-08-17 用户决策：店名前缀映射表
+# shop_id（业务调用方使用）→ file_prefix（RPA 实际命名）
+# 双花括号 {{xxx}} 是影刀 RPA 模板语法未替换的副产品，字面保留读取
+SHOP_ID_TO_PREFIX = {
+    "FYA箱包旗舰店": "{{FYA}}",   # FYA 短前缀
+    "MIYO箱包旗舰店": "{{MIYO}}", # MIYO 短前缀
+    "OTA箱包旗舰店":  "{{OTA}}",  # OTA 短前缀
+}
+PREFIX_TO_SHOP_ID = {v: k for k, v in SHOP_ID_TO_PREFIX.items()}
+
+
+def resolve_file_prefix(shop_id: str) -> str:
+    """shop_id → RPA 实际文件命名前缀；查不到就用 shop_id 自己包花括号兜底
+
+    示例:
+        resolve_file_prefix("FYA箱包旗舰店") → "{{FYA}}"
+        resolve_file_prefix("未知店") → "{{未知店}}"（兜底不抛异常）
+    """
+    if shop_id in SHOP_ID_TO_PREFIX:
+        return SHOP_ID_TO_PREFIX[shop_id]
+    return f"{{{{{shop_id}}}}}"
+
+
+def list_known_shops() -> list:
+    """列出所有已知店铺"""
+    return list(SHOP_ID_TO_PREFIX.keys())
+
 
 # RPA CLI 默认占位命令（用户需替换为影刀实际可执行文件路径）
 # 例：C:/Program Files/Yingdao/yingdao.exe
@@ -139,7 +172,7 @@ class AuthLoader:
     # ====================== 文件查找 ======================
 
     def _find_auth_file(self, biz_type: str, file_ext: str = "json") -> str:
-        """按优先级查找鉴权文件
+        """按优先级查找鉴权文件（2026-08-17 改造：{{短前缀}}_ 平铺布局）
 
         参数:
             biz_type - 业务类型: sz/jzt/jm
@@ -150,18 +183,35 @@ class AuthLoader:
 
         异常:
             AuthFileNotFound - 所有路径都不存在
+
+        布局约定（用户决策 2026-08-17）：
+            影刀 RPA 输出固定为 config/{{短前缀}}_<basename>.<ext> 平铺格式，
+            双花括号是影刀 RPA 模板语法未替换的副产品（保留字面读取即可）。
+            通过 resolve_file_prefix() 把 shop_id 翻译成 RPA 文件前缀。
         """
         if biz_type not in BIZ_TYPE_MAP:
             raise ValueError(f"未知 biz_type={biz_type}，合法值: {list(BIZ_TYPE_MAP.keys())}")
-        basename = BIZ_TYPE_MAP[biz_type]
+        basenames = BIZ_TYPE_MAP[biz_type]
+        if isinstance(basenames, str):  # 向后兼容旧 str 单值
+            basenames = [basenames]
 
-        # 4 级候选路径
-        candidates = [
-            os.path.join(self.config_dir, self.shop_id, f"{basename}.{file_ext}"),
-            os.path.join(self.config_dir, self.shop_id, f"{basename}.txt" if file_ext == "json" else f"{basename}.{file_ext}"),
-            os.path.join(self.config_dir, f"{basename}.{file_ext}"),
-            os.path.join(self.config_dir, f"{basename}.txt" if file_ext == "json" else f"{basename}.{file_ext}"),
-        ]
+        # shop_id → RPA 文件命名前缀（关键！把"FYA箱包旗舰店"翻成"{{FYA}}"）
+        file_prefix = resolve_file_prefix(self.shop_id)
+        shop_prefix = f"{file_prefix}_"  # 例：{{FYA}}_、{{MIYO}}_、{{OTA}}_
+
+        # 对每个 basename 都生成 4 级候选路径
+        candidates = []
+        for basename in basenames:
+            candidates.extend([
+                # 优先级 1：{{短前缀}}_{basename}.json（影刀 RPA 当前输出格式）
+                os.path.join(self.config_dir, f"{shop_prefix}{basename}.{file_ext}"),
+                # 优先级 2：{{短前缀}}_{basename}.txt（json→txt 兜底）
+                os.path.join(self.config_dir, f"{shop_prefix}{basename}.txt"),
+                # 优先级 3：basename.{ext}（旧单店根目录布局兼容）
+                os.path.join(self.config_dir, f"{basename}.{file_ext}"),
+                # 优先级 4：basename.txt（旧单店根目录布局兼容，json→txt）
+                os.path.join(self.config_dir, f"{basename}.txt"),
+            ])
         for path in candidates:
             if os.path.isfile(path):
                 return path
@@ -172,7 +222,7 @@ class AuthLoader:
         )
 
     def _find_h5st_file(self, h5st_key: str = "jm_order") -> str:
-        """查找 h5st 文件（json 优先，txt fallback）
+        """查找 h5st 文件（2026-08-17 改造：{{短前缀}}_ 平铺布局）
 
         参数:
             h5st_key - h5st 子类型（默认 jm_order）
@@ -182,19 +232,24 @@ class AuthLoader:
 
         异常:
             AuthFileNotFound - 文件不存在
+
+        布局（与 _find_auth_file 一致）：
+            影刀 RPA 输出为 config/{{短前缀}}_<h5st_filename> 平铺
         """
         # ⚠️ 2026-08-14 改造：3 个独立 h5st 文件（按 h5st_key 区分）
-        # 兼容旧版 h5st.json / h5st.txt（无 h5st_key 时 fallback 到旧文件）
         if h5st_key in H5ST_KEY_MAP:
             primary_filename = H5ST_KEY_MAP[h5st_key]
         else:
             primary_filename = "h5st.json"
 
+        file_prefix = resolve_file_prefix(self.shop_id)
+        shop_prefix = f"{file_prefix}_"  # {{FYA}}_ / {{MIYO}}_ / {{OTA}}_
+
         candidates = [
-            # 优先级 1：新版独立 h5st 文件
-            os.path.join(self.config_dir, self.shop_id, primary_filename),
-            # 优先级 2：旧版兼容 h5st.json
-            os.path.join(self.config_dir, self.shop_id, "h5st.json"),
+            # 优先级 1：{{短前缀}}_{primary_filename}（影刀 RPA 当前输出格式）
+            os.path.join(self.config_dir, f"{shop_prefix}{primary_filename}"),
+            # 优先级 2：{{短前缀}}_h5st.json（兼容旧版同名 RPA 输出）
+            os.path.join(self.config_dir, f"{shop_prefix}h5st.json"),
             # 优先级 3：根目录 h5st.json（向后兼容）
             os.path.join(self.config_dir, "h5st.json"),
             os.path.join(self.config_dir, "h5st.txt"),
@@ -280,7 +335,16 @@ class AuthLoader:
 
         异常:
             CookieExpiredError - 至少一个关键 Cookie 已过期
+
+        绕过（2026-08-15 用户决策）：
+            AGENTS.md 第 2 节说「Cookie 是否失效由接口返回码判定」。
+            设置环境变量 AUTH_SKIP_COOKIE_EXPIRE_CHECK=1 可跳过本检查。
+            适用场景：调试/紧急跑业务时，_gia_d 等高频轮换字段过期但 pin/light_key 等核心字段还有效。
         """
+        # 跳过检查开关（环境变量 AUTH_SKIP_COOKIE_EXPIRE_CHECK=1）
+        if os.getenv("AUTH_SKIP_COOKIE_EXPIRE_CHECK", "0") == "1":
+            return
+
         now = time.time()
         expired = []
         for c in cookies:
@@ -312,6 +376,244 @@ class AuthLoader:
 
     # ====================== h5st 读取 ======================
 
+    def _extract_h5st_from_cdp_log(self, json_path: str) -> Dict:
+        """从 CDP 抓包日志 JSON 数组中抽取 h5st
+
+        场景（2026-08-15 实测）：
+            影刀 RPA 用 [信息] 日志格式输出 CDP 抓包，每行一条 JSON 字符串。
+            实际保存到 .json 文件时是 [log_line, log_line, ...] JSON 数组。
+            每个 log_line 形如：
+                [{'type': 'XHR', 'url': '...exportCenterService.createdExportTask',
+                  'requestHeaders': {'h5st': '20260815172442388;ijn5jin75aebjn54;...;...'},
+                  'headers': {'x-rp-sdtoken': 'set;1800;...'}}, ...]
+
+        参数:
+            json_path - CDP 日志 JSON 文件路径
+
+        返回:
+            dict - {
+                "h5st": "20260815172442388;...;...;...;...",
+                "captured_at": 1786785877997,    # 毫秒时间戳
+                "source": "CDP日志 last 200-request h5st, ...ExportList",
+                "api": "dsm.order.export.exportCenterService.createdExportTask"
+            }
+
+        异常:
+            ValueError - CDP 日志里找不到 h5st
+        """
+        # ⚠️ 2026-08-17 大改：RPA 抓包文件 dict 嵌套太深 + 行被截断，
+        #    ast.literal_eval 经常解析失败。改成正则扫原始文本，直接抠 h5st + url。
+        with open(json_path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+
+        # h5st 格式固定：13位毫秒戳;xxx;...;...（多段，分号分隔）
+        # 抠出所有 (h5st_value, url) 对，按 url 内含 sff.jd.com + status=200 的优先
+        import re
+        # 正则：抓 'h5st': 'xxx' 字段
+        h5st_pattern = re.compile(r"'h5st':\s*'([^']{40,})'", re.S)
+        # 正则：抓 'url': 'xxx' 字段（注意 url 可能在截断处提前结束）
+        url_pattern = re.compile(r"'url':\s*'([^']+)'", re.S)
+        # 正则：抓 'status': 200 字段
+        status_pattern = re.compile(r"'status':\s*200")
+
+        candidates = []
+        # 简化策略：逐个找 h5st 值，向前后各看 5000 字符找最近的 url + status
+        for m in h5st_pattern.finditer(text):
+            h5st_value = m.group(1)
+            # ⚠️ 2026-08-17 修复：向前 + 向后各看 5000 字符（之前只向前看，h5st 在文件前面会找不到）
+            ctx_start = max(0, m.start() - 5000)
+            ctx_end = min(len(text), m.end() + 5000)
+            ctx = text[ctx_start:ctx_end]
+            url_match = None
+            for um in url_pattern.finditer(ctx):
+                url_match = um  # 取最后一个
+            if not url_match:
+                continue
+            url = url_match.group(1)
+            status_ok = bool(status_pattern.search(ctx))
+            if not status_ok:
+                continue
+            # ⚠️ 三级匹配（按优先级）
+            if "sff.jd.com" in url and "exportCenterService" in url:
+                candidates.append({"h5st": h5st_value, "url": url, "priority": 3, "pos": m.start()})
+            elif "sff.jd.com" in url:
+                candidates.append({"h5st": h5st_value, "url": url, "priority": 2, "pos": m.start()})
+            else:
+                candidates.append({"h5st": h5st_value, "url": url, "priority": 1, "pos": m.start()})
+
+        if not candidates:
+            raise ValueError(
+                f"CDP 日志里没找到 status=200 且带 h5st 的请求: {json_path}"
+            )
+
+        # 2. 优先选最后一个（最新），并按业务类型筛
+        #    exportCenterService.createdExportTask = 创建导出任务（最严）
+        #    queryNeedRollBackAndPermission / queryExportTaskInfo = 查询（较宽）
+        #    取业务对应：订单 → "createdExportTask" / 售后 → "createExportTask"
+        best = candidates[-1]
+        # ⚠️ 2026-08-17 按优先级选最佳：priority 越大越好（最严匹配）
+        candidates_sorted = sorted(candidates, key=lambda c: (c.get("priority", 0), c.get("pos", 0)))
+        best = candidates_sorted[-1]
+        # 如果有 createdExportTask/createExportTask，优先选它（即使不是 priority 最高）
+        for c in reversed(candidates):
+            if "createdExportTask" in c["url"] or "createExportTask" in c["url"]:
+                best = c
+                break
+
+        # 3. 抽取 x-rp-sdtoken（解析 `;1800;XXX` 第二段 → 30 分钟 ttl 参考）
+        # ⚠️ 2026-08-17 大改：从原始文本正则抠 x-rp-sdtoken（不一定有，缺失用默认 1800s）
+        import re as _re_local
+        # 在 best["pos"] 附近往后查 'x-rp-sdtoken': 'set;1800;xxx'
+        sdtoken = ""
+        sdtoken_pattern = _re_local.compile(r"'x-rp-sdtoken':\s*'(set;\d+;[^']*)'", _re_local.S)
+        sdtoken_m = sdtoken_pattern.search(text, best.get("pos", 0))
+        if sdtoken_m:
+            sdtoken = sdtoken_m.group(1)
+        if sdtoken.startswith("set;"):
+            parts = sdtoken.split(";")
+            if len(parts) >= 2:
+                try:
+                    ttl = int(parts[1])
+                except ValueError:
+                    ttl = 1800
+            else:
+                ttl = 1800
+        else:
+            ttl = 1800
+
+        # 4. captured_at 用文件 mtime（CDP 日志通常在抓取时 mtime）
+        file_mtime_ms = int(os.path.getmtime(json_path) * 1000)
+
+        # 5. 从 h5st 字符串里取时间戳（第 7 段，如 "20260815172442388"）
+        #    h5st 格式：yyyyMMddHHmmssSSS;uuid;...;ttl;...;timestamp
+        try:
+            h5st_parts = best["h5st"].split(";")
+            # 真实抓包实测：第 7 段是 13 位毫秒时间戳（如 1786785877997）
+            for part in h5st_parts:
+                if part.isdigit() and len(part) == 13:
+                    captured_at = int(part)
+                    break
+            else:
+                captured_at = file_mtime_ms
+        except Exception:
+            captured_at = file_mtime_ms
+
+        # 6. API 名称（用于日志）
+        api_name = "unknown"
+        if "createdExportTask" in best["url"]:
+            api_name = "dsm.order.export.exportCenterService.createdExportTask"
+        elif "createExportTask" in best["url"]:
+            api_name = "dsm.seller.afs.bff.ExportDsmService.createExportTask"
+        elif "queryExportTaskInfo" in best["url"]:
+            api_name = "dsm.order.export.exportCenterService.queryExportTaskInfo"
+
+        return {
+            "h5st": best["h5st"],
+            "captured_at": captured_at,
+            "source": f"CDP日志 last 200-request h5st, api={api_name}",
+            "api": api_name,
+            "ttl_seconds": ttl,
+            "file_mtime_ms": file_mtime_ms,
+        }
+
+    def _extract_h5st_from_pinyin_cdp(self, json_path: str) -> Dict:
+        """拼音命名 (jm_dingdan / jm_shouhou) CDP 日志专用入口
+
+        ⚠️ 2026-08-15 真实文件格式（影刀 RPA 输出）：
+            每行结构: "[信息] [2026-08-15 17:24:42.212] [{'type': 'XHR', 'url': '...', ...}]"
+            其中 [...] 是 Python repr 格式（单引号），不是合法 JSON。
+
+        处理：
+            1. 用 ast.literal_eval 安全解析单引号 dict 列表
+            2. 累加所有合法数组，去重
+            3. 复用 _extract_h5st_from_cdp_log 抽 h5st
+        """
+        import ast
+        # 处理 BOM
+        with open(json_path, "rb") as f:
+            raw = f.read()
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        text = raw.decode("utf-8", errors="replace")
+
+        # ⚠️ 2026-08-17 修复：影刀 RPA 写入文件时每行被截断到 ~10 万字符，
+        #    不能按行扫描。改成扫描整文本里的 `[{...}]` 完整 dict 配对。
+        #    使用 ast.parse 把整个文件当一个表达式解析，逐个提取 dict 字面量。
+        data = []
+
+        # 思路：定位所有 [{ 和 }] 配对，逐段提取 ast.literal_eval
+        # 因为单引号 dict 可能跨"行内换行"被截断，要从 [{ 开始到下一个完整 }] 结束
+        i = 0
+        n = len(text)
+        parse_attempts = 0
+        while i < n - 2:
+            # 找下一个 [{
+            if text[i] == '[' and i + 1 < n and text[i + 1] == '{':
+                # 找匹配的 ]（从后往前找最近的 }]）
+                # 启发式：dict 闭合后必是 ], 或 ]) 或 ] 之类
+                end = text.find('}]', i + 2)
+                if end < 0:
+                    # 没找到完整配对，可能文件被严重截断
+                    i += 2
+                    continue
+                # 尝试解析 [i, end+2) 这个片段
+                expr = text[i:end + 2]
+                parse_attempts += 1
+                try:
+                    obj = ast.literal_eval(expr)
+                    if isinstance(obj, list):
+                        data.extend(obj)
+                    elif isinstance(obj, dict):
+                        data.append(obj)
+                    i = end + 2  # 跳到 ] 之后继续找下一个 [{
+                    continue
+                except (ValueError, SyntaxError):
+                    # 这段可能被截断，向后挪1字符继续
+                    i += 1
+                    continue
+            else:
+                i += 1
+
+        # ⚠️ 兜底：如果上面完全没匹配到（极少见），尝试按"行"扫描（向后兼容）
+        if not data:
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                start = line.find('[{')
+                if start < 0:
+                    continue
+                if not line.endswith(']'):
+                    continue
+                expr = line[start:]
+                try:
+                    obj = ast.literal_eval(expr)
+                    if isinstance(obj, list):
+                        data.extend(obj)
+                    elif isinstance(obj, dict):
+                        data.append(obj)
+                except (ValueError, SyntaxError):
+                    continue
+
+        if not data:
+            raise ValueError(
+                f"无法解析 CDP 日志（{json_path}）："
+                f"未找到任何 [{...}] 数组行。文件前 200 字符：\n{text[:200]!r}"
+            )
+
+        # ⚠️ 2026-08-17 大改：ast 解析经常失败（dict 嵌套太深），
+        #    改成直接调 _extract_h5st_from_cdp_log 扫原始 text（该函数已改成正则扫文本）
+        try:
+            result = self._extract_h5st_from_cdp_log(json_path)
+            result["source"] = result["source"] + f" | file={os.path.basename(json_path)}"
+            return result
+        except ValueError:
+            # 正则也没找到 → 抛出更详细错误（提示 ast 解析失败也无济于事）
+            raise
+        # 旧的 tmp_path 复用方式已废弃（ast 解析不能保证数据完整，会丢 h5st）
+
+    # ====================== h5st 读取 ======================
+
     def get_h5st(self, check_expire: bool = True, h5st_key: str = "jm_order") -> str:
         """获取 h5st 字符串
 
@@ -320,7 +622,6 @@ class AuthLoader:
             h5st_key - h5st 子类型（默认 jm_order）：
                 "jm_order"      → 京麦订单明细（项目14）
                 "jm_after_sale" → 京麦售后明细（项目16）
-                "jzt"           → 京准通（项目1）
 
         返回:
             str - h5st 字符串
@@ -332,6 +633,10 @@ class AuthLoader:
         关键（2026-08-14 实测）：
             不同业务页面的 h5st 不能跨业务复用！必须传正确的 h5st_key。
             错误使用售后页 h5st 跑订单明细 → 服务端返回 code=1001 未登录
+
+        ⚠️ 2026-08-15 修订：京准通业务不在此 API 范围内。
+        京准通 add/list 接口实测不需要 h5st（HTTP 200 不被拦截），
+        项目 7 章节的"h5st 必需"结论已修正。详见 SKILL.md 京准通分区。
         """
         if h5st_key not in H5ST_KEY_MAP:
             raise ValueError(f"未知 h5st_key={h5st_key!r}，合法值: {list(H5ST_KEY_MAP.keys())}")
@@ -343,11 +648,66 @@ class AuthLoader:
         try:
             json_path = self._find_h5st_file(h5st_key)
             if json_path.endswith(".json"):
-                with open(json_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                h5st_value = data.get("h5st", "").strip()
+                try:
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    h5st_value = data.get("h5st", "").strip() if isinstance(data, dict) else ""
+                except json.JSONDecodeError:
+                    # ⚠️ 2026-08-15 实测：拼音命名文件存的是 CDP 抓包日志
+                    #    真实文件格式：每行 "[信息] [时间] [{...}, ...]"（Python repr 单引号）
+                    #    json.load() 会失败，需要走 _extract_h5st_from_pinyin_cdp
+                    self.logger.info(
+                        f"🔍 {json_path} 不是干净 JSON，尝试按 CDP 抓包日志格式解析"
+                    )
+                    cdp_result = self._extract_h5st_from_pinyin_cdp(json_path)
+                    h5st_value = cdp_result["h5st"]
+                    captured_at_cdp = cdp_result["captured_at"]
+                    self.logger.info(
+                        f"✅ 从 CDP 日志抽取 h5st：{json_path} | {cdp_result['api']} | ttl={cdp_result['ttl_seconds']}s"
+                    )
+                    # 过期检查（统一毫秒）
+                    if check_expire and captured_at_cdp > 0:
+                        age_seconds = (time.time() * 1000 - captured_at_cdp) / 1000
+                        if age_seconds > H5ST_EXPIRE_SECONDS:
+                            self._try_rpa_refresh(reason=f"h5st 过期 {age_seconds:.0f}秒 > {H5ST_EXPIRE_SECONDS}秒")
+                            raise H5stExpiredError(
+                                f"❌ {json_path} 抽出的 h5st 已过期 {age_seconds/60:.1f} 分钟 > 30 分钟\n"
+                                f"   captured_at: {datetime.fromtimestamp(captured_at_cdp/1000).isoformat()}\n"
+                                f"   → 请 RPA 重新抓取（影刀任务：{DEFAULT_RPA_TASK}）"
+                            )
+                    self._set_cache(cache_key, h5st_value)
+                    return h5st_value
                 if not h5st_value:
-                    raise ValueError(f"JSON 文件 {json_path} 不含 h5st 字段")
+                    # data 是合法 dict 但没 h5st 字段，且不是 dict 类型 → 走 CDP 分支
+                    if isinstance(data, list):
+                        # 顶层是 list（可能是 CDP 抓包数组）
+                        tmp_path = json_path + ".tmp"
+                        with open(tmp_path, "w", encoding="utf-8") as f:
+                            json.dump(data, f, ensure_ascii=False)
+                        try:
+                            cdp_result = self._extract_h5st_from_cdp_log(tmp_path)
+                        finally:
+                            try:
+                                os.remove(tmp_path)
+                            except OSError:
+                                pass
+                        h5st_value = cdp_result["h5st"]
+                        captured_at_cdp = cdp_result["captured_at"]
+                        self.logger.info(
+                            f"✅ 从 CDP 日志（list）抽取 h5st：{json_path} | {cdp_result['api']} | ttl={cdp_result['ttl_seconds']}s"
+                        )
+                        if check_expire and captured_at_cdp > 0:
+                            age_seconds = (time.time() * 1000 - captured_at_cdp) / 1000
+                            if age_seconds > H5ST_EXPIRE_SECONDS:
+                                self._try_rpa_refresh(reason=f"h5st 过期 {age_seconds:.0f}秒 > {H5ST_EXPIRE_SECONDS}秒")
+                                raise H5stExpiredError(
+                                    f"❌ {json_path} 抽出的 h5st 已过期 {age_seconds/60:.1f} 分钟 > 30 分钟\n"
+                                    f"   captured_at: {datetime.fromtimestamp(captured_at_cdp/1000).isoformat()}\n"
+                                    f"   → 请 RPA 重新抓取（影刀任务：{DEFAULT_RPA_TASK}）"
+                                )
+                        self._set_cache(cache_key, h5st_value)
+                        return h5st_value
+                    raise ValueError(f"JSON 文件 {json_path} 不含 h5st 字段（且不是 CDP 日志格式）")
                 if check_expire:
                     captured_at = data.get("captured_at", 0)
                     if captured_at > 0:

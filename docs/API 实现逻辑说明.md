@@ -750,16 +750,16 @@ h5st = "<浏览器F12抓 add 接口请求头复制>"
 | 异常 | 触发场景 | 处理 |
 |------|----------|------|
 | `FileNotFoundError` | `config/jzt_cookie.txt` 不存在 | 立即停止，提示抓包填入 |
-| `ValueError` | h5st 为空 / Cookie 文件为空 | 立即停止 |
-| `RuntimeError` | 业务码 601（h5st 过期）/ 业务码非0 / HTTP raise_for_status | 立即停止，提示用户排查 |
+| `ValueError` | Cookie 文件为空 | 立即停止 |
+| `RuntimeError` | 业务码 601（操作频繁/风控）/ 业务码非0 / HTTP raise_for_status | 立即停止，提示用户排查 |
 | `requests.exceptions.Timeout` | 请求超时（30s 创建/轮询，60s 下载）| **未捕获**（让调用方处理，阶段4 加入重试）|
 
 ### 调用示例（写进代码注释）
 ```python
 from main import JZTKuaicheAPI
 
-# h5st 从浏览器抓 add 接口获取填入
-api = JZTKuaicheAPI(h5st="抓包得到h5st字符串")
+# ⚠️ 2026-08-15 修订：京准通仅 Cookie 鉴权，不需要 h5st（list/add 均 HTTP 200）
+api = JZTKuaicheAPI()
 task_id = api.create_export_task("2026-08-07", "2026-08-07")
 print(f"任务ID: {task_id}")
 task_data = api.get_task_list()  # 阶段3 骨架：调用方手动轮询

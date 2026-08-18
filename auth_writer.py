@@ -41,10 +41,10 @@ BIZ_TYPE_MAP = {
 
 # h5st 子类型（按业务页面区分，2026-08-14 实测：不同页面 h5st 不能跨业务）
 # 实证：售后页 h5st 跑订单明细 → 服务端 code=1001 未登录
+# ⚠️ 2026-08-15 修订：京准通实测不需要 h5st（list/add 均 HTTP 200），不再登记 jzt 子类型
 H5ST_KEY_MAP = {
     "jm_order": "h5st_jm_order.json",       # 京麦订单明细（项目14）
     "jm_after_sale": "h5st_jm_after_sale.json",  # 京麦售后明细（项目16）
-    "jzt": "h5st_jzt.json",                 # 京准通（项目1，项目8-12 不需要）
 }
 
 
@@ -103,7 +103,7 @@ def write_h5st(shop_id: str, h5st_value: str, ua: str = "", biz_domain: str = ""
         h5st_key - h5st 子类型（必填）：
             "jm_order"      → 写入 h5st_jm_order.json（京麦订单明细）
             "jm_after_sale" → 写入 h5st_jm_after_sale.json（京麦售后明细）
-            "jzt"           → 写入 h5st_jzt.json（京准通）
+            （⚠️ 2026-08-15 修订：京准通实测不需要 h5st，无 jzt 子类型）
 
     返回:
         str - 写入的文件绝对路径
@@ -165,7 +165,7 @@ def write_from_raw_file(shop_id: str, raw_cookie_path: str, biz_type: str = None
 DEFAULT_API_KEYWORDS = {
     "jm_order": ["createdExportTask"],          # 京麦订单明细
     "jm_after_sale": ["ExportDsmService.createExportTask"],  # 京麦售后明细
-    "jzt": ["customreport/v2/report/report"],   # 京准通 add 接口
+    # ⚠️ 2026-08-15 修订：京准通实测不需要 h5st（list/add 均 HTTP 200），删除 jzt 关键词
 }
 
 
@@ -312,8 +312,8 @@ def main(argv=None):
     h5st_parser.add_argument(
         "--h5st_key",
         required=True,
-        choices=["jm_order", "jm_after_sale", "jzt"],
-        help="h5st 子类型：jm_order=订单明细 / jm_after_sale=售后明细 / jzt=京准通",
+        choices=["jm_order", "jm_after_sale"],
+        help="h5st 子类型：jm_order=订单明细 / jm_after_sale=售后明细（京准通不需要 h5st，2026-08-15 实测）",
     )
 
     # 子命令 3: raw（从临时文件读）
@@ -332,8 +332,8 @@ def main(argv=None):
     extract_parser.add_argument(
         "--h5st_key",
         required=True,
-        choices=["jm_order", "jm_after_sale", "jzt"],
-        help="h5st 子类型（决定写哪个文件）",
+        choices=["jm_order", "jm_after_sale"],
+        help="h5st 子类型（决定写哪个文件；京准通不需要 h5st，2026-08-15 实测）",
     )
     extract_parser.add_argument(
         "--api_keyword",

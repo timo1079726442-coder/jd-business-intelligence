@@ -1,4 +1,4 @@
-﻿# 敏感信息
+# 敏感信息
 # 商智独立 Cookie（与京麦/京准通不互通，项目1/4/5/6/13；2026-08-11 重命名 cookie.txt → sz_cookie.txt）
 config/sz_cookie.txt
 
@@ -27,6 +27,12 @@ config/*/jm_cookie.json
 config/*/h5st.json
 # 2026-08-14 3域独立 h5st JSON（项目20，敏感鉴权，禁止入仓）
 config/*/h5st_*.json
+# 2026-08-15 现场拼音命名鉴权文件（jm_dingdan / jm_shouhou 对应订单/售后业务，CDP日志格式）
+config/*/jm_dingdan_*.json
+config/*/jm_shouhou_*.json
+# 2026-08-17 多店铺 {{短前缀}}_* 平铺命名鉴权文件（影刀 RPA 输出格式，含 Cookie/h5st，敏感！）
+config/{{*}}_*.json
+config/{{*}}_*.txt
 # 2026-08-14 影刀 CDP 浏览器数据目录（含 Cookie/登录数据，敏感，禁止入仓）
 browser_data/
 

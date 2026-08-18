@@ -747,26 +747,26 @@ export.action GET 下载 {taskId}.zip
 ### 模块业务定位（2026-08-07 吸收项目7 落地）
 - **业务范围**：京准通广告投放后台（`jzt.jd.com/home`）的快车/海投/DMP 等广告报表导出
 - **鉴权体系**：与商智/京麦**完全不同**——
-  - **h5st 请求头**：浏览器 JS 动态生成，前端强签名，**短期有效**（过期业务码 601）
+  - **仅 Cookie 鉴权，不需要 h5st**：⚠️ 2026-08-15 实测反证——jzt-api list/add 不带 h5st 均 HTTP 200（add 返 code=400 参数错误，非登录/风控错误）；曾误判为"必须 h5st"，已修正
   - **Cookie**：jzt.jd.com 域 Cookie，**与商智/京麦不互通**，必须独立文件 `config/jzt_cookie.txt`
   - **无 User-mnp / 无 uuid**：京准通域**不校验** User-mnp/uuid 字段（项目7 抓包已确认）
 - **流程模型**：异步三步流程（创建任务 → 轮询列表 → CDN 下载），与商智同步请求-响应完全不同
 - **核心风险**：
   - downloadUrl 是一次性签名 CDN 链接，**过期 403 需重新轮询刷新**
-  - h5st 与 UA 绑定，**禁用基类 UA 切换**（切换会致 h5st 失效）
-  - 不适用基类 30 秒间隔 + 3 次重试模型（h5st 短期有效，重试加重风控）
-- **配置规则**：h5st 通过 `__init__(h5st=...)` 外部传入；脚本不实现 JS 签名（复杂度高）
+  - UA 固定（京准通实测无 h5st 绑定约束，保留固定 UA 习惯）
+  - 不适用基类 30 秒间隔 + 3 次重试模型（异步任务重试会重复创建报表）
+- **配置规则**：仅 Cookie 鉴权，脚本不实现任何前端签名（复杂度高，且实测不需要）
 
 ### 与商智域的架构差异对照
 | 维度 | 商智域（项目1-6）| 京准通域（项目7+）|
 |------|----------------|------------------|
-| 鉴权参数 | Cookie + User-mnp/uuid | **Cookie + h5st** |
-| 鉴权签名 | MD5(URL+uuid+ts+salt) | **h5st 一次性签名（外部传入）** |
+| 鉴权参数 | Cookie + User-mnp/uuid | **仅 Cookie**（不需要 h5st，2026-08-15 实测）|
+| 鉴权签名 | MD5(URL+uuid+ts+salt) | **无**（前端无签名要求）|
 | Cookie 文件 | `config/cookie.txt` | **`config/jzt_cookie.txt`**（独立）|
 | 请求方式 | 表单 / JSON | **JSON** |
 | 流程模型 | 同步请求-响应 | **异步三步：创建 → 轮询 → 下载** |
-| 重试模型 | 基类 30s 间隔 + 3 次重试 | **不适配**（h5st 短期有效）|
-| UA 切换 | 基类 Edge↔Chrome | **禁用**（UA 与 h5st 绑定）|
+| 重试模型 | 基类 30s 间隔 + 3 次重试 | **不适配**（异步任务重试会重复创建）|
+| UA 切换 | 基类 Edge↔Chrome | **固定 UA**（京准通无 h5st 绑定约束，保留习惯）|
 | Excel 后置 | `safe_convert_numeric` + `apply_column_formats` | 复用（阶段5 补）|
 
 ---
@@ -785,11 +785,11 @@ export.action GET 下载 {taskId}.zip
 
 ### 关键实现点
 1. **Cookie 独立读取**：类内自实现 `__init__()` 读 `config/jzt_cookie.txt`，不存在抛 `FileNotFoundError` 强制抓包
-2. **h5st 外部传入**：`__init__(h5st: str)`，脚本不实现 JS 签名
+2. **h5st 不需要**：`__init__(cookie_path=...)` 仅 Cookie 鉴权。⚠️ **2026-08-15 实测反证**：list/add 接口不带 h5st 均 HTTP 200（add 返 code=400 参数错误，非登录/风控错误），项目7 不需要 h5st
 3. **payload 模板类内常量**：`JZT_KUAICHE_PAYLOAD_TEMPLATE`（18 个顶层字段，最小字段版）；完整版延后抽 `templates/*.json`
 4. **三步异步流程骨架**：仅 3 个接口方法，**不含轮询循环**（阶段4 容错适配补充）
-5. **基础异常识别**：业务码 601 → h5st 过期提示；业务码非0 → 完整响应回显便于排查
-6. **禁用基类 UA 切换**：业务内固定 UA（与 h5st 绑定）
+5. **基础异常识别**：业务码 601 → 操作频繁/风控提示（不再解读为 h5st 过期）；业务码非0 → 完整响应回显便于排查
+6. **UA 固定**：业务内固定 UA（与基类 UA 切换机制不同，京准通实测无 h5st 绑定约束）
 
 ### 业务参数（payload 最少字段版）
 - `caliberSettings`：转化周期 15 天 + 点击 + 不含赠品 + 成交订单
@@ -816,9 +816,9 @@ python main.py --list
 
 ### 踩坑要点（阶段3 预防）
 1. **Cookie 不互通**：jzt.jd.com 域 Cookie 不能复用商智/京麦 Cookie，必须独立抓
-2. **h5st 短期有效**：抓包值几分钟到几十分钟过期，业务码 601 时必须重新抓
+2. **不需要 h5st**：⚠️ 2026-08-15 实测反证——京准通 jzt-api list/add 不带 h5st 均 HTTP 200，**项目7 无 h5st**（曾误判为"必须 h5st"，已修正）
 3. **downloadUrl 一次性**：CDN 链接过期 403，必须重新调 `/list` 刷新
-4. **禁用 UA 切换**：基类 UA 切换机制与 h5st 绑定会失效，业务内固定 UA
+4. **UA 固定**：业务内固定 UA（京准通实测无 h5st 绑定约束，保留固定 UA 习惯）
 5. **不写 uuid**：京准通域未校验 uuid 字段（已抓包确认），不要画蛇添足
 6. **payload 不要硬编码到 .env**：业务参数体量大放代码内常量更易维护，模板变更在代码内改
 
@@ -1320,6 +1320,7 @@ config/{shop_id}/sz_cookie.txt  jzt_cookie.txt  jm_cookie.txt  h5st.txt  imap_co
 
 | 日期 | 改动概要 |
 |------|----------|
+| 2026-08-15 | **京准通不需要 h5st（修正项目7/20 的误判）**：① **实测反证**——用京麦 Cookie 直连 jzt-api.jd.com：`GET /dataCenter/customreport/v2/report/list` 无 h5st → **HTTP 200 code:1**；`POST /add` 无 h5st → **HTTP 200 code:400**（参数错误，非登录/风控错误）。**结论：京准通全系接口仅 Cookie 鉴权，不需要 h5st**；② **代码修改**——`auth_loader.py` 的 `H5ST_KEY_MAP` 删除 `"jzt": "h5st_jzt.json"`（get_h5st 不再支持 jzt）；`module1.py` 删除 `--jzt_h5st` CLI 参数 + 京准通红路由块；`main.py` 的 `JZTKuaicheAPI.__init__` 去掉 h5st 参数/self.h5st/h5st 头注入，`_run_jzt_kuaiche_full` 不再读 h5st，BUSINESS_REGISTRY 的 desc/params 改写，601 错误提示从"h5st 过期"改为"操作频繁/风控"；③ **文档修订**——SKILL.md 项目7 章节「模块业务定位」「与商智域差异对照」「关键实现点」「踩坑要点」全部改写为"无 h5st"；docs/一键全部跑指南.md 删除 `--jzt_h5st` 用法；④ **适用范围澄清**：h5st 仅京麦 sff.jd.com（订单/售后）需要；商智/京准通均不需要。曾误判来源：项目7 上线时未做"删 h5st 跑通"反例测试，2026-08-15 用户质疑后实测纠正 |
 | 2026-08-14 | **项目20：3 域独立 h5st 抓取架构（解决 h5st 不能跨业务复用）**：① **关键发现**：同店同账号下，订单页 h5st 不能用于售后业务、售后页 h5st 不能用于订单业务（实测：售后页 h5st 跑订单明细 → 服务端 code=1001 未登录；订单页 h5st 跑售后明细 → code=200 成功）；② 改造 `auth_writer.py`：新增 `--h5st_key` 参数支持 3 个子类型（`jm_order`/`jm_after_sale`/`jzt`），分别写 `h5st_jm_order.json`/`h5st_jm_after_sale.json`/`h5st_jzt.json`；③ 改造 `auth_loader.py`：所有 h5st 方法（`get_h5st`/`is_h5st_expired`/`get_h5st_age_seconds`/`_try_get_h5st_safe`）新增 `h5st_key` 参数，H5ST_KEY_MAP 映射 → `_find_h5st_file(h5st_key)` 按子类型找文件（**向后兼容**：找不到时 fallback 到旧 `h5st.json`）；④ 改造 `module1.py`：新增 3 个 CLI 参数 `--jm_order_h5st`/`--jm_after_sale_h5st`/`--jzt_h5st`，**自动按 biz_key 路由到对应 h5st**（如 biz_keys 含「京麦售后明细」→ 自动读 `h5st_jm_after_sale.json`）；⑤ 改造 `main.py`：6 个 `_run_jm_xxx` 调度函数（订单4个+售后1个）的 h5st 取值从 `kwargs.get("h5st")` 改为 `kwargs.get("jm_order_h5st") or kwargs.get("hzt_h5st") or kwargs.get("h5st")`（**优先级：新版专用 → 旧版通用**）；⑥ **RPA 端配置**：影刀需在 3 个不同页面分别抓 h5st（订单导出页 → jm_order / 售后明细页 → jm_after_sale / 京准通页 → jzt）；⑦ 验证：`auth_writer.py h5st --shop "X" --value "Y" --h5st_key jm_order` 写入成功（含 `h5st_key` 标记字段） |
 | 2026-08-13 | **项目19：影刀 RPA 自动化集成（多店铺循环 + Python 调用）**：① 新增 `docs/RPA集成指南.md`（454 行）含完整流程图（外层循环遍历 config.xlsx「店铺账号」sheet × 子流程 A 拟人登录+抓鉴权 × 子流程 B 调 Python 跑业务 × 退出码触发重抓）；② 新增 `module1.py`（~220 行）作为影刀调用 Python 入口，CLI 接口 `--shop --biz_keys --date --h5st --range` 等 10 个参数，**退出码约定**：0=全部成功/1=业务失败/2=鉴权过期（影刀重抓）/3=系统错误；环境变量强制 `AUTH_LOADER=1 SHOP_ID={shop}`，stdout 标 `[SHOP]/[OK]/[FAIL]/[AUTH_EXPIRED]` 供影刀监听；③ 新增 `auth_writer.py`（~190 行）影刀写 JSON 辅助工具，3 个子命令：cookie（直接传 JSON 字符串）、h5st（自动加 13 位毫秒时间戳 captured_at）、raw（从临时文件读），**自动加 BOM 兼容**（PowerShell echo 会写 BOM）；路径校验防注入（禁止 `..`/`/`/`\\`）；④ config.xlsx「店铺账号」sheet 约定：A=店铺名/B=账号/C=密码/D=启用（"是"/其他），第 E 列预留给导出历史；⑤ **关键易错点**：路径含 `\t` 时被 Python 当 tab 字符、影刀 `args.biz` 被 `biz_type = None` 覆盖、退出码不监听导致死循环；⑥ 验证 4 场景全过：h5st 写+毫秒戳、cookie 写+读回、退出码示例、module1 --help 完整 CLI；⑦ 后续优化：监听 module1 stdout 触发重抓（影刀可读 `[AUTH_EXPIRED]` 自动跳转）、Excel「店铺账号」sheet 第 E 列加导出历史 |
 | 2026-08-13 | **项目18：auth_loader 鉴权加载器 + JSON 改造 + RPA 集成（环境驱动启用）**：① **新增 `auth_loader.py`（~440 行）**——单例 AuthLoader：a) 读 `config/{shop_id}/{jm,jzt,sz}_cookie.json`（浏览器 DevTools 导出格式，带 expires 时间戳）→ 转成 `name=val; name=val` 字符串（向后兼容 requests）；b) 读 `config/{shop_id}/h5st.json`（带 `captured_at` 毫秒时间戳）→ 检查 30 分钟过期；c) **Cookie 过期检查**（按 expires 字段精确判断，sessionCookie=true 跳过）；d) **RPA 接口预留**——过期时 `subprocess.Popen(yingdao.exe, jd_refresh)` 异步派发（不阻塞），未找到仅 warning；e) **5 级文件查找**（shop_id JSON → shop_id TXT → 根 JSON → 根 TXT → 报错），向后兼容；f) **缓存 5 秒 TTL**（避免 IO 抖动）；g) 环境变量 `AUTH_LOADER=1` 启用、`AUTH_RPA_CLI=0` 关闭 RPA；h) **3 个异常**：`CookieExpiredError` / `H5stExpiredError` / `AuthFileNotFound`；i) CLI 调试 `python auth_loader.py "店铺名" "sz"`；② **main.py 改造 3 处**——`JDBaseRequest.__init__` + `JZTKuaicheAPI.__init__` + `JingMaiOrderExportAPI.__init__` 全部加 AuthLoader 接管，触发条件 `AUTH_LOADER=1` 或 `cookie_path` 包含 `.json`；③ **向后兼容**——未启用时仍走原 `_read_cookie()` 读 .txt，老代码无感知；④ **验证**——3 场景全过（默认 .txt / 启用 .json / 京麦售后明细无 cookie 优雅报错）；⑤ **RPA 集成说明**——影刀任务 `jd_refresh` 需自行配置抓包写入 `config/{shop_id}/{jm,jzt,sz}_cookie.json` + `h5st.json`（带 `captured_at` 字段） |
