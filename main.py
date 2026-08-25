@@ -70,6 +70,14 @@ def SHOP_NAME() -> str:
     return runtime_config.get_shop_name_display()
 
 
+# H-26 修复（2026-08-25 用户决策）：默认走 JSON 鉴权（AuthLoader），txt 仅作备选
+# 背景：AUTH_LOADER 默认 "0" 导致 daily_update/fill_missing 直接调 main 时走 .txt 报错
+# 决策：默认 "1"（JSON 优先），AuthLoader 内部找不到 JSON 自动兜底 .txt
+def _auth_loader_enabled() -> bool:
+    """是否启用 AuthLoader（JSON 优先）。默认 True；显式设 AUTH_LOADER=0 可关。"""
+    return os.getenv("AUTH_LOADER", "1") == "1"
+
+
 # ============================================================
 #  自定义异常
 # ============================================================
@@ -580,7 +588,7 @@ class JDBaseRequest:
         os.makedirs(self.log_dir, exist_ok=True)
 
         self._use_auth_loader = (
-            os.getenv("AUTH_LOADER", "0") == "1" or
+            _auth_loader_enabled() or
             (cookie_path and cookie_path.endswith(".json"))
         )
         if self._use_auth_loader:
@@ -3015,7 +3023,7 @@ class JZTKuaicheAPI:
         # 1. 读取 Cookie（不存在即抛错，强制用户抓包填入）
         # ⚠️ 2026-08-13 升级：AuthLoader 接管（环境变量 AUTH_LOADER=1 启用或 cookie_path 包含 .json）
         _use_auth_loader = (
-            os.getenv("AUTH_LOADER", "0") == "1" or
+            _auth_loader_enabled() or
             cookie_path.endswith(".json")
         )
         if _use_auth_loader:
@@ -3968,7 +3976,7 @@ class JZTKuaicheOrderEffectAPI:
 
         # AuthLoader 接管（2026-08-20：与项目7 一致）
         _use_auth_loader = (
-            os.getenv("AUTH_LOADER", "0") == "1" or
+            _auth_loader_enabled() or
             cookie_path.endswith(".json")
         )
         if _use_auth_loader:
@@ -4780,7 +4788,7 @@ class JZTQuanZhanCampaignAPI:
 
         # AuthLoader 接管（2026-08-20：与项目7 一致）
         _use_auth_loader = (
-            os.getenv("AUTH_LOADER", "0") == "1" or
+            _auth_loader_enabled() or
             cookie_path.endswith(".json")
         )
         if _use_auth_loader:
@@ -5086,7 +5094,7 @@ class JZTQuanZhanEffectAPI:
 
         # AuthLoader 接管（2026-08-20：与项目7 一致）
         _use_auth_loader = (
-            os.getenv("AUTH_LOADER", "0") == "1" or
+            _auth_loader_enabled() or
             cookie_path.endswith(".json")
         )
         if _use_auth_loader:
@@ -5620,7 +5628,7 @@ class JZTQuanZhanCampaignAllStoreAPI:
 
         # AuthLoader 接管（2026-08-20：与项目7 一致）
         _use_auth_loader = (
-            os.getenv("AUTH_LOADER", "0") == "1" or
+            _auth_loader_enabled() or
             cookie_path.endswith(".json")
         )
         if _use_auth_loader:
@@ -6019,7 +6027,7 @@ class JZTQuanZhanEffectAllStoreAPI:
 
         # AuthLoader 接管（2026-08-20：与项目7 一致）
         _use_auth_loader = (
-            os.getenv("AUTH_LOADER", "0") == "1" or
+            _auth_loader_enabled() or
             cookie_path.endswith(".json")
         )
         if _use_auth_loader:
@@ -6868,7 +6876,7 @@ class JingMaiOrderExportAPI:
         # 1. h5st 校验（必填，前端强签名一次性）
         # ⚠️ 2026-08-13 升级：h5st 缺失时优先走 AuthLoader 读（如果启用）
         _use_auth_loader = (
-            os.getenv("AUTH_LOADER", "0") == "1" or
+            _auth_loader_enabled() or
             cookie_path.endswith(".json")
         )
         if not h5st and _use_auth_loader:
@@ -9511,7 +9519,7 @@ def _run_jm_run_full_export(**kwargs) -> dict:
     # ⚠️ 2026-08-14 改造：优先取 jm_order_h5st（项目14 专用），fallback h5st
     h5st = kwargs.get("jm_order_h5st") or kwargs.get("h5st", "")
     # 2026-08-20：h5st 未传时从 AuthLoader 获取
-    if not h5st and os.getenv("AUTH_LOADER", "0") == "1":
+    if not h5st and _auth_loader_enabled():
         try:
             from auth_loader import AuthLoader
             _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
@@ -9564,7 +9572,7 @@ def _run_jm_after_sale_full(**kwargs) -> dict:
     # ⚠️ 2026-08-14 改造：优先取 jm_after_sale_h5st（项目16 专用），fallback h5st
     h5st = kwargs.get("jm_after_sale_h5st") or kwargs.get("h5st", "")
     # 2026-08-20：h5st 未传时从 AuthLoader 获取
-    if not h5st and os.getenv("AUTH_LOADER", "0") == "1":
+    if not h5st and _auth_loader_enabled():
         try:
             from auth_loader import AuthLoader
             _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
@@ -9580,7 +9588,7 @@ def _run_jm_after_sale_full(**kwargs) -> dict:
 
     # 2026-08-20：cookie_path 未传时从 AuthLoader 获取实际文件路径
     cookie_path = kwargs.get("cookie_path")
-    if not cookie_path and os.getenv("AUTH_LOADER", "0") == "1":
+    if not cookie_path and _auth_loader_enabled():
         try:
             from auth_loader import AuthLoader
             _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
