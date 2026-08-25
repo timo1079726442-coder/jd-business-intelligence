@@ -75,13 +75,15 @@ __pycache__/
 
 # 测试和临时文件
 test_*.py
-_test_*.py        # 2026-08-09 补充：下划线开头的临时测试脚本不入仓
+# 2026-08-09 补充：下划线开头的临时测试脚本不入仓
+_test_*.py
 check_*.py
 find_*.py
 analyze_*.py
 git_*.py
 create_*.py
-!create_config_xlsx.py  # 但保留配置文件生成脚本
+# 但保留配置文件生成脚本
+!create_config_xlsx.py
 
 # 2026-08-09 明确指定：京准通测试脚本不入仓（防止 git glob 漏匹配）
 /_test_jzt_kuaiche.py
@@ -96,15 +98,20 @@ test_*.html
 
 # H-23 修复（2026-08-24 审计）：调试日志 + 一键抓包脚本不入仓（避免 Cookie/请求日志泄漏）
 debug.log
-_extract_*.py        # _extract_h5st.py 等一次性抓包脚本
-_*_capture*.json      # *_capture_payload.json / *_capture.json / ota_gen3.json 等
-_*_generated_*.json   # *_generated_payload.json / *_generated_payload2.json
+# _extract_h5st.py 等一次性抓包脚本
+_extract_*.py
+# *_capture_payload.json / *_capture.json / ota_gen3.json 等
+_*_capture*.json
+# *_generated_payload.json / *_generated_payload2.json
+_*_generated_*.json
 config/config.xlsx.tmp
 config/config_new.xlsx
-config/*.db           # config/ 下任何 SQLite 库（含旧 shops.db 等）
+# config/ 下任何 SQLite 库（含旧 shops.db 等）
+config/*.db
 
 # H-23 修复（2026-08-24 审计）：Office 全格式锁文件 + 通用临时文件
-~$*                   # 所有 MS Office 锁（不限于 xlsx）
+# 所有 MS Office 锁（不限于 xlsx）
+~$*
 *.tmp
 *.swp
 .*.swp
