@@ -49,38 +49,18 @@ from datetime import datetime, timedelta
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
-# ====================================================================
-#  业务配置：MVP 先做 2 个
-# ====================================================================
+# Phase 2.4（2026-08-20）：业务清单 + 业务特性从 config.xlsx 读取
+# 替代原硬编码 MVP_BIZ_KEYS / BIZ_FEATURES（AGENTS.md 第3条禁止硬编码业务列表）
+from biz_config_loader import list_biz_keys, get_biz_feature
 
-# 业务清单 + 是否支持区间
-# MVP 阶段只做这 2 个；全量业务后续扩展
-MVP_BIZ_KEYS = [
-    "商智关键词分析",       # day 粒度：逐日；month 粒度：直接区间
-    "店铺来源_三级渠道",     # 单日/区间都支持
-]
-
-# 业务特点（区分 supports_range）
-BIZ_FEATURES = {
-    "商智关键词分析": {
-        # supports_range 标记是否支持直接 start_date/end_date 区间调用
-        # day 粒度下接口其实只支持单日，30 天必须逐日循环；
-        # month 粒度下接口支持 start_date/end_date 区间聚合
-        # daily_update 默认用 day 粒度（避免误用 month 引起空数据），所以 supports_range=False
-        "supports_range": False,
-        "default_granularity": "day",
-        "extra_kwargs": {},
-    },
-    "店铺来源_三级渠道": {
-        # 店铺来源_三级渠道支持单日和区间（业务实现）
-        "supports_range": True,
-        "default_granularity": None,
-        "extra_kwargs": {},
-    },
-    # 未来扩展：把项目1-20 业务都加上
-    # "商品流量来源_搜索": {"supports_range": False, "default_granularity": None, "extra_kwargs": {}},
-    # ...
-}
+# ====================================================================
+#  业务配置：从 config.xlsx「业务清单」sheet 读取（Phase 2.4 改造，2026-08-20）
+# ====================================================================
+# 替代原硬编码 MVP_BIZ_KEYS / BIZ_FEATURES（AGENTS.md 第3条禁止硬编码业务列表）
+# 调用方式：
+#   list_biz_keys()                → 启用的全部业务（默认 --biz_keys 入参）
+#   get_biz_feature(biz_key)       → 业务特性 dict（supports_range/default_granularity/extra_kwargs）
+# 数据源：config.xlsx「业务清单」sheet（由 create_config_sheets.py 生成）
 
 
 # ====================================================================
@@ -99,8 +79,26 @@ def _gen_date_range(start_date: str, end_date: str):
     return dates
 
 
-def _run_one_biz(biz_key: str, start_date: str, end_date: str, interval: int = 0, dry_run: bool = False):
-    """跑一个业务。
+# 退出码（与 AGENTS.md 第47-51条约定对齐）
+EXIT_SUCCESS = 0       # 全部成功
+EXIT_BIZ_FAIL = 1      # 部分业务失败
+EXIT_AUTH_EXPIRED = 2  # 鉴权过期（Cookie / h5st，触发影刀重抓）
+EXIT_SYSTEM_ERROR = 3  # 系统错误
+
+
+def _is_auth_expired_exception(e: Exception) -> bool:
+    """判断异常是否是鉴权过期类（兼容 main.py 与 auth_loader.py 两套定义）
+
+    背景：main.py:68 自定义了 CookieExpiredError，auth_loader.py:110 也定义了一套。
+    两套类互不继承，except (auth_loader.CookieExpiredError, ...) 会漏掉 main.py 抛的。
+    按类名判断最稳健，跨模块兼容。
+    """
+    name = type(e).__name__
+    return name in ("CookieExpiredError", "H5stExpiredError", "AuthFileNotFound")
+
+
+def _run_one_biz(biz_key: str, start_date: str, end_date: str, interval: int = 0, dry_run: bool = False) -> int:
+    """跑一个业务，返回退出码（0=成功 / 1=业务失败 / 2=鉴权过期）。
 
     策略：
         - supports_range=True：直接区间调用
@@ -109,10 +107,11 @@ def _run_one_biz(biz_key: str, start_date: str, end_date: str, interval: int = 0
     import main  # 延迟导入，避免循环引用
     import time
 
-    feature = BIZ_FEATURES.get(biz_key, {})
+    # Phase 2.4：业务特性从 config.xlsx 读取（替代 BIZ_FEATURES 字典）
+    feature = get_biz_feature(biz_key)
     if not feature:
         logging.warning(f"⚠️ 业务 {biz_key} 无特性配置，跳过")
-        return False
+        return EXIT_SUCCESS  # 无配置视为跳过，不当作失败
 
     supports_range = feature.get("supports_range", True)
     granularity = feature.get("default_granularity")
@@ -160,11 +159,15 @@ def _run_one_biz(biz_key: str, start_date: str, end_date: str, interval: int = 0
                     time.sleep(interval)
 
         print(f"✅ {biz_key} 完成")
-        return True
+        return EXIT_SUCCESS
     except Exception as e:
+        # 鉴权过期优先识别（按类名匹配，兼容 main.py 与 auth_loader.py 两套定义）
+        if _is_auth_expired_exception(e):
+            print(f"🔄 [鉴权过期] {biz_key}：{type(e).__name__}: {e}")
+            return EXIT_AUTH_EXPIRED
         print(f"❌ {biz_key} 失败：{type(e).__name__}: {e}")
         traceback.print_exc()
-        return False
+        return EXIT_BIZ_FAIL
 
 
 def main():
@@ -172,8 +175,8 @@ def main():
     parser.add_argument(
         "--biz_keys",
         type=str,
-        default=",".join(MVP_BIZ_KEYS),
-        help=f"业务key列表（逗号分隔），默认 MVP 2 个：{','.join(MVP_BIZ_KEYS)}",
+        default=",".join(list_biz_keys()),
+        help=f"业务key列表（逗号分隔），默认全部启用业务：{','.join(list_biz_keys())}",
     )
     parser.add_argument(
         "--start_date",
@@ -221,25 +224,53 @@ def main():
     # 跑每个业务
     success_count = 0
     failed_count = 0
+    auth_expired_count = 0  # 鉴权过期计数（独立于业务失败）
     for biz_key in biz_keys:
-        ok = _run_one_biz(biz_key, start_date, end_date, args.interval, args.dry_run)
-        if ok:
+        code = _run_one_biz(biz_key, start_date, end_date, args.interval, args.dry_run)
+        if code == EXIT_SUCCESS:
             success_count += 1
+        elif code == EXIT_AUTH_EXPIRED:
+            auth_expired_count += 1
         else:
             failed_count += 1
 
     # 总结
     print()
     print("=" * 70)
-    print(f"📊 总结：成功 {success_count} / 失败 {failed_count} / 总 {len(biz_keys)}")
+    print(f"📊 总结：成功 {success_count} / 失败 {failed_count} / 鉴权过期 {auth_expired_count} / 总 {len(biz_keys)}")
     print("=" * 70)
 
-    if failed_count == 0:
-        return 0
-    elif failed_count < len(biz_keys):
-        return 1
-    else:
-        return 1
+    # 退出码优先级：鉴权过期(2) > 业务失败(1) > 全部成功(0)
+    # AGENTS.md 第49条：鉴权过期触发影刀重抓，必须优先返回 2
+    if auth_expired_count > 0:
+        _try_flush_excel_master_safe()  # 项目24（2026-08-22）：鉴权过期也尝试刷总表
+        return EXIT_AUTH_EXPIRED
+    if failed_count > 0:
+        _try_flush_excel_master_safe()  # 部分失败也要刷（成功部分已 collect）
+        return EXIT_BIZ_FAIL
+
+    # 全部成功路径
+    _try_flush_excel_master_safe()
+    return EXIT_SUCCESS
+
+
+def _try_flush_excel_master_safe() -> None:
+    """daily_update.py 收尾的兜底 flush。
+
+    场景：
+        - daily_update.py 是 subprocess 调 main.run_business() 触发 collect
+        - main.run_business 不会主动调 flush（避免 daily_update 里重复调）
+        - 所以必须由 daily_update 自己负责收尾刷
+    """
+    try:
+        import excel_master as _em
+        from runtime_config import get_shop_id, get_shop_pin
+        shop_id = get_shop_id()
+        shop_pin = get_shop_pin()
+        _em.flush_shop(shop_id, shop_pin)
+    except Exception as e:
+        # flush 失败仅警告（不影响主流程退出码）
+        print(f"⚠️ [ExcelMaster] daily_update.flush_shop 失败（不影响 DB）：{type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
