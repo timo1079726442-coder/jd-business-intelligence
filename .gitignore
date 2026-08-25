@@ -33,6 +33,14 @@ config/*/jm_shouhou_*.json
 # 2026-08-17 多店铺 {{短前缀}}_* 平铺命名鉴权文件（影刀 RPA 输出格式，含 Cookie/h5st，敏感！）
 config/{{*}}_*.json
 config/{{*}}_*.txt
+# 2026-08-22 多店铺平铺命名鉴权文件（项目17/18 演化格式：FYA_jzt_cookie.json / MIYO_sz_cookie.json 等）
+#    ⚠️ 防止 git add . 误提交 Cookie/h5st 到远程仓库
+config/FYA_*_cookie.json
+config/FYA_*_h5st.json
+config/MIYO_*_cookie.json
+config/MIYO_*_h5st.json
+config/OTA_*_cookie.json
+config/OTA_*_h5st.json
 # 2026-08-14 影刀 CDP 浏览器数据目录（含 Cookie/登录数据，敏感，禁止入仓）
 browser_data/
 
@@ -85,7 +93,24 @@ test_*.html
 
 # 抓包JS文件（太大且敏感）
 *.js
-!jd_api/*.py
+
+# H-23 修复（2026-08-24 审计）：调试日志 + 一键抓包脚本不入仓（避免 Cookie/请求日志泄漏）
+debug.log
+_extract_*.py        # _extract_h5st.py 等一次性抓包脚本
+_*_capture*.json      # *_capture_payload.json / *_capture.json / ota_gen3.json 等
+_*_generated_*.json   # *_generated_payload.json / *_generated_payload2.json
+config/config.xlsx.tmp
+config/config_new.xlsx
+config/*.db           # config/ 下任何 SQLite 库（含旧 shops.db 等）
+
+# H-23 修复（2026-08-24 审计）：Office 全格式锁文件 + 通用临时文件
+~$*                   # 所有 MS Office 锁（不限于 xlsx）
+*.tmp
+*.swp
+.*.swp
+*.bak
+*.orig
+*.rej
 
 # 系统文件
 .DS_Store

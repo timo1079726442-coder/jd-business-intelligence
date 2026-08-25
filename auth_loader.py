@@ -29,6 +29,7 @@
     AuthFileNotFound   - 文件不存在
 """
 import os
+import sys
 import json
 import time
 import logging
@@ -62,15 +63,12 @@ BIZ_TYPE_MAP = {
     "jm":  ["jm_dingdan_cookie", "jm_shouhou_cookie", "jm_cookie"],  # 京麦（shop.jd.com）
 }
 
-# ⚠️ 2026-08-17 用户决策：店名前缀映射表
-# shop_id（业务调用方使用）→ file_prefix（RPA 实际命名）
+# ⚠️ 2026-08-20 Phase 2.5 改造：店名前缀映射改从 config.xlsx「店铺清单」sheet 读取
+# 替代原硬编码 SHOP_ID_TO_PREFIX / PREFIX_TO_SHOP_ID 字典（AGENTS.md 第3条禁止硬编码店铺列表）
+# 数据源：biz_config_loader.list_shops() / get_shop_prefix()
 # 双花括号 {{xxx}} 是影刀 RPA 模板语法未替换的副产品，字面保留读取
-SHOP_ID_TO_PREFIX = {
-    "FYA箱包旗舰店": "{{FYA}}",   # FYA 短前缀
-    "MIYO箱包旗舰店": "{{MIYO}}", # MIYO 短前缀
-    "OTA箱包旗舰店":  "{{OTA}}",  # OTA 短前缀
-}
-PREFIX_TO_SHOP_ID = {v: k for k, v in SHOP_ID_TO_PREFIX.items()}
+from biz_config_loader import get_shop_prefix as _cfg_get_shop_prefix
+from biz_config_loader import list_shop_ids as _cfg_list_shop_ids
 
 
 def resolve_file_prefix(shop_id: str) -> str:
@@ -79,15 +77,20 @@ def resolve_file_prefix(shop_id: str) -> str:
     示例:
         resolve_file_prefix("FYA箱包旗舰店") → "{{FYA}}"
         resolve_file_prefix("未知店") → "{{未知店}}"（兜底不抛异常）
+
+    数据源：config.xlsx「店铺清单」sheet（由 biz_config_loader 读取）
+    兜底：sheet 缺失时 biz_config_loader 自动回退到代码兜底常量并打印警告
     """
-    if shop_id in SHOP_ID_TO_PREFIX:
-        return SHOP_ID_TO_PREFIX[shop_id]
-    return f"{{{{{shop_id}}}}}"
+    return _cfg_get_shop_prefix(shop_id)
 
 
 def list_known_shops() -> list:
-    """列出所有已知店铺"""
-    return list(SHOP_ID_TO_PREFIX.keys())
+    """列出所有已知店铺（含停用的；如需只看启用店，调 biz_config_loader.list_shop_ids(True)）
+
+    数据源：config.xlsx「店铺清单」sheet
+    """
+    # 默认 enabled_only=False，与旧 SHOP_ID_TO_PREFIX.keys() 语义一致（含 OTA 等停用店）
+    return _cfg_list_shop_ids(enabled_only=False)
 
 
 # RPA CLI 默认占位命令（用户需替换为影刀实际可执行文件路径）
@@ -141,14 +144,30 @@ class AuthLoader:
         """初始化
 
         参数:
-            shop_id    - 店铺 ID，默认从环境变量 SHOP_ID 读，否则用 "FYA箱包旗舰店"
+            shop_id    - 店铺 ID；不传则从环境变量 SHOP_ID 读，仍未设置则 SystemExit(3)
             config_dir - 配置根目录，默认项目根下的 config/
         """
         # 单例 + 允许 reload：检测参数是否变了，变了就清缓存
         if hasattr(self, "_initialized") and self._initialized:
             if shop_id == self.shop_id and config_dir == self.config_dir:
                 return
-        self.shop_id = shop_id or os.getenv("SHOP_ID", "FYA箱包旗舰店")
+        # H-13 修复（2026-08-24 审计）：禁止静默回落到 "FYA箱包旗舰店"
+        # 背景：MIYO/OTA 跑业务时若 SHOP_ID 未传，会读到 FYA 鉴权 → 数据污染
+        # 修复策略：仿照 H-06 风格，未设置时 SystemExit(3)，让上层（CLI/RPA/影刀）显式 set
+        if shop_id:
+            self.shop_id = shop_id
+        else:
+            env_shop_id = os.getenv("SHOP_ID", "").strip()
+            if env_shop_id:
+                self.shop_id = env_shop_id
+            else:
+                print(
+                    "[FATAL] AuthLoader 初始化失败：未提供 shop_id 且环境变量 SHOP_ID 未设置\n"
+                    "   → 调用方必须显式传 shop_id 或 set SHOP_ID=FYA箱包旗舰店/MIYO箱包旗舰店/OTA箱包旗舰店\n"
+                    "   → 与 H-06 修复风格一致，禁止静默回落",
+                    file=sys.stderr,
+                )
+                sys.exit(3)
         self.config_dir = config_dir or CONFIG_DIR
         self._initialized = True
         # 缓存（避免重复读文件，5 秒内复用）
@@ -171,8 +190,27 @@ class AuthLoader:
 
     # ====================== 文件查找 ======================
 
+    def _get_prefix_variants(self) -> list:
+        """获取文件命名前缀的所有变体（2026-08-20 修复前缀不匹配）
+
+        resolve_file_prefix 返回 config.xlsx 中的值（如 {{FYA}}），
+        但实际 RPA 输出文件可能用 FYA（无花括号）。
+        本方法返回两种变体，确保都能找到文件。
+
+        返回:
+            list - 前缀字符串列表，如 ["{{FYA}}_", "FYA_"]
+        """
+        file_prefix = resolve_file_prefix(self.shop_id)
+        variants = [f"{file_prefix}_"]
+        # 去掉双花括号后的变体（如 {{FYA}} → FYA）
+        stripped = file_prefix.replace("{{", "").replace("}}", "")
+        stripped_prefix = f"{stripped}_"
+        if stripped_prefix not in variants:
+            variants.append(stripped_prefix)
+        return variants
+
     def _find_auth_file(self, biz_type: str, file_ext: str = "json") -> str:
-        """按优先级查找鉴权文件（2026-08-17 改造：{{短前缀}}_ 平铺布局）
+        """按优先级查找鉴权文件（2026-08-20 修复：兼容 {{FYA}}_ 和 FYA_ 两种前缀）
 
         参数:
             biz_type - 业务类型: sz/jzt/jm
@@ -185,9 +223,10 @@ class AuthLoader:
             AuthFileNotFound - 所有路径都不存在
 
         布局约定（用户决策 2026-08-17）：
-            影刀 RPA 输出固定为 config/{{短前缀}}_<basename>.<ext> 平铺格式，
-            双花括号是影刀 RPA 模板语法未替换的副产品（保留字面读取即可）。
-            通过 resolve_file_prefix() 把 shop_id 翻译成 RPA 文件前缀。
+            影刀 RPA 输出固定为 config/{短前缀}_<basename>.<ext> 平铺格式。
+            2026-08-20 实测：RPA 实际输出文件名为 FYA_xxx（无花括号），
+            但 config.xlsx 中 file_prefix 配置为 {{FYA}}（带花括号）。
+            本方法同时尝试两种前缀，确保都能找到文件。
         """
         if biz_type not in BIZ_TYPE_MAP:
             raise ValueError(f"未知 biz_type={biz_type}，合法值: {list(BIZ_TYPE_MAP.keys())}")
@@ -195,21 +234,22 @@ class AuthLoader:
         if isinstance(basenames, str):  # 向后兼容旧 str 单值
             basenames = [basenames]
 
-        # shop_id → RPA 文件命名前缀（关键！把"FYA箱包旗舰店"翻成"{{FYA}}"）
-        file_prefix = resolve_file_prefix(self.shop_id)
-        shop_prefix = f"{file_prefix}_"  # 例：{{FYA}}_、{{MIYO}}_、{{OTA}}_
+        # 2026-08-20：获取所有前缀变体（{{FYA}}_ 和 FYA_）
+        prefix_variants = self._get_prefix_variants()
 
-        # 对每个 basename 都生成 4 级候选路径
+        # 对每个 basename × 每个前缀变体生成候选路径
         candidates = []
         for basename in basenames:
+            for shop_prefix in prefix_variants:
+                candidates.extend([
+                    # 优先级：{前缀}{basename}.json
+                    os.path.join(self.config_dir, f"{shop_prefix}{basename}.{file_ext}"),
+                    # 优先级：{前缀}{basename}.txt（json→txt 兜底）
+                    os.path.join(self.config_dir, f"{shop_prefix}{basename}.txt"),
+                ])
+            # 兜底：旧单店根目录布局（无前缀）
             candidates.extend([
-                # 优先级 1：{{短前缀}}_{basename}.json（影刀 RPA 当前输出格式）
-                os.path.join(self.config_dir, f"{shop_prefix}{basename}.{file_ext}"),
-                # 优先级 2：{{短前缀}}_{basename}.txt（json→txt 兜底）
-                os.path.join(self.config_dir, f"{shop_prefix}{basename}.txt"),
-                # 优先级 3：basename.{ext}（旧单店根目录布局兼容）
                 os.path.join(self.config_dir, f"{basename}.{file_ext}"),
-                # 优先级 4：basename.txt（旧单店根目录布局兼容，json→txt）
                 os.path.join(self.config_dir, f"{basename}.txt"),
             ])
         for path in candidates:
@@ -222,7 +262,7 @@ class AuthLoader:
         )
 
     def _find_h5st_file(self, h5st_key: str = "jm_order") -> str:
-        """查找 h5st 文件（2026-08-17 改造：{{短前缀}}_ 平铺布局）
+        """查找 h5st 文件（2026-08-20 修复：兼容 {{FYA}}_ 和 FYA_ 两种前缀）
 
         参数:
             h5st_key - h5st 子类型（默认 jm_order）
@@ -234,7 +274,8 @@ class AuthLoader:
             AuthFileNotFound - 文件不存在
 
         布局（与 _find_auth_file 一致）：
-            影刀 RPA 输出为 config/{{短前缀}}_<h5st_filename> 平铺
+            RPA 输出为 config/{短前缀}_<h5st_filename> 平铺
+            2026-08-20：同时尝试 {{FYA}}_ 和 FYA_ 两种前缀
         """
         # ⚠️ 2026-08-14 改造：3 个独立 h5st 文件（按 h5st_key 区分）
         if h5st_key in H5ST_KEY_MAP:
@@ -242,18 +283,22 @@ class AuthLoader:
         else:
             primary_filename = "h5st.json"
 
-        file_prefix = resolve_file_prefix(self.shop_id)
-        shop_prefix = f"{file_prefix}_"  # {{FYA}}_ / {{MIYO}}_ / {{OTA}}_
+        # 2026-08-20：获取所有前缀变体（{{FYA}}_ 和 FYA_）
+        prefix_variants = self._get_prefix_variants()
 
-        candidates = [
-            # 优先级 1：{{短前缀}}_{primary_filename}（影刀 RPA 当前输出格式）
-            os.path.join(self.config_dir, f"{shop_prefix}{primary_filename}"),
-            # 优先级 2：{{短前缀}}_h5st.json（兼容旧版同名 RPA 输出）
-            os.path.join(self.config_dir, f"{shop_prefix}h5st.json"),
-            # 优先级 3：根目录 h5st.json（向后兼容）
+        candidates = []
+        for shop_prefix in prefix_variants:
+            candidates.extend([
+                # {前缀}{primary_filename}（影刀 RPA 当前输出格式）
+                os.path.join(self.config_dir, f"{shop_prefix}{primary_filename}"),
+                # {前缀}h5st.json（兼容旧版同名 RPA 输出）
+                os.path.join(self.config_dir, f"{shop_prefix}h5st.json"),
+            ])
+        # 兜底：根目录 h5st 文件（向后兼容）
+        candidates.extend([
             os.path.join(self.config_dir, "h5st.json"),
             os.path.join(self.config_dir, "h5st.txt"),
-        ]
+        ])
         for path in candidates:
             if os.path.isfile(path):
                 return path
@@ -279,7 +324,9 @@ class AuthLoader:
             CookieExpiredError - Cookie 过期（如果 check_expire=True）
         """
         # 优先读 JSON（新格式）
-        cache_key = f"cookie_str:{biz_type}:{check_expire}"
+        # H-10 修复（2026-08-24 审计）：cache_key 加 shop_id 前缀，避免多店串库
+        # 背景：单例 + 5 秒缓存，原 cache_key 不含 shop_id，影刀切店后前 5 秒仍命中上店 Cookie
+        cache_key = f"{self.shop_id}:cookie_str:{biz_type}:{check_expire}"
         if self._is_cache_valid(cache_key):
             return self._cache[cache_key]
 
@@ -345,11 +392,18 @@ class AuthLoader:
         if os.getenv("AUTH_SKIP_COOKIE_EXPIRE_CHECK", "0") == "1":
             return
 
+        # ⚠️ 2026-08-22 修复：以下字段是京东后台埋点/分析字段，业务请求不需要
+        # 即使 expires 过期也不阻塞整体 Cookie 校验（AGENTS.md 第2节：接口返回码判定才作数）
+        _SKIP_EXPIRE_CHECK_NAMES = {"_gia_d", "sdtoken", "__jdb", "pinId", "_jpCls"}
+
         now = time.time()
         expired = []
         for c in cookies:
             # sessionCookie=true 表示会话级 Cookie（关闭浏览器即失效）
             if c.get("sessionCookie"):
+                continue
+            # 白名单字段（埋点/分析）即使 expires 过期也跳过
+            if c.get("name") in _SKIP_EXPIRE_CHECK_NAMES:
                 continue
             exp = c.get("expires")
             if exp and exp > 0 and exp < now:
@@ -637,10 +691,17 @@ class AuthLoader:
         ⚠️ 2026-08-15 修订：京准通业务不在此 API 范围内。
         京准通 add/list 接口实测不需要 h5st（HTTP 200 不被拦截），
         项目 7 章节的"h5st 必需"结论已修正。详见 SKILL.md 京准通分区。
+
+        ⚠️ 2026-08-20：环境变量 AUTH_SKIP_H5ST_EXPIRE_CHECK=1 可跳过过期检查
+        （与 AUTH_SKIP_COOKIE_EXPIRE_CHECK 同理：由接口返回码判定是否失效）
         """
         if h5st_key not in H5ST_KEY_MAP:
             raise ValueError(f"未知 h5st_key={h5st_key!r}，合法值: {list(H5ST_KEY_MAP.keys())}")
-        cache_key = f"h5st:{check_expire}:{h5st_key}"  # ⚠️ 加 h5st_key 避免缓存串
+        # 2026-08-20：跳过 h5st 过期检查（与 Cookie 同理，由接口返回码判定）
+        if check_expire and os.getenv("AUTH_SKIP_H5ST_EXPIRE_CHECK", "0") == "1":
+            check_expire = False
+        # H-10 修复（2026-08-24 审计）：cache_key 加 shop_id 前缀，避免多店串库
+        cache_key = f"{self.shop_id}:h5st:{check_expire}:{h5st_key}"  # ⚠️ 加 h5st_key 避免缓存串
         if self._is_cache_valid(cache_key):
             return self._cache[cache_key]
 
@@ -878,14 +939,19 @@ def _cli():
     print(f"\n=== AuthLoader 调试（shop_id={shop_id}, biz_type={biz_type}）===")
     try:
         cookie = auth.get_cookie_str(biz_type)
-        print(f"\n✅ Cookie 字符串（前 80 字符）：{cookie[:80]}...")
-        print(f"   长度：{len(cookie)} 字节")
+        # H-21 修复（2026-08-24 审计）：Cookie 脱敏打印，仅 DEBUG_AUTH=1 时显示前 80 字符
+        print(f"\n✅ Cookie 长度：{len(cookie)} 字节（已脱敏）")
+        print(f"   字段数：{len(cookie.split(';'))} 个")
+        if os.environ.get("DEBUG_AUTH") == "1":
+            print(f"   [DEBUG] cookie[:80]={cookie[:80]!r}")
     except (CookieExpiredError, AuthFileNotFound) as e:
         print(f"\n❌ {e}")
     try:
         h5st = auth.get_h5st()
         age = auth.get_h5st_age_seconds()
-        print(f"\n✅ h5st（前 30 字符）：{h5st[:30]}...")
+        # H-22 修复（2026-08-24 审计）：h5st 脱敏打印（首 6 + 尾 6），避免 stdout/日志泄漏
+        h5st_masked = f"{h5st[:6]}***{h5st[-6:]}" if len(h5st) > 12 else "***"
+        print(f"\n✅ h5st（首尾脱敏）：{h5st_masked}（共 {len(h5st)} 字符）")
         print(f"   距捕获：{age:.0f} 秒（{age/60:.1f} 分钟）")
     except (H5stExpiredError, AuthFileNotFound) as e:
         print(f"\n❌ {e}")

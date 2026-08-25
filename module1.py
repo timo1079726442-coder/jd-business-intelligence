@@ -142,6 +142,15 @@ def main(argv=None):
     # 1. 强制设置 SHOP_ID（影刀可能忘了设）
     os.environ["SHOP_ID"] = args.shop
     # 注：环境变量已在 import 前设默认值（line 30-32），这里再次覆盖
+    # H-11 修复（2026-08-24 审计）：同时 set SHOP_PIN，避免 db_utils DELETE 错位
+    # 背景：db_utils.upsert_df fallback 用 shop_id.replace("箱包旗舰店","")="FYA"，
+    #       但 config 实际是 shop_pin="FYA8888"，DELETE 找不到 → 数据堆积
+    try:
+        from runtime_config import get_shop_pin
+        os.environ["SHOP_PIN"] = get_shop_pin()
+    except SystemExit as e:
+        print(f"[WARN] 店铺 {args.shop} 的 SHOP_PIN 读取失败：{e}")
+        print(f"[WARN] 继续跑业务，但 DB 入库可能错位（建议检查 config.xlsx「店铺账号」sheet）")
 
     # 2. ⚠️ 2026-08-14 升级：--yesterday 自动算日期（昨天）
     #    适用：影刀每天定时跑，自动用"今天-1 天"

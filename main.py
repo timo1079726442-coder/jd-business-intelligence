@@ -54,12 +54,20 @@ from urllib.parse import urlparse
 import requests
 from openpyxl import load_workbook
 
+# H-04/H-05/H-06 修复（2026-08-22 审计）：运行时配置统一加载器（appId / shop_pin / sign_salt）
+# 模块级只 import，函数调用时才读取 SHOP_ID / config.xlsx（这样 import main.py 不会报错）
+import runtime_config  # noqa: E402
+
 
 # ============================================================
 #  全局常量
 # ============================================================
-# 当前店铺（只用于展示输出，不参与签名）
-SHOP_NAME = "FYA8888"
+# H-02 修复（2026-08-22 审计）：SHOP_NAME 改为函数式读取，禁止硬编码 FYA8888
+#   通过 SHOP_NAME() 函数延迟读取（避免 import 时 SHOP_ID 未设置报错）
+#   调用方原本使用 SHOP_NAME 常量的地方改用 SHOP_NAME()（自动兼容）
+def SHOP_NAME() -> str:
+    """延迟读取当前店铺全名（如「FYA箱包旗舰店」），CLI banner 显示用。"""
+    return runtime_config.get_shop_name_display()
 
 
 # ============================================================
@@ -232,28 +240,30 @@ def prepare_date_columns(df, date):
     return "日期", date_str
 
 
-def build_business_output_path(output_dir, filename, date):
-    """按业务模块+日期子文件夹构造Excel保存路径（AGENTS.md Excel规则4）。
+def build_business_output_path(output_dir, filename, date=None):
+    """按业务模块平铺构造Excel保存路径（2026-08-21 改为平铺，取消日期子目录）。
 
-    目录规则：output/{业务模块}/{date}/{filename}
+    目录规则：output/{业务模块}/{filename}
         业务模块名 = 文件名去掉 "_{date}.xlsx" 后缀的主体
         （如 搜索流量_2026-07-29.xlsx → 业务模块"搜索流量"）
-    例：output/搜索流量/2026-07-29/搜索流量_2026-07-29.xlsx
+    例：output/搜索流量/搜索流量_2026-07-29.xlsx
+    日期区分通过文件名内的 _{date} 段保证，不再额外建日期子目录。
 
     入参:
         output_dir - 全局输出目录（output/）
         filename   - 保存文件名（含 {date} 与 .xlsx 后缀）
-        date       - 查询日期（YYYY-MM-DD）
+        date       - 查询日期（YYYY-MM-DD），仅用于从文件名提取业务模块名，不再拼路径
     出参:
         最终保存的完整路径（子目录不存在会自动创建）
     """
     # 提取业务模块名：去掉 "_{date}.xlsx" 后缀即为主体名
     stem = filename
-    suffix = f"_{date}.xlsx"
-    if stem.endswith(suffix):
-        stem = stem[: -len(suffix)]
+    if date:
+        suffix = f"_{date}.xlsx"
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
 
-    business_dir = os.path.join(output_dir, stem, date)
+    business_dir = os.path.join(output_dir, stem)
     os.makedirs(business_dir, exist_ok=True)
     return os.path.join(business_dir, filename)
 
@@ -500,12 +510,25 @@ class JDBaseRequest:
     DEFAULT_ORIGIN = "https://sz.jd.com"
     DEFAULT_CONFIG_PATH = "config/config.xlsx"
 
-    # 风控签名盐值默认值（config.xlsx 可覆盖；新增业务时如需不同盐值，注册业务时单独覆盖）
-    _DEFAULT_SIGN_SALT = "372ad2c2b6"
+    # H-05 修复（2026-08-22 审计）：签名盐值改为从 runtime_config.get_sign_salt() 动态读取，
+    #   禁止在源码硬编码 SALT。运行时从 config.xlsx「全局配置」sheet「全局/sign_salt」或
+    #   「商品流量来源/签名盐值」读取。读取不到 → SystemExit（不静默兜底）
+    @property
+    def _DEFAULT_SIGN_SALT(self) -> str:
+        from runtime_config import get_sign_salt
+        return get_sign_salt()
 
-    # uuid前缀默认值（基类兜底；各业务应通过业务参数注册时单独指定，避免硬编码渠道差异）
-    UUID_PREFIX = "ca412182e5668a106054"
+    # ⚠️ 2026-08-20 Phase 2.6 改造：
+    #   原 UUID_PREFIX = "ca412182e5668a106054" 硬编码违反 AGENTS.md 风控归档
+    #   「禁止硬编码 uuid 前缀」+「UUID 运行时动态生成」。
+    #   抓包实测：前端 SDK 每次会话生成的 UUID 完全随机（无固定前缀），
+    #   基类 _gen_risk_params 改为完全随机兜底（16hex-10hex）。
+    #   各业务（ProductFlowAPI/OfflineChannelAPI/ProductDetailAPI/LossProductAPI/KeywordAnalysisAPI）
+    #   已 override 走 _gen_risk_params_random 完全随机；本兜底仅供未 override 的兜底业务用。
+    UUID_PREFIX = ""  # 空字符串=完全随机；非空=按前缀拼接（保留兼容入参）
     UUID_RANDOM_DIGITS = 10
+    UUID_RANDOM_HEX_PREFIX_LEN = 16  # 16hex（前段）
+    UUID_RANDOM_HEX_SUFFIX_LEN = 10  # 10hex（后段）
 
     # ⚠️ 进程级共享的"上次请求时间"（类属性，不是实例属性）
     # 原因：批量执行多个业务时会创建多个实例，若用实例属性，
@@ -539,7 +562,14 @@ class JDBaseRequest:
         # 触发条件：环境变量 AUTH_LOADER=1 显式启用，或 cookie_path 包含 ".json"
         # 向后兼容：未启用时仍走 _read_cookie()（读 .txt）
         # 输出目录
+        # 2026-08-21 多店铺平铺：基类自动在输出目录下加 shop_id 子目录
+        # 京准通业务类在自己的 __init__ 末尾会重新覆盖 self.output_dir（直接拼 shop_id + OUTPUT_SUBDIR），
+        # 这里只对商智类（流量/三级渠道/商品明细/商品流失/关键词分析）生效
         output_dir_rel = self.config.get("输出目录", "output/")
+        _shop_id = os.getenv("SHOP_ID", "")
+        # 兼容旧测试场景：SHOP_ID 未设时不加子目录（保持原行为）
+        if _shop_id and not output_dir_rel.startswith(("http://", "https://")):
+            output_dir_rel = os.path.join(output_dir_rel, _shop_id)
         self.output_dir = output_dir_rel if os.path.isabs(output_dir_rel) else os.path.join(project_root, output_dir_rel)
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -556,7 +586,7 @@ class JDBaseRequest:
         if self._use_auth_loader:
             try:
                 from auth_loader import AuthLoader
-                _auth = AuthLoader(shop_id=os.getenv("SHOP_ID", "FYA箱包旗舰店"))
+                _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
                 # 业务类型从 cookie_path 推断（默认 sz）
                 if "jm" in str(cookie_path or ""):
                     _biz = "jm"
@@ -669,6 +699,20 @@ class JDBaseRequest:
         self.logger.info("Cookie已更新")
 
     # ---------- 风控签名 ----------
+    def _gen_uuid_random(self):
+        """完全随机 UUID 生成器（16hex-10hex，与项目4/5 一致）。
+
+        抓包实测：前端 SDK 每次会话生成的 UUID 完全随机（无固定前缀）。
+        AGENTS.md 风控归档：禁止硬编码 uuid 前缀，运行时动态生成。
+
+        返回:
+            str - 形如 "a31e066d8e94f4f39a3a-19fda02c2d4"
+        """
+        import secrets
+        prefix_hex = secrets.token_hex(self.UUID_RANDOM_HEX_PREFIX_LEN // 2)
+        suffix_hex = secrets.token_hex(self.UUID_RANDOM_HEX_SUFFIX_LEN // 2)
+        return f"{prefix_hex}-{suffix_hex}"
+
     def _gen_risk_params(self, url, uuid_prefix=None):
         """
         生成风控参数：User-mup / User-mnp / uuid
@@ -677,15 +721,25 @@ class JDBaseRequest:
 
         参数:
             url         - 接口URL，用于提取URL路径
-            uuid_prefix - 自定义uuid前缀（如不传，用类常量UUID_PREFIX）
-                          不同业务/页面uuid前缀可能不同（参考商智购物车3001用5f9cc2ca20cad3d11642）
+            uuid_prefix - 自定义uuid前缀（已废弃，保留兼容入参）
+                          ⚠️ 2026-08-20 Phase 2.6 改造：
+                          原 UUID_PREFIX="ca412182e5668a106054" 硬编码违反
+                          AGENTS.md 风控归档。基类现默认走完全随机 UUID。
+                          各业务（ProductFlowAPI 等）已 override 走完全随机。
         """
         timestamp = int(time.time() * 1000)
 
-        prefix = uuid_prefix if uuid_prefix else self.UUID_PREFIX
-        random_min = 10 ** (self.UUID_RANDOM_DIGITS - 1)
-        random_max = 10 ** self.UUID_RANDOM_DIGITS - 1
-        uuid_str = f"{prefix}-{random.randint(random_min, random_max)}"
+        # ⚠️ 2026-08-20 Phase 2.6：UUID_PREFIX 改空（完全随机兜底）
+        # 入参 uuid_prefix 优先；其次类常量 UUID_PREFIX（空=完全随机）；都空则完全随机
+        prefix = uuid_prefix or self.UUID_PREFIX
+        if prefix:
+            # 兼容旧逻辑：prefix 拼接随机数字（旧版格式）
+            random_min = 10 ** (self.UUID_RANDOM_DIGITS - 1)
+            random_max = 10 ** self.UUID_RANDOM_DIGITS - 1
+            uuid_str = f"{prefix}-{random.randint(random_min, random_max)}"
+        else:
+            # 完全随机（16hex-10hex，与项目4/5 一致）
+            uuid_str = self._gen_uuid_random()
 
         parsed = urlparse(url)
         url_path = parsed.path
@@ -874,20 +928,22 @@ class ProductFlowAPI(JDBaseRequest):
     #     "商品流量来源_推荐"     → 推荐子来源（2009）【执行】
     #     "商品流量来源_购物车"   → 购物车/我的订单回流（3001）【执行】
     #     "商品流量来源_自主访问" → 与购物车数据口径重叠（同3001），仅保留配置，调度层停用
-    #   uuid前缀：京东风控校验用的随机ID前缀
-    #     搜索/推荐：ca412182e5668a106054
-    #     购物车/自主访问：5f9cc2ca20cad3d11642
-    #   ⚠️ 警告：新增/修改子渠道，必须修改此字典（业务参数专属配置）。
+    #   ⚠️ 2026-08-20 Phase 2.6 改造：
+    #     原 CHANNEL_MAP 把 uuid 前缀硬编码为元组第二位（"ca412182e5668a106054" / "5f9cc2ca20cad3d11642"），
+    #     违反 AGENTS.md 风控归档「禁止硬编码 uuid 前缀」+「UUID 运行时动态生成」。
+    #     实测抓包显示前端 SDK 每次会话生成的 UUID 完全随机（与项目4/5 详查一致），
+    #     故取消硬编码前缀，UUID 改为完全随机（见 _gen_uuid_random / _gen_risk_params_random）。
+    #     CHANNEL_MAP 仅保留 channel_id2（业务常量），不再含风控参数。
     #
     #   ⚠️ 2026-08-10 配置注释（P1-1）：商智搜索/推荐/购物车接口 **服务端不支持多日区间导出**。
     #     虽然接口表单里有 startDate/endDate，但服务端实际只返回单日数据。
     #     用户传入区间（--range last_Nd 或 --start_date/--end_date）时，
     #     由 _download_sku_by_days() 自动拆成逐天循环调用，每天插入当天日期列后合并输出。
     CHANNEL_MAP = {
-        "商品流量来源_搜索":     ("2008", "ca412182e5668a106054"),
-        "商品流量来源_推荐":     ("2009", "ca412182e5668a106054"),
-        "商品流量来源_购物车":   ("3001", "5f9cc2ca20cad3d11642"),
-        "商品流量来源_自主访问": ("3001", "5f9cc2ca20cad3d11642"),  # 与购物车口径重叠，仅保留配置
+        "商品流量来源_搜索":     "2008",
+        "商品流量来源_推荐":     "2009",
+        "商品流量来源_购物车":   "3001",
+        "商品流量来源_自主访问": "3001",  # 与购物车口径重叠，仅保留配置
     }
 
     # ⚠️ 2026-08-10 用户决策：逐日循环最大天数限制。
@@ -900,14 +956,32 @@ class ProductFlowAPI(JDBaseRequest):
 
     @classmethod
     def _build_channel_id_index(cls):
-        """从 CHANNEL_MAP 构建反向索引：{channel_id2: uuid_prefix}"""
+        """从 CHANNEL_MAP 构建反向索引：{channel_id2: biz_key}
+
+        ⚠️ 同一 channel_id2 可能有多个 biz_key（如「购物车」「自主访问」都用 3001），
+           保留**第一个**出现的 biz_key（与原代码循环 break 的语义一致），
+           避免字典推导式后面覆盖前面造成的回归。
+        """
         index = {}
-        for _key, (channel_id2, uuid_prefix) in cls.CHANNEL_MAP.items():
-            index[channel_id2] = uuid_prefix
+        for key, cid in cls.CHANNEL_MAP.items():
+            if cid not in index:  # 只在第一次出现时记录，后续重复不覆盖
+                index[cid] = key
         return index
 
     def _get_channel_config(self, biz_key):
-        """获取渠道配置 (channel_id2, uuid_prefix)。支持业务key和channel_id2两种入参。"""
+        """获取渠道配置 channel_id2（业务常量）。
+
+        支持两种入参：
+            biz_key     - 业务 key（CHANNEL_MAP 的 key），如 "商品流量来源_搜索"
+            channel_id2 - 直接传渠道 ID，如 "2008"
+
+        返回:
+            str - channel_id2（如 "2008"）
+
+        ⚠️ 2026-08-20 Phase 2.6 改造：
+            原方法返回二元组 (channel_id2, uuid_prefix)，现 uuid 改完全随机，
+            此方法只返回 channel_id2。原 uuid_prefix 字段已废弃。
+        """
         # 方式1：业务key直接查
         if biz_key in self.CHANNEL_MAP:
             return self.CHANNEL_MAP[biz_key]
@@ -916,33 +990,67 @@ class ProductFlowAPI(JDBaseRequest):
         if self._CHANNEL_ID_INDEX is None:
             self._CHANNEL_ID_INDEX = self._build_channel_id_index()
         if biz_key in self._CHANNEL_ID_INDEX:
-            uuid_prefix = self._CHANNEL_ID_INDEX[biz_key]
-            for key, (cid, _) in self.CHANNEL_MAP.items():
-                if cid == biz_key:
-                    self.logger.info(f"通过channel_id2 '{biz_key}' 匹配到业务 '{key}'")
-                    break
-            return (biz_key, uuid_prefix)
+            self.logger.info(f"通过channel_id2 '{biz_key}' 匹配到业务 '{self._CHANNEL_ID_INDEX[biz_key]}'")
+            return biz_key
 
         available_keys = "、".join(self.CHANNEL_MAP.keys())
         raise ValueError(
             f"不支持的渠道: {biz_key}\n可用业务key: {available_keys}"
         )
 
-    def _get_uuid_for_channel(self, biz_key):
-        """根据业务key或channel_id2，返回完整uuid。"""
-        _, uuid_prefix = self._get_channel_config(biz_key)
-        random_min = 10 ** (self.UUID_RANDOM_DIGITS - 1)
-        random_max = 10 ** self.UUID_RANDOM_DIGITS - 1
-        return f"{uuid_prefix}-{random.randint(random_min, random_max)}"
+    def _gen_uuid_random(self):
+        """完全随机 UUID 生成器（16hex-10hex，与项目4/5一致）。
+
+        业务背景：
+            抓包显示前端 SDK 每次会话生成的 UUID 完全随机（无固定前缀），
+            故 ProductFlowAPI 不再依赖 CHANNEL_MAP 的 uuid 前缀字段（已废弃）。
+        AGENTS.md 风控归档：禁止硬编码 uuid 前缀，运行时动态生成。
+
+        返回:
+            str - 形如 "a31e066d8e94f4f39a3a-19fda02c2d4"
+        """
+        import secrets
+        return f"{secrets.token_hex(8)}-{secrets.token_hex(5)}"
+
+    def _gen_risk_params_random(self, url):
+        """uuid 完全随机版风控参数（与项目4/5 一致）。
+
+        Override 基类 _gen_risk_params，原因：
+            基类默认用类常量 UUID_PREFIX（硬编码 ca412182...），违反 AGENTS.md 风控归档。
+            本方法用 _gen_uuid_random() 完全随机生成 UUID。
+
+        算法（commons-a5562705.js 逆向）：
+            User-mnp = MD5(URL路径 + uuid + 时间戳 + 盐值)
+        """
+        timestamp = int(time.time() * 1000)
+        uuid_str = self._gen_uuid_random()
+        parsed = urlparse(url)
+        url_path = parsed.path
+        sign_str = f"{url_path}{uuid_str}{timestamp}{self.SIGN_SALT}"
+        user_mnp = hashlib.md5(sign_str.encode("utf-8")).hexdigest()
+        return {
+            "User-mup": str(timestamp),
+            "User-mnp": user_mnp,
+            "uuid": uuid_str,
+        }
+
+    def _gen_risk_params(self, url, uuid_prefix=None):
+        """Override 基类：用完全随机 UUID（替代硬编码 UUID_PREFIX）。
+
+        ⚠️ 2026-08-20 Phase 2.6 改造：
+            基类 _gen_risk_params 用 UUID_PREFIX（"ca412182e5668a106054"）硬编码拼接 UUID。
+            实测抓包显示前端 UUID 每次完全随机，与项目4/5 一致。
+            本 override 忽略 uuid_prefix 入参，统一走完全随机生成。
+        """
+        return self._gen_risk_params_random(url)
 
     def _resolve_display_key(self, biz_key, channel_id2):
         """把biz_key归一化为友好业务key（用于日志和文件名）。"""
         if biz_key in self.CHANNEL_MAP:
             return biz_key
-        for key, (cid, _) in self.CHANNEL_MAP.items():
-            if cid == channel_id2:
-                return key
-        return biz_key
+        if self._CHANNEL_ID_INDEX is None:
+            self._CHANNEL_ID_INDEX = self._build_channel_id_index()
+        return self._CHANNEL_ID_INDEX.get(channel_id2, biz_key)
 
     # ---------- 业务参数配置区 ----------
     # ⚠️ 铁律：经常变化的业务参数必须走 config.xlsx（带开发期兜底+警告）。
@@ -1032,7 +1140,8 @@ class ProductFlowAPI(JDBaseRequest):
             保存的Excel文件路径
         """
         # 1. 解析渠道配置
-        channel_id2, uuid_prefix = self._get_channel_config(biz_key)
+        # ⚠️ 2026-08-20 Phase 2.6：channel_id2 是业务常量；UUID 完全随机（不再依赖 uuid_prefix 硬编码）
+        channel_id2 = self._get_channel_config(biz_key)
         display_key = self._resolve_display_key(biz_key, channel_id2)
 
         # 2. 读取日期参数（入参 > config）
@@ -1059,12 +1168,12 @@ class ProductFlowAPI(JDBaseRequest):
             "lastSrcChannelId2": channel_id2,
         }
 
-        # 5. 发送请求（自动间隔+重试+UA切换+风控签名）
+        # 5. 发送请求（自动间隔+重试+UA切换+风控签名；UUID 由 _gen_risk_params 完全随机）
         self.logger.info(
             f"下载商品流量来源数据: 日期={date}, 业务={display_key}"
-            f"(id2={channel_id2}, uuid_prefix={uuid_prefix[:8]}...)"
+            f"(id2={channel_id2}, uuid=随机)"
         )
-        response = self.request(self.API_URL, data, uuid_prefix=uuid_prefix)
+        response = self.request(self.API_URL, data)
 
         # 6. 保存Excel（文件名用友好业务key）
         # 例如：搜索流量_2026-07-29.xlsx
@@ -1116,7 +1225,8 @@ class ProductFlowAPI(JDBaseRequest):
         self.logger.warning(warn_msg)
         print(warn_msg)
 
-        channel_id2, uuid_prefix = self._get_channel_config(biz_key)
+        # ⚠️ 2026-08-20 Phase 2.6：UUID 改完全随机，不再传 uuid_prefix
+        channel_id2 = self._get_channel_config(biz_key)
         biz_params = self._get_business_params()
 
         # ③ 逐天循环：每天 date=startDate=endDate=当天，收集 DataFrame
@@ -1131,7 +1241,7 @@ class ProductFlowAPI(JDBaseRequest):
                 **biz_params,
                 "lastSrcChannelId2": channel_id2,
             }
-            response = self.request(self.API_URL, data, uuid_prefix=uuid_prefix)
+            response = self.request(self.API_URL, data)
             # 每天的单天数据：接口无日期列 → prepare_date_columns 自动插入当天日期列
             df, _col, _val = self._read_flow_df(response, day)
             frames.append(df)
@@ -1143,12 +1253,9 @@ class ProductFlowAPI(JDBaseRequest):
         short_name = display_key.replace("商品流量来源_", "")  # 去掉前缀，保留"搜索/推荐/购物车"
         filename = f"{short_name}流量_{start_date}_{end_date}.xlsx"
 
-        # ⑤ 输出目录用最后一天 end_date（用户决策 2026-08-10）
-        # ⚠️ 区间文件名含两个日期（start_end），不能复用 build_business_output_path 的
-        #   "去掉 _{date}.xlsx 后缀提取业务模块名"规则（会把 start 日期误并入业务模块名，
-        #   产生 output/搜索流量_2026-08-03/ 这样的错误目录），故在此直接构造目录：
-        #   output/{业务模块}/{end_date}/{filename}
-        business_dir = os.path.join(self.output_dir, f"{short_name}流量", end_date)
+        # ⑤ 输出目录平铺到业务模块（2026-08-21 改：去日期子目录，文件名已含 start_end 区分）
+        #   output/{业务模块}/{filename}，文件名内的 _{start}_{end} 段保证唯一性
+        business_dir = os.path.join(self.output_dir, f"{short_name}流量")
         os.makedirs(business_dir, exist_ok=True)
         file_path = os.path.join(business_dir, filename)
         merged.to_excel(file_path, index=False, engine="openpyxl")
@@ -2181,10 +2288,9 @@ class ProductDetailAPI(JDBaseRequest):
             )
             original_filename = f"{second or '全类目'}_{date}_商品明细.xlsx"
 
-        # 7. 构造业务子目录路径：output/商品明细/{date}/{filename}
-        # 注意：业务子目录确保不与其他业务混淆
-        date_subdir = os.path.join(self.OUTPUT_SUBDIR, date)
-        business_output_dir = os.path.join(self.output_dir, date_subdir)
+        # 7. 构造业务子目录路径：output/商品明细/{filename}（2026-08-21 改平铺，去日期子目录）
+        # 注意：业务子目录确保不与其他业务混淆；文件名内的日期段保证唯一性
+        business_output_dir = os.path.join(self.output_dir, self.OUTPUT_SUBDIR)
         os.makedirs(business_output_dir, exist_ok=True)
 
         # 8. Excel 后置处理（业务子目录 + 解析 Content-Disposition 文件名）
@@ -2608,9 +2714,8 @@ class LossProductAPI(JDBaseRequest):
         if original_filename.lower().endswith(".xls"):
             original_filename = original_filename[:-4] + ".xlsx"
 
-        # 7. 构造业务子目录路径：output/商品流失分析/{date}/{filename}
-        date_subdir = os.path.join(self.OUTPUT_SUBDIR, date)
-        business_output_dir = os.path.join(self.output_dir, date_subdir)
+        # 7. 构造业务子目录路径：output/商品流失分析/{filename}（2026-08-21 改平铺，去日期子目录）
+        business_output_dir = os.path.join(self.output_dir, self.OUTPUT_SUBDIR)
         os.makedirs(business_output_dir, exist_ok=True)
         target_path = os.path.join(business_output_dir, original_filename)
 
@@ -2698,23 +2803,14 @@ JZT_KUAICHE_PAYLOAD_TEMPLATE = {
          ]},
     ],
     # customDimensionOptions：账号范围 + 产品线 + 营销目标 + 广告定向类型（抓包原貌）
+    # ⚠️ 2026-08-20 修复：pin.subUser.options 清空硬编码子账号，完全由 _build_payload 动态从 config.xlsx 读取
+    #   原 11 个 FYA 子账号已迁移到 config.xlsx「店铺清单」jzt_pin_options 列
     "customDimensionOptions": [
         {"checked": False, "desc": "账号范围", "hidden": False, "key": "pin",
          "options": [
             {"checked": False, "desc": "自有账户", "hidden": False, "key": "subUser",
-             "options": [
-                {"checked": True, "desc": "FYA8888", "flag": True, "hidden": False, "key": "99936530475", "value": "FYA8888"},
-                {"checked": False, "desc": "FYA888888", "flag": False, "hidden": False, "key": "99936525688", "value": "FYA888888"},
-                {"checked": False, "desc": "FAY掌柜888", "flag": False, "hidden": False, "key": "99937142699", "value": "FAY掌柜888"},
-                {"checked": False, "desc": "FYA19529975351", "flag": False, "hidden": False, "key": "99938531397", "value": "FYA19529975351"},
-                {"checked": False, "desc": "fya掌柜777", "flag": False, "hidden": False, "key": "99938957251", "value": "fya掌柜777"},
-                {"checked": False, "desc": "FYA小婷", "flag": False, "hidden": False, "key": "99938963919", "value": "FYA小婷"},
-                {"checked": False, "desc": "FYA少冰", "flag": False, "hidden": False, "key": "99945916633", "value": "FYA少冰"},
-                {"checked": False, "desc": "FYA小冠", "flag": False, "hidden": False, "key": "99947097388", "value": "FYA小冠"},
-                {"checked": False, "desc": "FYA布丁", "flag": False, "hidden": False, "key": "99952884963", "value": "FYA布丁"},
-                {"checked": False, "desc": "FYA小柔", "flag": False, "hidden": False, "key": "99955522890", "value": "FYA小柔"},
-                {"checked": False, "desc": "FYA小敏", "flag": False, "hidden": False, "key": "99960125485", "value": "FYA小敏"},
-             ]},
+             "options": []  # 动态注入：_build_payload 从 config.xlsx 读取当前店铺子账号
+            },
             {"checked": False, "desc": "授权账户", "hidden": False, "key": "authUser"},
          ]},
         {"checked": False, "desc": "产品线", "hidden": False, "key": "businessType",
@@ -2834,21 +2930,38 @@ class JZTKuaicheAPI:
     OUTPUT_SUBDIR = "京准通快车效果自定义"  # 落 output/京准通快车效果自定义/{date}/ 子目录（AGENTS.md Excel规则4）
 
     # ---- 阶段4 容错配置（用户决策 2026-08-07：POLL_INTERVAL=3s / MAX_POLL_TIMES=15）----
+    # ⚠️ 2026-08-20：大数据量 ZIP OSS 生成慢，MAX_POLL_TIMES 从 15 改为 30（3s × 30 = 90s 超时）
+    # ⚠️ 2026-08-21：FYA 京准通快车任务生成更慢，MAX_POLL_TIMES 从 30 改为 60（3s × 60 = 180s = 3 分钟）
     POLL_INTERVAL = 3            # 轮询间隔（秒），报表生成等待
-    MAX_POLL_TIMES = 15          # 轮询最大次数（3s × 15 = 45s 超时）
+    MAX_POLL_TIMES = 60          # 轮询最大次数（3s × 60 = 180s = 3 分钟超时）
     MAX_DOWNLOAD_RETRY = 3       # CDN 404 重试最大次数（重刷 URL 后随机退避 3-10s）
+    MAX_ZIP_DOWNLOAD_RETRY = 15  # ZIP 大数据量 OSS 异步生成慢，重试 15 次（退避 10-30s，总 2.5-7.5 分钟）
+
+    # ---- 2026-08-21 新增：100 下载上限防护配置 ----
+    # 京东京准通快车/全站营销等业务的下载记录有 100 条上限
+    # 超过上限后 create_export_task 仍会创建记录，但 downloadById 返回"下载报表数超过上限"
+    # 防护策略：
+    #   1. 前置预检：create_export_task 前数已有任务数，≥95 就提前报错
+    #   2. 轮询早停：探针检测到 100 上限错误时立即停，不浪费 3 分钟
+    QUOTA_LIMIT = 100            # 京东下载记录上限
+    QUOTA_PRECHECK_THRESHOLD = 95  # 预检阈值：已有任务数 ≥ 此值就告警（留 5 条缓冲）
 
     # ---- 京东业务码约定（与项目4/5/6 对齐）----
     # code=0 成功；code=601 操作频繁/风控（不重试）；code=-407/-402 签名错（重试）；
     # 业务码非0 且 message/msg 含"未登录/登录" → CookieExpiredError（不重试）
 
-    def __init__(self, cookie_path: str = "config/jzt_cookie.txt"):
+    def __init__(self, cookie_path=None):
         """初始化京准通 API。
 
         参数:
-            cookie_path - 京准通 Cookie 文件路径（默认 config/jzt_cookie.txt；与商智 Cookie 不互通）
+            cookie_path - 京准通 Cookie 文件路径（默认 None → 自动用 config/{SHOP_PIN}_jzt_cookie.json；与商智 Cookie 不互通）
         """
         import requests  # 本类独立按需导入，避免污染顶层 namespace
+        # ⚠️ 2026-08-22 修复：默认值从硬编码 config/jzt_cookie.txt 改为按店铺平铺 json
+        # 走 AuthLoader 直接找 config/{SHOP_PIN}_jzt_cookie.json，触发 cookie_path.endswith('.json') 自动启用
+        if cookie_path is None:
+            # H-14 修复（2026-08-24 审计）：用 runtime_config.get_shop_pin() 替代硬编码兜底
+            cookie_path = f"config/{runtime_config.get_shop_pin()}_jzt_cookie.json"
         # random 模块已在 main.py 顶层 import，此处可直接使用 random.uniform()
 
         # 1. 读取 Cookie（不存在即抛错，强制用户抓包填入）
@@ -2860,7 +2973,7 @@ class JZTKuaicheAPI:
         if _use_auth_loader:
             try:
                 from auth_loader import AuthLoader
-                _auth = AuthLoader(shop_id=os.getenv("SHOP_ID", "FYA箱包旗舰店"))
+                _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
                 self.cookie = _auth.get_cookie_str("jzt", check_expire=True)
             except Exception as e:
                 print(f"[WARN] AuthLoader 加载失败，fallback 到 txt：{e}")
@@ -2895,7 +3008,7 @@ class JZTKuaicheAPI:
         # 4. 输出路径（按 AGENTS.md Excel规则4：业务子目录 + 日期子目录）
         self.output_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            "output", self.OUTPUT_SUBDIR,
+            "output", runtime_config.get_shop_id(), self.OUTPUT_SUBDIR,
         )
 
     # ---- 公共方法：组装 payload（动态注入时间）----
@@ -2944,6 +3057,33 @@ class JZTKuaicheAPI:
         payload["endTimeStr"] = end_date
         payload["tempName"] = f"{date_compact}_{end_compact}_{suffix}"
         payload["reportName"] = f"{date_compact}_{end_compact}_{suffix}"
+
+        # 2.5 动态化京准通 pin 子账号（2026-08-20 修复：多店铺验证发现 MIYO/OTA 店 code=400, key:pin）
+        # 问题：JZT_KUAICHE_PAYLOAD_TEMPLATE.customDimensionOptions.pin.options[0].options（subUser 子账号列表）
+        #       硬编码了 FYA 店 11 个子账号（FYA8888 等），MIYO/OTA 店使用时京东服务端校验 pin 不属于当前账号
+        # 修复：从 config.xlsx「店铺清单」jzt_pin_options 列动态读取当前店铺的子账号列表
+        #       格式：逗号分隔"账号名:账号ID"，第一个为当前账号（flag=True, checked=True）
+        #       config 为空 → 清空 subUser.options（兜底，任务仍可创建）
+        _shop_id = runtime_config.get_shop_id()
+        try:
+            from biz_config_loader import get_jzt_pin_options
+            _pin_list = get_jzt_pin_options(_shop_id)
+        except Exception as _e:
+            print(f"[WARN] 读取 config.xlsx jzt_pin_options 失败，清空 pin options 兜底：{_e}")
+            _pin_list = []
+        # 定位 customDimensionOptions → key="pin" → options[0] key="subUser" → options（子账号列表）
+        for _dim in payload.get("customDimensionOptions", []):
+            if _dim.get("key") != "pin":
+                continue
+            for _sub in _dim.get("options", []):
+                if _sub.get("key") == "subUser":
+                    _sub["options"] = _pin_list
+                    break
+            break
+        if _pin_list:
+            print(f"  [pin 动态化] shop={_shop_id} → {len(_pin_list)} 个子账号，首个={_pin_list[0].get('desc')}")
+        else:
+            print(f"  [pin 动态化] shop={_shop_id} → config 未配置子账号，已清空 subUser.options（兜底）")
 
         # 3. 运行时日志：打印完整 payload（重点 checkSum 字段），方便人工比对抓包
         # ⚠️ 用户决策 2026-08-07：组装完 payload 输出完整 JSON，重点打印 checkSum 字段值
@@ -3101,6 +3241,91 @@ class JZTKuaicheAPI:
         self._handle_response(ret, op_desc="查询任务列表")
         return ret
 
+    # ---- 2026-08-21 新增：100 下载上限检测静态方法 ----
+
+    @staticmethod
+    def _is_quota_exceeded_response(ret: dict) -> bool:
+        """检测 downloadById 响应是否为 100 下载上限错误。
+
+        京东报错原文：
+        【操作失败】操作受限，下载报表数超过上限(100个),
+        您可以到下载报表页面查看历史所有的下载记录，删除一部分下载记录再重新触发
+
+        参数:
+            ret - downloadById 接口返回的 dict
+        返回:
+            bool - True=命中 100 上限错误
+        """
+        if not isinstance(ret, dict):
+            return False
+        msg = str(ret.get("msg", ""))
+        return "下载报表数超过上限" in msg or "下载报表数超过上限(100个)" in msg
+
+    @staticmethod
+    def _count_tasks_from_list(ret: dict) -> int:
+        """从 get_task_list 响应中提取任务数量。
+
+        参数:
+            ret - get_task_list 接口返回的 dict
+        返回:
+            int - 任务数量；解析失败返回 0
+        """
+        if not isinstance(ret, dict):
+            return 0
+        data = ret.get("data", {})
+        if not isinstance(data, dict):
+            return 0
+        # data.data 是任务列表
+        task_list = data.get("data", [])
+        if isinstance(task_list, list):
+            return len(task_list)
+        return 0
+
+    @staticmethod
+    def _is_quota_near_limit(count: int, threshold: int = 95) -> bool:
+        """判断任务数是否接近上限。
+
+        参数:
+            count    - 当前任务数
+            threshold - 告警阈值（默认 95，即离 100 还剩 5 条缓冲）
+        返回:
+            bool - True=已接近上限
+        """
+        return count >= threshold
+
+    def _precheck_quota(self, threshold: int = None) -> int:
+        """前置配额预检：create_export_task 前调用，避免浪费配额。
+
+        流程：
+        1. 调 get_task_list 统计已有任务数
+        2. 若任务数 ≥ threshold → 抛 RuntimeError 提前报错
+        3. 否则返回当前任务数，允许继续创建任务
+
+        参数:
+            threshold - 告警阈值（默认用类常量 QUOTA_PRECHECK_THRESHOLD=95）
+        返回:
+            int - 当前已有任务数
+
+        异常:
+            RuntimeError - 接近上限时抛出，提示用户清理历史记录
+        """
+        if threshold is None:
+            threshold = self.QUOTA_PRECHECK_THRESHOLD
+
+        ret = self.get_task_list()
+        count = self._count_tasks_from_list(ret)
+
+        if self._is_quota_near_limit(count, threshold):
+            raise RuntimeError(
+                f"❌ 京准通下载报表数接近上限（当前 {count} 条，上限 {self.QUOTA_LIMIT} 条）\n"
+                f"   阈值：{threshold} 条（预留 {self.QUOTA_LIMIT - threshold} 条缓冲）\n"
+                f"   请登录 jzt.jd.com → 我的报表/下载记录 → 删除历史记录后重试\n"
+                f"   ⚠️ 配额超限后 create_export_task 仍会创建记录但 downloadById 拒绝下载"
+            )
+
+        print(f"  📊 配额预检通过：当前 {count} 条 / 上限 {self.QUOTA_LIMIT} 条（阈值 {threshold}）")
+        return count
+
     # ---- 阶段4 容错：轮询等待报表生成 ----
 
     # 任务状态映射（2026-08-07 真实 list 响应实证 + atoms-api 对照修正）
@@ -3174,9 +3399,21 @@ class JZTKuaicheAPI:
                 time.sleep(self.POLL_INTERVAL * 2)
                 continue
 
-            probe_result = self._probe_download_ready(task_id, match_item)
+            # 2026-08-21：探针调用打开 verbose 模式（首次失败时打印 downloadById 实际响应，便于诊断任务卡住根因）
+            try:
+                probe_result = self._probe_download_ready(task_id, match_item, verbose=True)
+            except RuntimeError as e:
+                # 2026-08-21 新增：探针检测到 100 上限错误时立即停，不浪费 3  分钟
+                if "QUOTA_EXCEEDED" in str(e):
+                    raise RuntimeError(
+                        f"❌ 京准通下载报表数已达 100 上限，无法继续下载\n"
+                        f"   task_id={task_id}\n"
+                        f"   请登录 jzt.jd.com → 我的报表/下载记录 → 删除历史记录后重试\n"
+                        f"   ⚠️ 注意：每次 create_export_task 都会创建记录，删除前不要重复触发"
+                    )
+                raise
             if probe_result:
-                print(f"  ✅ 探针成功，任务已就绪（downloadById 能拿到 urlCsv）")
+                print(f"  ✅ 探针成功，任务已就绪（downloadById 能拿到 urlCsv 或 urlZip）")
                 return match_item
 
             if i < self.MAX_POLL_TIMES:
@@ -3188,8 +3425,13 @@ class JZTKuaicheAPI:
             f"   可手动浏览器登录 https://jzt.jd.com 查看任务状态"
         )
 
-    def _probe_download_ready(self, task_id: str, match_item: dict) -> bool:
-        """探针：调 downloadById 看能否拿到 urlCsv（不实际下载）。
+    def _probe_download_ready(self, task_id: str, match_item: dict, verbose: bool = False) -> bool:
+        """探针：调 downloadById 看能否拿到 urlCsv/urlZip（不实际下载）。
+
+        参数:
+            task_id   - 任务 ID
+            match_item - get_task_list 返回的单条任务记录
+            verbose   - 是否打印诊断信息（探针失败时打印 downloadById 响应前 300 字符）
 
         返回:
             bool - True=报表已就绪可下载，False=还没生成
@@ -3199,6 +3441,8 @@ class JZTKuaicheAPI:
         end_day = match_item.get("endTimeStr", "")
         pin = match_item.get("pin", "")
         if not file_name:
+            if verbose:
+                print(f"     [探针诊断] match_item 缺 reportName/tempName 字段，匹配项 keys={list(match_item.keys())[:10]}")
             return False
         try:
             url = (
@@ -3210,14 +3454,35 @@ class JZTKuaicheAPI:
             )
             resp = self.session.get(url, timeout=30)
             if resp.status_code != 200:
+                if verbose:
+                    print(f"     [探针诊断] downloadById HTTP {resp.status_code}，响应前 200 字符: {resp.text[:200]}")
                 return False
             ret = resp.json()
-            # 成功判定：success=true + code∈{0,1} 且 data.urlCsv 非空
-            if ret.get("success", True) and ret.get("code") in (0, 1):
-                url_csv = ret.get("data", {}).get("urlCsv")
-                return bool(url_csv)
+            # 成功判定：success=true + code∈{0,1} 且 data.urlCsv 或 data.urlZip 非空
+            # ⚠️ 2026-08-20：大数据量时 downloadById 返回 urlZip（不是 urlCsv），探针需同时检查
+            success_flag = ret.get("success", True)
+            code_val = ret.get("code")
+            if success_flag and code_val in (0, 1):
+                data_obj = ret.get("data", {})
+                url_csv = data_obj.get("urlCsv")
+                url_zip = data_obj.get("urlZip")
+                has_url = bool(url_csv or url_zip)
+                if not has_url and verbose:
+                    # 探针成功但 urlCsv/urlZip 都空 → 诊断 data 字段实际内容
+                    print(f"     [探针诊断] success={success_flag} code={code_val} 但 urlCsv/urlZip 均空")
+                    print(f"     [探针诊断] data 字段 keys={list(data_obj.keys())[:15] if isinstance(data_obj, dict) else type(data_obj).__name__}")
+                    data_str = str(data_obj)
+                    print(f"     [探针诊断] data 内容前 300 字符: {data_str[:300]}")
+                return has_url
+            # 2026-08-21 新增：检测 100 上限错误，抛出 RuntimeError 让 wait_for_task_ready 立即停
+            if self._is_quota_exceeded_response(ret):
+                raise RuntimeError("QUOTA_EXCEEDED")
+            if verbose:
+                print(f"     [探针诊断] success={success_flag} code={code_val}（不在 0/1），msg={ret.get('msg', '')[:200]}")
             return False
-        except Exception:
+        except Exception as e:
+            if verbose:
+                print(f"     [探针诊断] 探针异常：{type(e).__name__}: {e}")
             return False
 
     # ---- 接口3：CDN 下载（阶段4：CDN 403 自动重刷 URL 重试）----
@@ -3281,57 +3546,105 @@ class JZTKuaicheAPI:
         # 业务码校验（success=true 且 code∈{0,1} 视为成功）
         self._handle_response(ret_byid, op_desc="downloadById")
 
-        url_csv = ret_byid.get("data", {}).get("urlCsv")
-        if not url_csv:
+        # ⚠️ 2026-08-20 新增：大数据量时 OSS 返回 ZIP，downloadById 可能返回 urlZip 字段
+        data_obj = ret_byid.get("data", {})
+        url_csv = data_obj.get("urlCsv")
+        url_zip = data_obj.get("urlZip")  # 大数据量时可能有 ZIP 链接
+        if not url_csv and not url_zip:
             raise RuntimeError(
-                f"❌ downloadById 响应中 urlCsv 缺失：{ret_byid}\n"
+                f"❌ downloadById 响应中 urlCsv/urlZip 均缺失：{ret_byid}\n"
                 f"   可能原因：报表还没真正生成 / 接口字段名变更"
             )
 
-        # 5. 立即 GET urlCsv（OSS 预签名链接）
+        # 2026-08-21 改造：urlZip + urlCsv 兼容重试（用户决策）
+        #   旧逻辑：url_primary = url_zip or url_csv，只用一个 URL，404 时只对同一 URL 重试 N 次
+        #   缺陷：京东可能同时返回 urlCsv（先生成）+ urlZip（异步生成中），但旧逻辑只用 urlZip，
+        #         urlZip 404 时不会切换到 urlCsv 重试 → 错过已就绪的 CSV 文件
+        #   新逻辑：把 urlZip + urlCsv 都加入候选列表
+        #         优先 urlZip（数据更完整），404 → 立即试 urlCsv（小 CSV 通常先生成）
+        #         两个都 404 → 退避重试整个候选列表
+        #         兼容互斥场景（接口只返回一个 URL 时也工作）
+        url_candidates = []
+        if url_zip:
+            url_candidates.append(("urlZip", url_zip, True))   # (label, url, is_zip)
+        if url_csv:
+            url_candidates.append(("urlCsv", url_csv, False))
+        print(f"⬇️ 下载候选 URL：{[c[0] for c in url_candidates]}（OSS 预签名链接；首次可能 404 等几秒重试）")
+        for _label, _url, _is_zip in url_candidates:
+            print(f"  - {_label}: {_url[:80]}...")
+
+        # 5. 立即 GET url（OSS 预签名链接）
         # ⚠️ 2026-08-09 修正：单纯 GET 同 URL 重试即可（OSS链接有效期内稳定）
         #   旧版"每次失败重调 downloadById 拿新 urlCsv"是错的：
         #   - 新 urlCsv 是新 OSS 文件路径，新文件可能还没生成
         #   - 京东 OSS 是异步生成，旧 urlCsv 对应的文件**正在生成中**，多等几次就 200
-        print(f"⬇️ 下载 urlCsv（OSS 预签名链接；首次可能 404 等几秒重试）")
-        print(f"  URL 前 80 字符: {url_csv[:80]}...")
-
+        # ⚠️ 2026-08-20 新增：
+        #   - 大数据量时 downloadById 返回 urlZip（.zip 链接），OSS 异步生成 ZIP 需要更长时间
+        #   - ZIP 重试次数 MAX_ZIP_DOWNLOAD_RETRY=15，退避 10-30 秒（总 2.5-7.5 分钟）
+        #   - 单 CSV 重试次数 MAX_DOWNLOAD_RETRY=3，退避 3-10 秒（总 10-30 秒）
+        # ⚠️ 2026-08-21 改造：urlZip + urlCsv 兼容重试
+        #   - 优先 urlZip（大数据量场景）；urlZip 404 → 立即试 urlCsv
+        #   - 两个都 404 → 退避重试整个候选列表
+        #   - 退避时长：候选列表里只要含 ZIP 就用 ZIP 退避（10-30s），否则 CSV 退避（3-10s）
+        has_zip_candidate = any(c[2] for c in url_candidates)
+        max_retry = self.MAX_ZIP_DOWNLOAD_RETRY if has_zip_candidate else self.MAX_DOWNLOAD_RETRY
+        backoff_min = 10 if has_zip_candidate else 3
+        backoff_max = 30 if has_zip_candidate else 10
+        import time as _time
         resp_csv = None
         last_error = None
-        for retry in range(self.MAX_DOWNLOAD_RETRY + 1):
-            try:
-                resp_csv = requests.get(
-                    url_csv,
-                    headers={"User-Agent": self.USER_AGENT},
-                    timeout=60,
-                )
-                # 200 成功
-                if resp_csv.status_code == 200:
-                    break
-                # 404 NoSuchKey（OSS 文件还在生成中）→ 同一 urlCsv 退避重试
-                if resp_csv.status_code == 404 and retry < self.MAX_DOWNLOAD_RETRY:
-                    import time as _time
-                    # ⚠️ 随机退避 3-10 秒（避免固定间隔被风控识别；同时给 OSS 足够预热时间）
-                    backoff = random.uniform(3, 10)
-                    print(
-                        f"  ⚠️ 第 {retry+1}/{self.MAX_DOWNLOAD_RETRY+1} 次 urlCsv 404 NoSuchKey"
-                        f"，随机退避 {backoff:.1f} 秒后重试（同一 urlCsv）..."
+        winning_label = None
+        for retry in range(max_retry + 1):
+            # 内层循环：遍历所有候选 URL，谁先 200 用谁
+            for url_label, url, is_zip in url_candidates:
+                try:
+                    resp_csv = requests.get(
+                        url,
+                        headers={"User-Agent": self.USER_AGENT},
+                        timeout=60,
                     )
-                    _time.sleep(backoff)
-                    continue  # 注意：不重新调 downloadById，同一 urlCsv 继续 GET
-                # 其他非 200
-                resp_csv.raise_for_status()
-            except requests.exceptions.RequestException as e:
-                last_error = e
-                if retry >= self.MAX_DOWNLOAD_RETRY:
-                    raise RuntimeError(f"❌ urlCsv 下载失败（重试 {self.MAX_DOWNLOAD_RETRY+1} 次后）：{e}") from e
-                print(f"  ⚠️ urlCsv 下载异常：{e}，重试中...")
+                    # 200 成功 → 立即跳出内+外层循环
+                    if resp_csv.status_code == 200:
+                        winning_label = url_label
+                        print(f"  ✅ 第 {retry+1}/{max_retry+1} 次 {url_label} 200 OK")
+                        break
+                    # 404 NoSuchKey（OSS 文件还在生成中）→ 切换到下一个候选 URL
+                    if resp_csv.status_code == 404:
+                        print(f"  ⚠️ 第 {retry+1}/{max_retry+1} 次 {url_label} 404 NoSuchKey，切换下一个候选 URL")
+                        continue
+                    # 其他非 200
+                    resp_csv.raise_for_status()
+                except requests.exceptions.RequestException as e:
+                    last_error = e
+                    print(f"  ⚠️ {url_label} 下载异常：{e}，切换下一个候选 URL")
+                    continue
+            # 检查是否成功（break 内层循环后这里判断）
+            if resp_csv is not None and resp_csv.status_code == 200:
+                break
+            # 所有候选都 404/异常 → 退避后重试整个候选列表
+            if retry < max_retry:
+                # ⚠️ 随机退避（ZIP 10-30s / CSV 3-10s；避免固定间隔被风控识别）
+                backoff = random.uniform(backoff_min, backoff_max)
+                url_type = "ZIP" if has_zip_candidate else "CSV"
+                print(
+                    f"  ⏳ 第 {retry+1}/{max_retry+1} 轮所有候选 URL 均 404/失败（{url_type}），"
+                    f"随机退避 {backoff:.1f} 秒后重试整个候选列表..."
+                )
+                _time.sleep(backoff)
+                # ⚠️ 2026-08-20 修正：删除 .csv→.zip 变换逻辑
+                #   原因：OSS 预签名链接含 Signature 参数，改后缀会导致签名失效
+                #   实测：downloadById 对大数据量直接返回 urlZip（无需变换）
 
         if resp_csv is None or resp_csv.status_code != 200:
+            url_type = "ZIP" if has_zip_candidate else "CSV"
             raise RuntimeError(
-                f"❌ urlCsv 连续 {self.MAX_DOWNLOAD_RETRY+1} 次未成功：{last_error}\n"
-                f"   可能原因：报表生成尚未完成 / OSS 预热延迟超出预期"
+                f"❌ 连续 {max_retry+1} 轮（候选 URL {len(url_candidates)} 个）均未成功（{url_type}）：{last_error}\n"
+                f"   可能原因：报表生成尚未完成 / OSS 异步生成延迟超出预期"
             )
+
+        # 标记最终用了哪个 URL（用于后续日志诊断）
+        print(f"  🎯 最终命中 URL：{winning_label}")
+        is_zip_url = winning_label == "urlZip"
 
         # 6. 落盘 + Excel 后置处理（2026-08-09 对齐 AGENTS.md Excel 报表统一规则）
         #    流程：raw CSV → pandas 读取(dtype=str) → prepare_date_columns →
@@ -3342,17 +3655,22 @@ class JZTKuaicheAPI:
     # ---- Excel 后置处理：CSV → xlsx ----
 
     def _post_process_csv_to_xlsx(self, csv_bytes: bytes, task_id) -> str:
-        """把京东 OSS 返回的 raw CSV 字节流 → 标准 Excel 后置处理 → 保存为 xlsx。
+        """把京东 OSS 返回的 raw 数据流 → 标准 Excel 后置处理 → 保存为 xlsx。
+
+        ⚠️ 2026-08-20 新增 ZIP 格式支持：
+            数据量小 → OSS 返回单个 CSV 字节流（原逻辑）
+            数据量大 → OSS 返回 ZIP 压缩包（内含多个 CSV 分片，按行数分片非按日期）
+            自动检测：zipfile.is_zipfile() → ZIP 走解压合并；否则走单 CSV 解析
 
         流程（对齐 AGENTS.md Excel 报表统一规则 + 商品流失分析项目6 模式）：
-            ① pandas.read_csv(dtype=str, na_filter=False) → 防精度丢失
+            ① 检测 ZIP → 解压读取所有 CSV → concat 合并 / 或单 CSV 直接读取（dtype=str 防精度丢失）
             ② prepare_date_columns(df, date) → 日期列智能处理（公共规则1+2）
             ③ safe_convert_numeric(df) → 数值安全转换（公共规则3）
             ④ 转存为 .xlsx + apply_column_formats 设置单元格格式（SKU/SPU 0位小数、订单编号@）
             ⑤ 落盘路径：output/京准通快车效果自定义/{date}/京准通快车效果自定义_{date}.xlsx
 
         参数:
-            csv_bytes - OSS 下载的原始 CSV 字节流（含 UTF-8 BOM）
+            csv_bytes - OSS 下载的原始数据流（单个 CSV 字节流 或 ZIP 压缩包字节流）
             task_id   - 任务 ID（用于日志关联）
         返回:
             str - 保存的 .xlsx 绝对路径
@@ -3360,6 +3678,7 @@ class JZTKuaicheAPI:
             RuntimeError - CSV 解析失败
         """
         import io
+        import zipfile
         import pandas as pd
 
         # ⚠️ 京准通 OSS 返回的 CSV 文件名通常带"下载.csv"等中文，这里从任务获取干净文件名
@@ -3370,18 +3689,38 @@ class JZTKuaicheAPI:
             from datetime import datetime as _dt
             clean_date = _dt.now().strftime("%Y-%m-%d")
 
-        # 1. 读取 CSV（dtype=str 防长数字精度丢失；na_filter=False 防 "0" 被当 NaN）
+        # 1. 读取数据流（自动检测 ZIP 格式 → 解压合并多个 CSV；否则单 CSV 解析）
         try:
-            df = pd.read_csv(
-                io.BytesIO(csv_bytes),
-                dtype=str,
-                na_filter=False,
-                encoding="utf-8-sig",  # 兼容 BOM
-                keep_default_na=False,
-            )
+            if zipfile.is_zipfile(io.BytesIO(csv_bytes)):
+                # ZIP 格式：数据量大时 OSS 返回 ZIP（内含多个 CSV 分片，按行数分片）
+                print(f"  📦 检测到 ZIP 压缩包格式，解压合并多个 CSV 分片...")
+                with zipfile.ZipFile(io.BytesIO(csv_bytes)) as zf:
+                    csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                    if not csv_names:
+                        raise RuntimeError(f"ZIP 内无 CSV 文件：{zf.namelist()}")
+                    dfs = []
+                    for name in csv_names:
+                        with zf.open(name) as f:
+                            df_part = pd.read_csv(
+                                f, dtype=str, na_filter=False,
+                                encoding="utf-8-sig", keep_default_na=False,
+                            )
+                        dfs.append(df_part)
+                        print(f"     └─ {name.split('_')[-1]}: {len(df_part)} 行")
+                    df = pd.concat(dfs, ignore_index=True)
+                    print(f"  ✅ ZIP 合并完成：{len(df)} 行 × {len(df.columns)} 列")
+            else:
+                # 单个 CSV 格式：数据量小时 OSS 返回单个 CSV 字节流
+                df = pd.read_csv(
+                    io.BytesIO(csv_bytes),
+                    dtype=str,
+                    na_filter=False,
+                    encoding="utf-8-sig",  # 兼容 BOM
+                    keep_default_na=False,
+                )
         except Exception as e:
             raise RuntimeError(
-                f"❌ CSV 解析失败：{e}\n"
+                f"❌ CSV/ZIP 解析失败：{e}\n"
                 f"   任务 task_id={task_id}，请检查 OSS 返回内容是否正常"
             ) from e
 
@@ -3394,15 +3733,43 @@ class JZTKuaicheAPI:
         # 3. 数值安全转换（公共规则3）
         df = safe_convert_numeric(df)
 
-        # 4. 构造输出路径：output/京准通快车效果自定义/{date}/京准通快车效果自定义_{date}.xlsx
-        date_subdir = os.path.join(self.output_dir, clean_date)
+        # 4. 构造输出路径：output/{shop_id}/京准通快车效果自定义/京准通快车效果自定义_{date}.xlsx
+        # 2026-08-21 改平铺：去日期子目录，文件名内的 _{date} 段保证唯一性
+        _shop_id = runtime_config.get_shop_id()
+        date_subdir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "output", _shop_id, self.OUTPUT_SUBDIR,
+        )
         os.makedirs(date_subdir, exist_ok=True)
         save_filename = f"京准通快车效果自定义_{clean_date}.xlsx"
         target_path = os.path.join(date_subdir, save_filename)
 
-        # 5. 写 xlsx + 设置单元格格式
-        df.to_excel(target_path, index=False, engine="openpyxl")
-        apply_column_formats(target_path, df, date_column=date_column, date_value=date_value)
+        # 5. 清除非法字符（控制字符 \x00-\x1f，大数据量 CSV 常见）
+        #    openpyxl/xlsxwriter 对单元格内容有非法字符限制
+        #    ⚠️ 2026-08-20 优化：直接对 object 列做 str.replace（向量化），避免逐列 mask 检测
+        import re
+        illegal_re = re.compile(r'[\000-\010]|[\013-\014]|[\016-\037]')
+        cleaned_count = 0
+        for col in df.columns:
+            if df[col].dtype == object:
+                # 直接 replace（向量化，比 mask 检测快），统计替换前后的长度差
+                before = df[col].astype(str).str.len().sum()
+                df[col] = df[col].astype(str).str.replace(illegal_re, '', regex=True)
+                after = df[col].astype(str).str.len().sum()
+                cleaned_count += (before - after)
+        if cleaned_count > 0:
+            print(f"  🧹 清除 {cleaned_count} 个非法控制字符")
+
+        # 6. 写 xlsx（大数据量用 xlsxwriter 性能优，小数据量用 openpyxl 支持格式设置）
+        #    用户决策 2026-08-20：行数 > 50000 用 xlsxwriter（openpyxl 写 37 万行 10+ 分钟）
+        ROW_THRESHOLD = 50000
+        if len(df) > ROW_THRESHOLD:
+            print(f"  📊 大数据量（{len(df)} 行 > {ROW_THRESHOLD}），用 xlsxwriter 写入（性能优）...")
+            df.to_excel(target_path, index=False, engine="xlsxwriter")
+            print(f"  ✅ xlsxwriter 写入完成")
+        else:
+            df.to_excel(target_path, index=False, engine="openpyxl")
+            apply_column_formats(target_path, df, date_column=date_column, date_value=date_value)
 
         print(
             f"✅ 文件已保存：{target_path}"
@@ -3418,8 +3785,12 @@ class JZTKuaicheAPI:
             for item in records:
                 if str(item.get("id")) == str(task_id):
                     return item
-        except Exception:
-            pass
+        except Exception as e:
+            # H-08 修复（2026-08-22 审计）：禁止 except Exception: pass 静默吞异常
+            # 区分异常类型：网络/解析错误打 ERROR 日志；找不到任务（业务正常）打 DEBUG
+            self.logger.error(
+                f"_find_task_in_list 查询任务 {task_id} 失败：{type(e).__name__}: {e}"
+            )
         return {}
 
     # ---- 阶段10 完整流程封装（一键跑通）----
@@ -3463,6 +3834,9 @@ class JZTKuaicheAPI:
 
         # 3. 完整链路
         print(f"🚀 [JZT快车] 启动完整导出：{start_date} ~ {end_date}")
+        # 2026-08-21 新增：前置配额预检，避免 create_export_task 浪费配额
+        print(f"   └─ Step 0/3: 配额预检（防止 100 上限）...")
+        self._precheck_quota()
         print(f"   └─ Step 1/3: 创建导出任务...")
         task_id = self.create_export_task(date=date, start_date=start_date, end_date=end_date)
         print(f"   └─ Step 2/3: 轮询等待任务就绪（subscribeState=2）...")
@@ -3526,22 +3900,47 @@ class JZTKuaicheOrderEffectAPI:
     GIFT_FLAG = 0                   # 0=不含赠品
     ORDER_STATUS_CATEGORY = 1       # 1=成交订单
     ORDER_TYPE = "1,3"              # 订单类型（含义待补查）
-    PIN_ID = "FYA8888"
 
-    def __init__(self, cookie_path: str = "config/jzt_cookie.txt"):
+    # H-01 修复（2026-08-22 审计）：PIN_ID 改为从 runtime_config 动态读取，禁止硬编码 FYA8888
+    #   MIYO/OTA 跑 JZT 时，PIN_ID 自动从环境变量 SHOP_PIN / config.xlsx「店铺账号」sheet 读取对应 pin
+    @property
+    def PIN_ID(self) -> str:
+        from runtime_config import get_shop_pin
+        return get_shop_pin()
+
+    def __init__(self, cookie_path=None):
         import requests
 
-        # 读 Cookie（与项目7 互通 jzt_cookie.txt）
-        cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
-        if not os.path.isfile(cookie_path_abs):
-            raise FileNotFoundError(
-                f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
-                f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入此文件"
-            )
-        with open(cookie_path_abs, "r", encoding="utf-8") as f:
-            self.cookie = f.read().strip()
-        if not self.cookie:
-            raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
+        # ⚠️ 2026-08-22 修复：默认值从硬编码 config/jzt_cookie.txt 改为按店铺平铺 json
+        if cookie_path is None:
+            # H-14 修复（2026-08-24 审计）：用 runtime_config.get_shop_pin() 替代硬编码兜底
+            cookie_path = f"config/{runtime_config.get_shop_pin()}_jzt_cookie.json"
+
+        # AuthLoader 接管（2026-08-20：与项目7 一致）
+        _use_auth_loader = (
+            os.getenv("AUTH_LOADER", "0") == "1" or
+            cookie_path.endswith(".json")
+        )
+        if _use_auth_loader:
+            try:
+                from auth_loader import AuthLoader
+                _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
+                self.cookie = _auth.get_cookie_str("jzt", check_expire=True)
+            except Exception as e:
+                print(f"[WARN] AuthLoader 加载失败，fallback 到 txt：{e}")
+                _use_auth_loader = False
+        if not _use_auth_loader:
+            # 读 Cookie（与项目7 互通 jzt_cookie.txt）
+            cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
+            if not os.path.isfile(cookie_path_abs):
+                raise FileNotFoundError(
+                    f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
+                    f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入此文件"
+                )
+            with open(cookie_path_abs, "r", encoding="utf-8") as f:
+                self.cookie = f.read().strip()
+            if not self.cookie:
+                raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -3563,7 +3962,7 @@ class JZTKuaicheOrderEffectAPI:
         # 输出目录（按 AGENTS.md Excel规则4）
         self.output_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            "output", self.OUTPUT_SUBDIR,
+            "output", runtime_config.get_shop_id(), self.OUTPUT_SUBDIR,
         )
 
     # ---- 业务参数组装 ----
@@ -3753,8 +4152,8 @@ class JZTKuaicheOrderEffectAPI:
         # 3. 数值安全转换（公共规则3）—— 订单编号强制文本，SKU 转数字 0 位小数
         df = safe_convert_numeric(df)
 
-        # 4. 构造输出路径：output/京准通快车订单效果明细/{date}/业务名_{date}.xlsx
-        date_subdir = os.path.join(self.output_dir, clean_date)
+        # 4. 构造输出路径：output/京准通快车订单效果明细/业务名_{date}.xlsx（2026-08-21 改平铺，去日期子目录）
+        date_subdir = self.output_dir
         os.makedirs(date_subdir, exist_ok=True)
         save_filename = f"京准通快车订单效果明细_{clean_date}.xlsx"
         target_path = os.path.join(date_subdir, save_filename)
@@ -4243,7 +4642,7 @@ def _run_jzt_quanzhan_campaign_full(**kwargs) -> str:
         k: kwargs[k] for k in ("start_date", "end_date", "date")
         if k in kwargs
     }
-    api = JZTQuanZhanCampaignAPI(cookie_path=kwargs.get("cookie_path", "config/jzt_cookie.txt"))
+    api = JZTQuanZhanCampaignAPI(cookie_path=kwargs.get("cookie_path", None))
     return api.run_full_export(**forward_kwargs)
 
 
@@ -4314,22 +4713,46 @@ class JZTQuanZhanCampaignAPI:
     GIFT_FLAG = ""              # 含赠品（字符串空，注意与项目8数字0不同）
     SXU_ID = ""                 # SKU 过滤（空）
     OBYS = ""                   # 对象过滤（空）
-    PIN_ID = "FYA8888"
 
-    def __init__(self, cookie_path: str = "config/jzt_cookie.txt"):
+    # H-01 修复（2026-08-22 审计）：PIN_ID 动态读取，禁止硬编码
+    @property
+    def PIN_ID(self) -> str:
+        from runtime_config import get_shop_pin
+        return get_shop_pin()
+
+    def __init__(self, cookie_path=None):
         import requests
 
-        # 读 Cookie（与项目7/8 互通 jzt_cookie.txt）
-        cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
-        if not os.path.isfile(cookie_path_abs):
-            raise FileNotFoundError(
-                f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
-                f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入此文件"
-            )
-        with open(cookie_path_abs, "r", encoding="utf-8") as f:
-            self.cookie = f.read().strip()
-        if not self.cookie:
-            raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
+        # ⚠️ 2026-08-22 修复：默认值从硬编码 config/jzt_cookie.txt 改为按店铺平铺 json
+        if cookie_path is None:
+            # H-14 修复（2026-08-24 审计）：用 runtime_config.get_shop_pin() 替代硬编码兜底
+            cookie_path = f"config/{runtime_config.get_shop_pin()}_jzt_cookie.json"
+
+        # AuthLoader 接管（2026-08-20：与项目7 一致）
+        _use_auth_loader = (
+            os.getenv("AUTH_LOADER", "0") == "1" or
+            cookie_path.endswith(".json")
+        )
+        if _use_auth_loader:
+            try:
+                from auth_loader import AuthLoader
+                _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
+                self.cookie = _auth.get_cookie_str("jzt", check_expire=True)
+            except Exception as e:
+                print(f"[WARN] AuthLoader 加载失败，fallback 到 txt：{e}")
+                _use_auth_loader = False
+        if not _use_auth_loader:
+            # 读 Cookie（与项目7/8 互通 jzt_cookie.txt）
+            cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
+            if not os.path.isfile(cookie_path_abs):
+                raise FileNotFoundError(
+                    f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
+                    f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入此文件"
+                )
+            with open(cookie_path_abs, "r", encoding="utf-8") as f:
+                self.cookie = f.read().strip()
+            if not self.cookie:
+                raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -4346,7 +4769,7 @@ class JZTQuanZhanCampaignAPI:
         # 输出目录（按 AGENTS.md Excel规则4）
         self.output_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            "output", self.OUTPUT_SUBDIR,
+            "output", runtime_config.get_shop_id(), self.OUTPUT_SUBDIR,
         )
 
     # ---- 业务参数组装 ----
@@ -4525,8 +4948,8 @@ class JZTQuanZhanCampaignAPI:
         # 3. 数值安全转换（公共规则3）
         df = safe_convert_numeric(df)
 
-        # 4. 构造输出路径：output/京准通全站营销单品计划/{date}/业务名_{date}.xlsx
-        date_subdir = os.path.join(self.output_dir, clean_date)
+        # 4. 构造输出路径：output/京准通全站营销单品计划/业务名_{date}.xlsx（2026-08-21 改平铺，去日期子目录）
+        date_subdir = self.output_dir
         os.makedirs(date_subdir, exist_ok=True)
         save_filename = f"京准通全站营销单品计划_{clean_date}.xlsx"
         target_path = os.path.join(date_subdir, save_filename)
@@ -4590,7 +5013,12 @@ class JZTQuanZhanEffectAPI:
     CLICK_OR_ORDER_CALIBER = 0  # 0=点击（int）
     ORDER_STATUS_CATEGORY = 1   # 1=成交订单
     GIFT_FLAG = ""              # 含赠品（字符串空）
-    PIN_ID = "FYA8888"
+
+    # H-01 修复（2026-08-22 审计）：PIN_ID 动态读取，禁止硬编码
+    @property
+    def PIN_ID(self) -> str:
+        from runtime_config import get_shop_pin
+        return get_shop_pin()
 
     # ⚠️ 用户决策 2026-08-10：
     #   orderStatus 默认 "1"（成交订单），开放入参支持传空（""=不限）
@@ -4599,20 +5027,38 @@ class JZTQuanZhanEffectAPI:
     DEFAULT_ORDER_STATUS = "1"  # 成交订单（用户决策 2026-08-10）
     DEFAULT_IS_DAILY = False    # 默认非日报（用户决策 2026-08-10，抓包实测值）
 
-    def __init__(self, cookie_path: str = "config/jzt_cookie.txt"):
+    def __init__(self, cookie_path=None):
         import requests
+        # ⚠️ 2026-08-22 修复：默认值从硬编码 config/jzt_cookie.txt 改为按店铺平铺 json
+        if cookie_path is None:
+            # H-14 修复（2026-08-24 审计）：用 runtime_config.get_shop_pin() 替代硬编码兜底
+            cookie_path = f"config/{runtime_config.get_shop_pin()}_jzt_cookie.json"
 
-        # 读 Cookie（与项目7/8/9 互通 jzt_cookie.txt）
-        cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
-        if not os.path.isfile(cookie_path_abs):
-            raise FileNotFoundError(
-                f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
-                f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入此文件"
-            )
-        with open(cookie_path_abs, "r", encoding="utf-8") as f:
-            self.cookie = f.read().strip()
-        if not self.cookie:
-            raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
+        # AuthLoader 接管（2026-08-20：与项目7 一致）
+        _use_auth_loader = (
+            os.getenv("AUTH_LOADER", "0") == "1" or
+            cookie_path.endswith(".json")
+        )
+        if _use_auth_loader:
+            try:
+                from auth_loader import AuthLoader
+                _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
+                self.cookie = _auth.get_cookie_str("jzt", check_expire=True)
+            except Exception as e:
+                print(f"[WARN] AuthLoader 加载失败，fallback 到 txt：{e}")
+                _use_auth_loader = False
+        if not _use_auth_loader:
+            # 读 Cookie（与项目7/8/9 互通 jzt_cookie.txt）
+            cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
+            if not os.path.isfile(cookie_path_abs):
+                raise FileNotFoundError(
+                    f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
+                    f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入此文件"
+                )
+            with open(cookie_path_abs, "r", encoding="utf-8") as f:
+                self.cookie = f.read().strip()
+            if not self.cookie:
+                raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -4629,7 +5075,7 @@ class JZTQuanZhanEffectAPI:
         # 输出目录（按 AGENTS.md Excel规则4）
         self.output_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            "output", self.OUTPUT_SUBDIR,
+            "output", runtime_config.get_shop_id(), self.OUTPUT_SUBDIR,
         )
 
     # ---- 业务参数组装 ----
@@ -5044,8 +5490,8 @@ class JZTQuanZhanEffectAPI:
         # 4. 数值安全转换（公共规则3）
         df = safe_convert_numeric(df)
 
-        # 5. 构造输出路径：output/京准通全站营销单品推广效果/{date}/业务名_{date}.xlsx
-        date_subdir = os.path.join(self.output_dir, clean_date)
+        # 5. 构造输出路径：output/京准通全站营销单品推广效果/业务名_{date}.xlsx（2026-08-21 改平铺，去日期子目录）
+        date_subdir = self.output_dir
         os.makedirs(date_subdir, exist_ok=True)
         save_filename = f"京准通全站营销单品推广效果_{clean_date}.xlsx"
         target_path = os.path.join(date_subdir, save_filename)
@@ -5105,25 +5551,48 @@ class JZTQuanZhanCampaignAllStoreAPI:
     GIFT_FLAG = ""              # 含赠品（字符串空）
     SXU_ID = ""                 # SKU 过滤（空）
     OBYS = ""                   # 对象过滤（空）
-    PIN_ID = "FYA8888"
+
+    # H-01 修复（2026-08-22 审计）：PIN_ID 动态读取，禁止硬编码
+    @property
+    def PIN_ID(self) -> str:
+        from runtime_config import get_shop_pin
+        return get_shop_pin()
 
     # ---- 复用项目10 的 MAX_DOWNLOAD_RETRY ----
     MAX_DOWNLOAD_RETRY = 8
 
-    def __init__(self, cookie_path: str = "config/jzt_cookie.txt"):
+    def __init__(self, cookie_path=None):
         import requests
+        # ⚠️ 2026-08-22 修复：默认值从硬编码 config/jzt_cookie.txt 改为按店铺平铺 json
+        if cookie_path is None:
+            # H-14 修复（2026-08-24 审计）：用 runtime_config.get_shop_pin() 替代硬编码兜底
+            cookie_path = f"config/{runtime_config.get_shop_pin()}_jzt_cookie.json"
 
-        # 读 Cookie（与项目7-10 互通 jzt_cookie.txt）
-        cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
-        if not os.path.isfile(cookie_path_abs):
-            raise FileNotFoundError(
-                f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
-                f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入此文件"
-            )
-        with open(cookie_path_abs, "r", encoding="utf-8") as f:
-            self.cookie = f.read().strip()
-        if not self.cookie:
-            raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
+        # AuthLoader 接管（2026-08-20：与项目7 一致）
+        _use_auth_loader = (
+            os.getenv("AUTH_LOADER", "0") == "1" or
+            cookie_path.endswith(".json")
+        )
+        if _use_auth_loader:
+            try:
+                from auth_loader import AuthLoader
+                _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
+                self.cookie = _auth.get_cookie_str("jzt", check_expire=True)
+            except Exception as e:
+                print(f"[WARN] AuthLoader 加载失败，fallback 到 txt：{e}")
+                _use_auth_loader = False
+        if not _use_auth_loader:
+            # 读 Cookie（与项目7-10 互通 jzt_cookie.txt）
+            cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
+            if not os.path.isfile(cookie_path_abs):
+                raise FileNotFoundError(
+                    f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
+                    f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入此文件"
+                )
+            with open(cookie_path_abs, "r", encoding="utf-8") as f:
+                self.cookie = f.read().strip()
+            if not self.cookie:
+                raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -5140,7 +5609,7 @@ class JZTQuanZhanCampaignAllStoreAPI:
         # 输出目录（按 AGENTS.md Excel规则4）
         self.output_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            "output", self.OUTPUT_SUBDIR,
+            "output", runtime_config.get_shop_id(), self.OUTPUT_SUBDIR,
         )
 
     # ---- 业务参数组装 ----
@@ -5402,8 +5871,8 @@ class JZTQuanZhanCampaignAllStoreAPI:
         # 4. 数值安全转换
         df = safe_convert_numeric(df)
 
-        # 5. 构造输出路径：output/京准通全站营销全店计划/{date}/业务名_{date}.xlsx
-        date_subdir = os.path.join(self.output_dir, clean_date)
+        # 5. 构造输出路径：output/京准通全站营销全店计划/业务名_{date}.xlsx（2026-08-21 改平铺，去日期子目录）
+        date_subdir = self.output_dir
         os.makedirs(date_subdir, exist_ok=True)
         save_filename = f"京准通全站营销全店计划_{clean_date}.xlsx"
         target_path = os.path.join(date_subdir, save_filename)
@@ -5481,25 +5950,48 @@ class JZTQuanZhanEffectAllStoreAPI:
     ORDER_STATUS_CATEGORY = 1    # 1=成交订单
     ORDER_STATUS = "1"          # 订单状态过滤（字符串 "1"成交订单，与项目10 默认一致）
     GIFT_FLAG = ""              # 含赠品（字符串空）
-    PIN_ID = "FYA8888"
+
+    # H-01 修复（2026-08-22 审计）：PIN_ID 动态读取，禁止硬编码
+    @property
+    def PIN_ID(self) -> str:
+        from runtime_config import get_shop_pin
+        return get_shop_pin()
 
     # ---- 复用项目10 的 MAX_DOWNLOAD_RETRY ----
     MAX_DOWNLOAD_RETRY = 8
 
-    def __init__(self, cookie_path: str = "config/jzt_cookie.txt"):
+    def __init__(self, cookie_path=None):
         import requests
+        # ⚠️ 2026-08-22 修复：默认值从硬编码 config/jzt_cookie.txt 改为按店铺平铺 json
+        if cookie_path is None:
+            # H-14 修复（2026-08-24 审计）：用 runtime_config.get_shop_pin() 替代硬编码兜底
+            cookie_path = f"config/{runtime_config.get_shop_pin()}_jzt_cookie.json"
 
-        # 读 Cookie（与项目7-11 互通 jzt_cookie.txt）
-        cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
-        if not os.path.isfile(cookie_path_abs):
-            raise FileNotFoundError(
-                f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
-                f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入此文件"
-            )
-        with open(cookie_path_abs, "r", encoding="utf-8") as f:
-            self.cookie = f.read().strip()
-        if not self.cookie:
-            raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
+        # AuthLoader 接管（2026-08-20：与项目7 一致）
+        _use_auth_loader = (
+            os.getenv("AUTH_LOADER", "0") == "1" or
+            cookie_path.endswith(".json")
+        )
+        if _use_auth_loader:
+            try:
+                from auth_loader import AuthLoader
+                _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
+                self.cookie = _auth.get_cookie_str("jzt", check_expire=True)
+            except Exception as e:
+                print(f"[WARN] AuthLoader 加载失败，fallback 到 txt：{e}")
+                _use_auth_loader = False
+        if not _use_auth_loader:
+            # 读 Cookie（与项目7-11 互通 jzt_cookie.txt）
+            cookie_path_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), cookie_path)
+            if not os.path.isfile(cookie_path_abs):
+                raise FileNotFoundError(
+                    f"❌ 京准通 Cookie 文件不存在：{cookie_path_abs}\n"
+                    f"   请浏览器登录 https://jzt.jd.com/home，F12 抓 jzt-api.jd.com 域 Cookie 写入此文件"
+                )
+            with open(cookie_path_abs, "r", encoding="utf-8") as f:
+                self.cookie = f.read().strip()
+            if not self.cookie:
+                raise ValueError(f"❌ 京准通 Cookie 文件 {cookie_path_abs} 内容为空")
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -5516,7 +6008,7 @@ class JZTQuanZhanEffectAllStoreAPI:
         # 输出目录（按 AGENTS.md Excel规则4）
         self.output_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            "output", self.OUTPUT_SUBDIR,
+            "output", runtime_config.get_shop_id(), self.OUTPUT_SUBDIR,
         )
 
     # ---- 业务参数组装 ----
@@ -5771,8 +6263,8 @@ class JZTQuanZhanEffectAllStoreAPI:
         # 4. 数值安全转换（公共规则3，含合计行剔除 + 商品ID 整数 0 位小数）
         df = safe_convert_numeric(df)
 
-        # 5. 构造输出路径：output/京准通全站营销全店推广效果/{date}/业务名_{date}.xlsx
-        date_subdir = os.path.join(self.output_dir, clean_date)
+        # 5. 构造输出路径：output/京准通全站营销全店推广效果/业务名_{date}.xlsx（2026-08-21 改平铺，去日期子目录）
+        date_subdir = self.output_dir
         os.makedirs(date_subdir, exist_ok=True)
         save_filename = f"京准通全站营销全店推广效果_{clean_date}.xlsx"
         target_path = os.path.join(date_subdir, save_filename)
@@ -6190,8 +6682,8 @@ class KeywordAnalysisAPI(JDBaseRequest):
         # 3. Excel 通用后置（数值安全转换）
         df = safe_convert_numeric(df)
 
-        # 4. 构造输出路径：output/商智关键词分析/{YYYY-MM-DD}/{业务名}_{YYYY-MM-DD}_{granularity}.xlsx
-        date_subdir = os.path.join(self.output_dir, self.OUTPUT_SUBDIR, clean_date)
+        # 4. 构造输出路径：output/商智关键词分析/业务名_{YYYY-MM-DD}_{granularity}.xlsx（2026-08-21 改平铺，去日期子目录）
+        date_subdir = os.path.join(self.output_dir, self.OUTPUT_SUBDIR)
         os.makedirs(date_subdir, exist_ok=True)
         save_filename = f"商智关键词分析_{clean_date}_{granularity}.xlsx"
         target_path = os.path.join(date_subdir, save_filename)
@@ -6281,7 +6773,12 @@ class JingMaiOrderExportAPI:
 
     # ---- 鉴权域（业务约束，固定）----
     BASE_URL = "https://sff.jd.com/api"
-    APP_ID = "CQLEJWPYPFOVQBC8UFLQ"
+    # H-04 修复（2026-08-22 审计）：APP_ID 改为从 runtime_config.get_app_id() 动态读取，
+    #   禁止在源码硬编码京东 appId。运行时从 config.xlsx「全局配置」sheet「京麦接口/app_id_jm_order」读取
+    @property
+    def APP_ID(self) -> str:
+        from runtime_config import get_app_id
+        return get_app_id("jm_order")
     API_VERSION = "1.0"
     ORIGIN = "https://shop.jd.com"
     REFERER = "https://shop.jd.com/jdm/trade/tools/export/ExprotList?exportTaskType=0"
@@ -6306,14 +6803,17 @@ class JingMaiOrderExportAPI:
     CODE_DAILY_LIMIT = 201    # 单日次数超限
     CODE_RISK = 601           # 风控限流（不重试）
 
-    def __init__(self, h5st: str = "", cookie_path: str = "config/sz_cookie.txt"):
+    def __init__(self, h5st: str = "", cookie_path=None):
         """初始化京麦订单导出 API。
 
         参数:
             h5st        - 浏览器F12抓 createdExportTask 请求头 h5st（**必填**）
-            cookie_path - 京麦 Cookie 文件路径，默认 config/sz_cookie.txt
+            cookie_path - 京麦 Cookie 文件路径，默认 None → 自动用 config/{SHOP_PIN}_jm_dingdan_cookie.json
         """
         import requests
+        # ⚠️ 2026-08-22 修复：默认值从 config/sz_cookie.txt(写错) → 按店铺平铺 jm_dingdan json
+        if cookie_path is None:
+            cookie_path = f"config/{runtime_config.get_shop_pin()}_jm_dingdan_cookie.json"
 
         # 1. h5st 校验（必填，前端强签名一次性）
         # ⚠️ 2026-08-13 升级：h5st 缺失时优先走 AuthLoader 读（如果启用）
@@ -6324,7 +6824,7 @@ class JingMaiOrderExportAPI:
         if not h5st and _use_auth_loader:
             try:
                 from auth_loader import AuthLoader
-                _auth = AuthLoader(shop_id=os.getenv("SHOP_ID", "FYA箱包旗舰店"))
+                _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
                 h5st = _auth.get_h5st(check_expire=True)
                 if h5st:
                     print(f"ℹ️  [京麦] 未传 h5st，AuthLoader 自动读取（{len(h5st)} 字符）")
@@ -6347,7 +6847,7 @@ class JingMaiOrderExportAPI:
             try:
                 from auth_loader import AuthLoader
                 if 'auth_loader' not in dir() or not isinstance(getattr(self, '_auth_instance', None), AuthLoader):
-                    _auth = AuthLoader(shop_id=os.getenv("SHOP_ID", "FYA箱包旗舰店"))
+                    _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
                     self._auth_instance = _auth
                 _biz = "jm" if "jm" in str(cookie_path) else "sz"
                 self.cookie = self._auth_instance.get_cookie_str(_biz, check_expire=True)
@@ -6431,8 +6931,7 @@ class JingMaiOrderExportAPI:
         }
         return headers
 
-    @staticmethod
-    def _build_api_url(api_name: str) -> str:
+    def _build_api_url(self, api_name: str) -> str:
         """拼接接口 URL。
 
         模板：https://sff.jd.com/api?v={VER}&appId={APP_ID}&api=dsm.order.export.exportCenterService.{api_name}
@@ -6447,7 +6946,8 @@ class JingMaiOrderExportAPI:
         return (
             f"{JingMaiOrderExportAPI.BASE_URL}"
             f"?v={JingMaiOrderExportAPI.API_VERSION}"
-            f"&appId={JingMaiOrderExportAPI.APP_ID}"
+            # H-04 修复：APP_ID 是 property，必须用 self.APP_ID（类引用已失效）
+            f"&appId={self.APP_ID}"
             f"&api={full_api}"
         )
 
@@ -6469,10 +6969,12 @@ class JingMaiOrderExportAPI:
         url = self._build_api_url(api_name)
         headers = self._build_request_headers()
 
-        # 调试日志：打印 URL + 关键头（敏感字段做长度截断，不打印完整 h5st）
+        # 调试日志：打印 URL + 关键头（敏感字段做脱敏，不打印完整 h5st）
+        # H-22 修复（2026-08-24 审计）：h5st 脱敏（首 6 + 尾 6），避免 stdout/日志泄漏签名 token
+        h5st_masked = f"{self.h5st[:6]}***{self.h5st[-6:]}" if len(self.h5st) > 12 else "***"
         print(f"🚀 [京麦订单] POST {url}")
         print(f"   Body: {json.dumps(body, ensure_ascii=False)}")
-        print(f"   Headers(关键): dsm-eid={headers['dsm-eid'][:30]}..., dsm-trace-id={headers['dsm-trace-id']}, h5st={self.h5st[:30]}...（共 {len(self.h5st)} 字符）")
+        print(f"   Headers(关键): dsm-eid={headers['dsm-eid'][:30]}..., dsm-trace-id={headers['dsm-trace-id']}, h5st={h5st_masked}（共 {len(self.h5st)} 字符）")
 
         resp = self.session.post(url, headers=headers, json=body, timeout=60)
         resp.raise_for_status()
@@ -7249,7 +7751,7 @@ class JingMaiOrderExportAPI:
         """
         if output_dir is None:
             base_dir = os.path.dirname(os.path.abspath(__file__))
-            output_dir = os.path.join(base_dir, "output", "京麦订单明细加密导出", "raw_zip")
+            output_dir = os.path.join(base_dir, "output", runtime_config.get_shop_id(), "京麦订单明细加密导出", "raw_zip")
         os.makedirs(output_dir, exist_ok=True)
 
         target_path = os.path.join(output_dir, filename)
@@ -7261,59 +7763,28 @@ class JingMaiOrderExportAPI:
     # ---- 阶段 5：IMAP 监听 + zip 解压 + xlsx 提取（2026-08-11）----
 
     @staticmethod
-    def load_imap_config(config_path: str = "config/imap_config.ini") -> dict:
-        """读取 IMAP 配置文件（ini 格式），不存任何敏感字段到代码（2026-08-11 决策）。
+    def load_imap_config(config_path: str = None) -> dict:
+        """读取 IMAP 配置（2026-08-21 改造：代理到 imap_config_loader.py）。
 
-        ini 模板（config/imap_config.ini）：
-            [imap]
-            host = imap.qq.com
-            port = 993
-            user = your_qq@qq.com
-            auth_code = xxxxxxxxxxxxxxxx   # QQ 邮箱 IMAP 授权码（不是 QQ 密码）
-            use_ssl = true
-            folder = INBOX
-            sender_filter = jmsj@jd.com   # 只关心京东商家平台发的短信
-            subject_keyword = 解压密码    # 主题含此关键词
-            max_wait_seconds = 300        # 最多等 5 分钟
-            poll_interval_seconds = 5     # 每 5 秒轮询一次
+        主源：config/imap_config.ini（**真实鉴权**，不入仓）
+        辅源：config.xlsx「全局配置」sheet 的 IMAP 组（元信息/过期提醒）
+
+        参数:
+            config_path: ini 路径；None → 用默认（IMAP_INI_PATH 环境变量或 config/imap_config.ini）
 
         返回:
-            dict - 配置项（缺字段抛错）
-        异常:
-            FileNotFoundError - 配置文件不存在
-            ValueError        - 必填字段缺失
-        """
-        import configparser
-        if not os.path.isfile(config_path):
-            raise FileNotFoundError(
-                f"❌ IMAP 配置文件不存在：{config_path}\n"
-                f"   请参考 SKILL.md 模板创建 ini 文件，授权码从 QQ 邮箱设置获取"
-            )
-        cfg = configparser.ConfigParser()
-        cfg.read(config_path, encoding="utf-8")
-        if "imap" not in cfg:
-            raise ValueError(f"❌ IMAP 配置文件缺少 [imap] section：{config_path}")
+            dict - 配置项（含 xlsx 中的 auth_code_last4/expire_date/note）
 
-        section = cfg["imap"]
-        required = ["host", "port", "user", "auth_code"]
-        missing = [k for k in required if not section.get(k)]
-        if missing:
-            raise ValueError(
-                f"❌ IMAP 配置文件缺失必填字段：{missing}\n"
-                f"   完整模板见 SKILL.md"
-            )
-        return {
-            "host": section["host"].strip(),
-            "port": int(section["port"]),
-            "user": section["user"].strip(),
-            "auth_code": section["auth_code"].strip(),
-            "use_ssl": section.get("use_ssl", "true").strip().lower() in ("1", "true", "yes"),
-            "folder": section.get("folder", "INBOX").strip(),
-            "sender_filter": section.get("sender_filter", "").strip(),
-            "subject_keyword": section.get("subject_keyword", "解压密码").strip(),
-            "max_wait_seconds": int(section.get("max_wait_seconds", "300")),
-            "poll_interval_seconds": int(section.get("poll_interval_seconds", "5")),
-        }
+        异常:
+            FileNotFoundError - ini 文件不存在
+            ValueError        - 必填字段缺失
+
+        改造记录（2026-08-21）：
+            - 业务类不再重复实现 ini 解析，全部走 imap_config_loader.load_imap_config
+            - 授权码过期时，调用方应同时调用 imap_config_loader.check_imap_health
+        """
+        from imap_config_loader import load_imap_config as _load
+        return _load(config_path)
 
     @staticmethod
     def fetch_password_from_imap(
@@ -7370,6 +7841,7 @@ class JingMaiOrderExportAPI:
 
         while _time.time() < deadline:
             attempt += 1
+            mail = None  # H-18 修复（2026-08-24 审计）：提前置 None，确保 finally 能安全 logout
             try:
                 # 1. 登录 IMAP
                 if cfg["use_ssl"]:
@@ -7387,7 +7859,6 @@ class JingMaiOrderExportAPI:
                 criterion = "ALL"
                 typ, data = mail.search(None, criterion)
                 if typ != "OK" or not data or not data[0]:
-                    mail.logout()
                     print(f"  [第 {attempt} 次] 邮箱无邮件（typ={typ}）")
                 else:
                     # 3. 倒序遍历最新邮件（最近 10 封）
@@ -7411,7 +7882,12 @@ class JingMaiOrderExportAPI:
                                 else:
                                     subj_decoded += part
                             subject_text = subj_decoded
-                        except Exception:
+                        except Exception as e:
+                            # H-09 修复（2026-08-22 审计）：IMAP 主题解码失败补日志，
+                            #   避免"明明收到邮件但永远拿不到密码"的隐性故障
+                            self.logger.warning(
+                                f"[IMAP] 邮件主题解码失败，用原始 Subject 兜底：{type(e).__name__}: {e}"
+                            )
                             subject_text = subj_raw
 
                         # 3.2 主题关键词过滤（客户端判断，避开 imaplib 中文编码问题）
@@ -7431,13 +7907,21 @@ class JingMaiOrderExportAPI:
                                 if part.get_content_type() == "text/plain":
                                     try:
                                         body_text = part.get_payload(decode=True).decode("utf-8", errors="replace")
-                                    except Exception:
+                                    except Exception as e:
+                                        # H-09 修复（2026-08-22 审计）：multipart 正文解析失败补日志
+                                        self.logger.warning(
+                                            f"[IMAP] multipart 邮件正文解析失败：{type(e).__name__}: {e}"
+                                        )
                                         pass
                                     break
                         else:
                             try:
                                 body_text = msg.get_payload(decode=True).decode("utf-8", errors="replace")
-                            except Exception:
+                            except Exception as e:
+                                # H-09 修复（2026-08-22 审计）：邮件正文解码失败补日志
+                                self.logger.warning(
+                                    f"[IMAP] 邮件正文解码失败，用 payload 兜底：{type(e).__name__}: {e}"
+                                )
                                 body_text = str(msg.get_payload())
 
                         # 3.5 body 提取密码（taskId 精筛）
@@ -7472,14 +7956,13 @@ class JingMaiOrderExportAPI:
                                 break
 
                         if password:
-                            mail.logout()
+                            # mail.logout() 移到下方 finally 统一处理（H-18 修复）
                             print(
                                 f"✅ [京麦订单] IMAP 拿到密码：{password!r}（taskId={task_id}，"
                                 f"第 {attempt} 次轮询命中）"
                             )
                             return password
 
-                    mail.logout()
                     print(
                         f"  [第 {attempt} 次] 邮箱共 {len(msg_ids)} 封，"
                         f"主题匹配 {matched_count} 封，但都未含 taskId={task_id}"
@@ -7491,7 +7974,19 @@ class JingMaiOrderExportAPI:
                     f"   检查授权码（{cfg['host']}:{cfg['port']}, user={cfg['user']}）"
                 ) from e
             except Exception as e:
-                print(f"  [第 {attempt} 次] IMAP 网络异常：{e}（继续重试）")
+                # M-17 修复（2026-08-24 审计）：IMAP 网络异常用 logger.warning，纳入日志检索
+                self.logger.warning(
+                    f"  [第 {attempt} 次] IMAP 网络异常：{type(e).__name__}: {e}（继续重试）"
+                )
+            finally:
+                # H-18 修复（2026-08-24 审计）：确保 logout 一定执行，防止 IMAP 连接泄漏
+                # 5 分钟超时 × N 次失败可导致 QQ IMAP 服务端拒绝新连接
+                if mail is not None:
+                    try:
+                        mail.logout()
+                    except Exception:
+                        # logout 自身抛错不掩盖原异常
+                        pass
 
             if _time.time() < deadline:
                 _time.sleep(cfg["poll_interval_seconds"])
@@ -7549,10 +8044,12 @@ class JingMaiOrderExportAPI:
         if not os.path.isfile(zip_path):
             raise RuntimeError(f"❌ 加密 zip 不存在：{zip_path}")
 
-        # 输出根目录：output/京麦订单明细/（用户决策 2026-08-11：按业务模块建立文件夹）
+        # 输出根目录：output/{shop_id}/京麦订单明细/（2026-08-21 项目23 改造：按店铺隔离）
+        # ⚠️ 与京麦售后明细对齐：京准通6业务 + 商智已落到 output/{店名}/ 子目录
         if output_dir is None:
             base_dir = os.path.dirname(os.path.abspath(__file__))
-            output_dir = os.path.join(base_dir, "output", "京麦订单明细")
+            shop_id = runtime_config.get_shop_id()
+            output_dir = os.path.join(base_dir, "output", shop_id, "京麦订单明细")
         os.makedirs(output_dir, exist_ok=True)
 
         # 1. 解开 zip（带密码）
@@ -7659,7 +8156,8 @@ class JingMaiOrderExportAPI:
             mtime_ts = os.path.getmtime(zip_path)
             date = _dt.datetime.fromtimestamp(mtime_ts).strftime("%Y-%m-%d")
 
-        date_subdir = os.path.join(output_dir, date)
+        # 输出路径：output/京麦订单明细/订单明细_{date}.xlsx（2026-08-21 改平铺，去日期子目录）
+        date_subdir = output_dir
         os.makedirs(date_subdir, exist_ok=True)
         save_filename = f"订单明细_{date}.xlsx"
         target_xlsx = os.path.join(date_subdir, save_filename)
@@ -7957,7 +8455,11 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
     """
 
     # ---- ⚠️ 项目16 特有类常量（与项目14 完全不同）----
-    APP_ID = "BHPQ4MHJBUOQZKTFTRNS"  # ⚠️ 售后明细导出专属 appId
+    # H-04 修复（2026-08-22 审计）：APP_ID 从 runtime_config.get_app_id() 动态读取（biz_type=jm_after_sale）
+    @property
+    def APP_ID(self) -> str:
+        from runtime_config import get_app_id
+        return get_app_id("jm_after_sale")
     API_PATH_PREFIX = "dsm.seller.afs.bff.ExportDsmService"  # ⚠️ 售后明细 api 路径前缀
     DSM_FILE_PATH = "lineation-price"  # ⚠️ 售后业务特有 dsm-file-path 头（待其他业务验证）
     REFERER = "https://shop.jd.com/jdm/trade/after-sale/independent-after-sale/list?tabCode=all"
@@ -7966,15 +8468,18 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
     # ---- 业务硬性约束（项目16 待真实业务限制实证）----
     EXPORT_TYPE_AFTER_SALE_DETAIL = 2602  # ⚠️ 售后明细导出类型，固定值（待更多业务验证）
 
-    def __init__(self, h5st: str = "", cookie_path: str = "config/jm_cookie.txt"):
+    def __init__(self, h5st: str = "", cookie_path=None):
         """初始化京麦售后明细导出 API。
 
         参数:
             h5st        - 浏览器F12抓 createdExportTask 请求头 h5st（项目16 抓包实证必需）
-            cookie_path - 京麦 Cookie 文件路径，默认 config/jm_cookie.txt
+            cookie_path - 京麦 Cookie 文件路径，默认 None → 自动用 config/{SHOP_PIN}_jm_shouhou_cookie.json
         """
         # ⚠️ 不用 super()（之前的 super().__init__() 在某些情况下未触发子类后续代码）
         #    改用显式调用父类 __init__ + self.setattr 强制设值
+        # ⚠️ 2026-08-22 修复：售后业务 cookie_path 必须指向 jm_shouhou_*.json（订单的父类默认是 jm_dingdan）
+        if cookie_path is None:
+            cookie_path = f"config/{runtime_config.get_shop_pin()}_jm_shouhou_cookie.json"
         JingMaiOrderExportAPI.__init__(self, h5st=h5st, cookie_path=cookie_path)
 
         # 项目16 特有：X-Rp-Sdtoken 风控令牌（从响应里解析，下次请求带上）
@@ -8046,11 +8551,15 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
         if self._rp_sdtoken and self._rp_sdtoken_expire_ts > _time.time():
             headers["X-Rp-Sdtoken"] = self._rp_sdtoken
 
+        # H-22 修复（2026-08-24 审计）：h5st / X-Rp-Sdtoken 脱敏（首 6 + 尾 6）
+        h5st_masked = f"{self.h5st[:6]}***{self.h5st[-6:]}" if len(self.h5st) > 12 else "***"
         print(f"🚀 [京麦售后明细] POST {url}")
         print(f"   Body: {json.dumps(body, ensure_ascii=False)[:500]}{'...' if len(json.dumps(body, ensure_ascii=False)) > 500 else ''}")
-        print(f"   Headers(关键): dsm-eid={headers.get('dsm-eid','')[:30]}..., dsm-trace-id={headers.get('dsm-trace-id','')}, h5st={self.h5st[:30]}...（共 {len(self.h5st)} 字符）")
+        print(f"   Headers(关键): dsm-eid={headers.get('dsm-eid','')[:30]}..., dsm-trace-id={headers.get('dsm-trace-id','')}, h5st={h5st_masked}（共 {len(self.h5st)} 字符）")
         if "X-Rp-Sdtoken" in headers:
-            print(f"   X-Rp-Sdtoken: {headers['X-Rp-Sdtoken'][:30]}...（有效至 {_time.time() - self._rp_sdtoken_expire_ts:.0f}s 后）")
+            sdt = headers["X-Rp-Sdtoken"]
+            sdt_masked = f"{sdt[:6]}***{sdt[-6:]}" if len(sdt) > 12 else "***"
+            print(f"   X-Rp-Sdtoken: {sdt_masked}（有效至 {_time.time() - self._rp_sdtoken_expire_ts:.0f}s 后）")
 
         resp = self.session.post(url, headers=headers, json=body, timeout=60)
         # ⚠️ 项目16 响应可能 code=200 但 data=true（不是 dict），不用 raise_for_status 用业务码判断
@@ -8514,12 +9023,12 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
         if not os.path.isfile(zip_path):
             raise RuntimeError(f"❌ zip 文件不存在：{zip_path}")
 
-        # 输出目录：output/京麦售后明细/{date}/订单明细_{date}.xlsx
-        # ⚠️ 项目14 用的"订单明细_{date}.xlsx"是订单明细的命名
-        #     项目16 应该是"售后明细_{date}.xlsx"（保持命名一致）
+        # 输出目录：output/{shop_id}/京麦售后明细/（2026-08-21 项目23 改造：按店铺隔离）
+        # ⚠️ 与项目14（京麦订单明细）保持一致：京准通6业务 + 商智已落到 output/{店名}/ 子目录
         if output_dir is None:
             base_dir = os.path.dirname(os.path.abspath(__file__))
-            output_dir = os.path.join(base_dir, "output", "京麦售后明细")
+            shop_id = runtime_config.get_shop_id()
+            output_dir = os.path.join(base_dir, "output", shop_id, "京麦售后明细")
         os.makedirs(output_dir, exist_ok=True)
 
         try:
@@ -8605,12 +9114,12 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
 
         df = safe_convert_numeric(df)
 
-        # 输出路径：output/京麦售后明细/{date}/售后明细_{date}.xlsx
+        # 输出路径：output/京麦售后明细/售后明细_{date}.xlsx（2026-08-21 改平铺，去日期子目录）
         if date is None:
             import datetime as _dt
             date = _dt.datetime.fromtimestamp(os.path.getmtime(zip_path)).strftime("%Y-%m-%d")
 
-        date_subdir = os.path.join(output_dir, date)
+        date_subdir = output_dir
         os.makedirs(date_subdir, exist_ok=True)
         save_filename = f"售后明细_{date}.xlsx"
         target_xlsx = os.path.join(date_subdir, save_filename)
@@ -8767,10 +9276,16 @@ class JingMaiAfterSaleExportAPI(JingMaiOrderExportAPI):
         zip_path = self.save_encrypted_zip(zip_bytes, filename)
 
         # 第 4 步：解压（无密码，售后业务无密码）
+        # ⚠️ 2026-08-21 项目23 改造：output_dir 加上 shop_id 子目录，与京麦订单明细对齐
         print(f"📂 [京麦售后明细] 第 4 步：解压 zip（无密码）")
         xlsx_path = self.extract_xlsx_from_after_sale_zip(
             zip_path=zip_path,
-            output_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "京麦售后明细"),
+            output_dir=os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "output",
+                runtime_config.get_shop_id(),
+                "京麦售后明细",
+            ),
             date=date or start_date,
         )
 
@@ -8807,7 +9322,7 @@ def _run_jm_create_task(**kwargs) -> dict:
         )
 
     # cookie_path 可选
-    cookie_path = kwargs.get("cookie_path", "config/jm_cookie.txt")
+    cookie_path = kwargs.get("cookie_path", None)
 
     # 透传给 create_export_task 的参数
     forward_kwargs = {
@@ -8844,7 +9359,7 @@ def _run_jm_create_and_wait(**kwargs) -> dict:
             "   → 浏览器F12抓 createdExportTask 请求头 h5st 复制传入"
         )
 
-    cookie_path = kwargs.get("cookie_path", "config/jm_cookie.txt")
+    cookie_path = kwargs.get("cookie_path", f"config/{runtime_config.get_shop_pin()}_jm_dingdan_cookie.json")
     forward_kwargs = {
         k: kwargs[k] for k in (
             "start_date", "end_date", "date",
@@ -8879,7 +9394,7 @@ def _run_jm_create_wait_download(**kwargs) -> dict:
             "   → 浏览器F12抓 createdExportTask 请求头 h5st 复制传入"
         )
 
-    cookie_path = kwargs.get("cookie_path", "config/jm_cookie.txt")
+    cookie_path = kwargs.get("cookie_path", f"config/{runtime_config.get_shop_pin()}_jm_dingdan_cookie.json")
     forward_kwargs = {
         k: kwargs[k] for k in (
             "start_date", "end_date", "date",
@@ -8915,7 +9430,7 @@ def _run_jm_full_with_pwd(**kwargs) -> dict:
             "   → 浏览器F12抓 createdExportTask 请求头 h5st 复制传入"
         )
 
-    cookie_path = kwargs.get("cookie_path", "config/jm_cookie.txt")
+    cookie_path = kwargs.get("cookie_path", None) or f"config/{runtime_config.get_shop_pin()}_jm_dingdan_cookie.json"
     forward_kwargs = {
         k: kwargs[k] for k in (
             "start_date", "end_date", "date",
@@ -8945,13 +9460,25 @@ def _run_jm_run_full_export(**kwargs) -> dict:
     """
     # ⚠️ 2026-08-14 改造：优先取 jm_order_h5st（项目14 专用），fallback h5st
     h5st = kwargs.get("jm_order_h5st") or kwargs.get("h5st", "")
+    # 2026-08-20：h5st 未传时从 AuthLoader 获取
+    if not h5st and os.getenv("AUTH_LOADER", "0") == "1":
+        try:
+            from auth_loader import AuthLoader
+            _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
+            h5st = _auth.get_h5st(h5st_key="jm_order")
+        except Exception as e:
+            print(f"[WARN] AuthLoader 获取 h5st 失败：{e}")
     if not h5st:
         raise ValueError(
             "❌ 京麦订单明细_完整一键导出 必须传 h5st\n"
             "   → 浏览器F12抓 createdExportTask 请求头 h5st 复制传入"
         )
 
-    cookie_path = kwargs.get("cookie_path", "config/jm_cookie.txt")
+    # 2026-08-22 修复：cookie_path 未传时按业务子类型精确指向对应平铺 json
+    cookie_path = kwargs.get("cookie_path")
+    if not cookie_path:
+        _shop = runtime_config.get_shop_pin()
+        cookie_path = f"config/{_shop}_jm_dingdan_cookie.json"
     forward_kwargs = {
         k: kwargs[k] for k in (
             "start_date", "end_date", "date",
@@ -8986,6 +9513,14 @@ def _run_jm_after_sale_full(**kwargs) -> dict:
     """
     # ⚠️ 2026-08-14 改造：优先取 jm_after_sale_h5st（项目16 专用），fallback h5st
     h5st = kwargs.get("jm_after_sale_h5st") or kwargs.get("h5st", "")
+    # 2026-08-20：h5st 未传时从 AuthLoader 获取
+    if not h5st and os.getenv("AUTH_LOADER", "0") == "1":
+        try:
+            from auth_loader import AuthLoader
+            _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
+            h5st = _auth.get_h5st(h5st_key="jm_after_sale")
+        except Exception as e:
+            print(f"[WARN] AuthLoader 获取 h5st 失败：{e}")
     if not h5st:
         raise ValueError(
             "❌ 京麦售后明细_完整一键导出 必须传 h5st\n"
@@ -8993,7 +9528,18 @@ def _run_jm_after_sale_full(**kwargs) -> dict:
             "   ⚠️ 项目16 h5st 抓包实证是必需的（与项目14 一致）"
         )
 
-    cookie_path = kwargs.get("cookie_path", "config/jm_cookie.txt")
+    # 2026-08-20：cookie_path 未传时从 AuthLoader 获取实际文件路径
+    cookie_path = kwargs.get("cookie_path")
+    if not cookie_path and os.getenv("AUTH_LOADER", "0") == "1":
+        try:
+            from auth_loader import AuthLoader
+            _auth = AuthLoader(shop_id=runtime_config.get_shop_id())
+            cookie_path = _auth._find_auth_file("jm", "json")
+        except Exception as e:
+            print(f"[WARN] AuthLoader 获取 cookie 失败：{e}")
+    if not cookie_path:
+        # H-15 修复（2026-08-24 审计）：禁止硬编码 config/jm_cookie.txt，动态拼多店路径
+        cookie_path = f"config/{runtime_config.get_shop_pin()}_jm_shouhou_cookie.json"
     forward_kwargs = {
         k: kwargs[k] for k in (
             "start_date", "end_date", "date",
@@ -9113,6 +9659,14 @@ def _run_single_business(biz_key, **kwargs):
     try:
         result = handler(**kwargs)
         print(f"[OK] 业务完成: {biz_key} → {result}")
+
+        # 项目24（2026-08-22 新增）：业务成功后自动从 xlsx 读 DataFrame 入库
+        #    解决大部分业务类没主动调 save_to_db 的问题（零侵入）
+        #    save_to_db 内部已联动 excel_master.collect，无需额外调
+        # ⚠️ 只对返回 xlsx 路径的业务生效；返回 dict/list 的不处理
+        if isinstance(result, str) and result.lower().endswith(".xlsx") and os.path.exists(result):
+            _auto_save_db_from_xlsx(biz_key, result)
+
         return result
     except CookieExpiredError as e:
         print(f"[ERR] Cookie已过期: {e}")
@@ -9122,6 +9676,57 @@ def _run_single_business(biz_key, **kwargs):
         print(f"[ERR] 业务失败: {biz_key} → {e}")
         print(f"       详细日志请查看 logs/ 目录下的日志文件。")
         raise
+
+
+def _auto_save_db_from_xlsx(biz_key: str, xlsx_path: str) -> None:
+    """业务完成后自动从 xlsx 读 DataFrame 入库（项目24，2026-08-22 新增）。
+
+    设计动机：
+        - 大部分业务类（项目1-6 商智流量等）没有主动调 save_to_db
+        - DB 入库 + Excel 总表依赖 save_to_db 内部联动
+        - 这里拦截业务返回值（xlsx 路径），自动入库 → 让所有业务都享受零侵入的 DB + Excel 总表
+
+    行为：
+        - 读 xlsx (dtype=str, na_filter=False 避免精度丢失)
+        - 推断 report_date：优先用业务入参 date；否则用 xlsx 文件名提取
+        - 调 save_to_db（内部自动联动 excel_master.collect）
+
+    失败容忍：
+        - 任何异常仅 warning，不阻塞主流程（业务已完成，DB 失败不影响 xlsx 输出）
+    """
+    try:
+        import pandas as pd
+        from db_utils import save_to_db
+
+        # 1. 推断 report_date
+        #    优先 xlsx 文件名（含 _2026-08-21），其次调用栈拿不到，回退到今天-1
+        import re
+        m = re.search(r"_(\d{4}-\d{2}-\d{2})\.xlsx$", os.path.basename(xlsx_path))
+        if m:
+            report_date = m.group(1)
+        else:
+            # 兜底：用今天-1（与 daily_update.py 默认窗口一致）
+            from datetime import datetime, timedelta
+            report_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            print(f"[WARN] xlsx 文件名不含日期，用今天-1={report_date} 兜底")
+
+        # 2. 读 xlsx
+        df = pd.read_excel(xlsx_path, dtype=str, na_filter=False)
+        if df.empty:
+            print(f"[WARN] xlsx 空数据，跳过入库：{xlsx_path}")
+            return
+
+        # 3. 入库（save_to_db 内部已联动 excel_master.collect）
+        save_to_db(
+            biz_key=biz_key,
+            df=df,
+            report_date=report_date,
+            granularity=None,
+        )
+        print(f"[OK] 自动入库：{biz_key} → {report_date} ({len(df)} 行)")
+    except Exception as e:
+        # 任何错误仅 warning，不阻塞主流程
+        print(f"[WARN] 自动入库失败（不影响 xlsx 输出）：{type(e).__name__}: {e}")
 
 
 def _run_business_batch(biz_key_list, **kwargs):
@@ -9516,7 +10121,7 @@ def main():
 
     # 启动信息
     print("=" * 70)
-    print(f"京东商智 - 数据导出工具    店铺: {SHOP_NAME}")
+    print(f"京东商智 - 数据导出工具    店铺: {SHOP_NAME()}")
     print("=" * 70)
 
     # 配置一致性检查
@@ -9646,13 +10251,40 @@ def main():
             print(f"\n[OK] 导出成功: {results}")
     except CookieExpiredError as e:
         print(f"\n[ERR] Cookie已过期: {e}")
+        # 即使鉴权过期也要尝试刷一次总表（已 collect 的部分可能还能写）
+        _try_flush_excel_master_safe()
         sys.exit(1)
     except BusinessNotFoundError as e:
         print(f"\n[ERR] 业务未找到: {e}")
         sys.exit(2)
     except Exception as e:
         print(f"\n[ERR] 导出失败: {e}")
+        # 即使业务失败也要尝试刷总表（前面成功的部分数据已 collect 到缓存）
+        _try_flush_excel_master_safe()
         sys.exit(3)
+
+    # 项目24（2026-08-22 新增）：所有业务跑完后统一刷 Excel 总表
+    # MySQL/DB 已写完 → 现在刷 Excel（用户决策 2026-08-22）
+    _try_flush_excel_master_safe()
+
+
+def _try_flush_excel_master_safe() -> None:
+    """main() 出口的安全 flush：失败仅警告不抛错。
+
+    设计原因：
+        1. Excel 总表只是 DB 的可视化快照，flush 失败不应阻塞主流程
+        2. 异常路径（Cookie 过期/业务失败）也要尝试刷，前面已 collect 的部分还能写入
+        3. 多店并发安全：excel_master 内部按 shop_pin 隔离
+    """
+    try:
+        import excel_master as _em
+        from runtime_config import get_shop_id, get_shop_pin
+        shop_id = get_shop_id()
+        shop_pin = get_shop_pin()
+        _em.flush_shop(shop_id, shop_pin)
+    except Exception as e:
+        # flush 失败仅警告（Excel 只是快照，DB 是真相源）
+        print(f"⚠️ [ExcelMaster] flush_shop 失败（不影响 DB 数据）：{type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
