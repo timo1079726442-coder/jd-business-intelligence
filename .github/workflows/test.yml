@@ -1,0 +1,70 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Python 3.12 · Windows · UTF-8
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # 安装最小必需依赖（按需添加）
+          pip install openpyxl pandas requests msoffcrypto-tool xlrd==2.0.1
+        continue-on-error: false
+
+      - name: Run tests (UTF-8)
+        env:
+          PYTHONIOENCODING: utf-8
+          SHOP_ID: FYA箱包旗舰店
+          SHOP_PIN: FYA8888
+          AUTH_LOADER: "1"
+        run: |
+          # 测试发现：Windows GBK 控制台无法打印 emoji (✅/⚠️)
+          # 必须设 PYTHONIOENCODING=utf-8，否则大部分 JZT 单测因 print UnicodeEncodeError 全挂
+          python -m unittest discover tests -v 2>&1 | Tee-Object -FilePath test_output.log
+          $LASTEXITCODE = $LASTEXITCODE  # 保留退出码
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ github.run_id }}
+          path: test_output.log
+          retention-days: 7
+
+  # 未来可加 lint job（启用 ruff/black 后）：
+  # lint:
+  #   name: ruff + black
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #     - run: pip install ruff black
+  #     - run: ruff check .
+  #     - run: black --check .
