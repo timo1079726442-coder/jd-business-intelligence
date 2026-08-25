@@ -182,6 +182,26 @@ class TestEnsureTableAndUpsert(unittest.TestCase):
         self.assertEqual(len(rows), 1, "应只剩 1 行（覆盖）")
         self.assertEqual(rows[0][1], "999", "访客数应被覆盖为 999")
 
+    def test_sanitize_bare_id_renamed(self):
+        """京东裸「ID」列应重命名 ID_（SQLite 大小写不敏感，撞自动主键 id）"""
+        import pandas as pd
+        df = pd.DataFrame({"日期": ["2026-08-01"], "ID": ["P123"], "花费": ["10"]})
+        out = db_utils._sanitize_columns(df, "京准通全站营销单品计划")
+        self.assertIn("ID_", out.columns, "裸 ID 应重命名为 ID_（避免与 id 主键冲突）")
+        self.assertNotIn("ID", out.columns)
+
+    def test_create_table_with_bare_id_column(self):
+        """回归：带裸「ID」列的 df 经 _sanitize_columns 后 ensure_table 应建表成功
+        （修复前 CREATE TABLE 报 duplicate column name: ID）"""
+        import pandas as pd
+        df = pd.DataFrame({"日期": ["2026-08-01"], "ID": ["P123"], "花费": ["10"]})
+        df = db_utils._sanitize_columns(df, "京准通全站营销单品计划")
+        db_utils.ensure_table(self.conn, "biz_test_bare_id", df, "日期")
+        cur = self.conn.execute("PRAGMA table_info(biz_test_bare_id)")
+        cols = {row[1] for row in cur.fetchall()}
+        self.assertIn("ID_", cols, "建表应含 ID_ 列")
+        self.assertNotIn("ID", cols, "不应再出现裸 ID（与 id 主键冲突）")
+
 
 class TestGetExistingDates(unittest.TestCase):
     """M-26.4 get_existing_dates 排序 + shop_pin 过滤"""

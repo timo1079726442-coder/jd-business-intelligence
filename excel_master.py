@@ -46,7 +46,7 @@ import re
 import json
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, Dict, List
 
 import openpyxl
@@ -543,6 +543,29 @@ def _check_threshold_and_cleanup(ws, sheet_name: str) -> int:
 # ====================================================================
 #  flush_shop：写一次所有 3 个总表
 # ====================================================================
+def _parse_stat_date(v) -> Optional[date]:
+    """把统计日期解析为 date 对象（兼容 datetime/date/字符串多格式）。
+
+    背景（2026-08-25 修复）：总表 stat_date 写入为 YYYY/M/D 文本，
+    而 DB/collect 里是 YYYY-MM-DD。字符串直接比对（'2026/7/22' vs '2026-07-22'）
+    会匹配失败 → 旧行删不掉 → 多次 rebuild 同日期翻倍累积。
+    统一解析为 date 对象比较，保证幂等。
+    """
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = str(v).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 def _flush_one_file(
     shop_pin: str,
     file_type: str,
@@ -598,7 +621,13 @@ def _flush_one_file(
             merged_df = merged_df.rename(columns={stat_date_alias: "stat_date"})
 
         # 受影响日期（用于删除旧行）
-        affected_dates = set(merged_df["stat_date"].astype(str).str.strip().unique())
+        # ⚠️ 2026-08-25 修复：总表 stat_date 存 YYYY/M/D，与 DB 的 YYYY-MM-DD 不一致，
+        #   旧逻辑字符串比对删不掉同日期旧行 → 多次 rebuild 同日期翻倍累积。
+        #   统一解析为 date 集合（_parse_stat_date），删除时同样解析 → 幂等。
+        affected_dates = {
+            d for v in merged_df["stat_date"]
+            if (d := _parse_stat_date(v)) is not None
+        }
 
         # 确保 sheet 存在
         # 2026-08-24 修复：旧版本曾把 column_order='*' 当成字面列名写成表头
@@ -643,12 +672,8 @@ def _flush_one_file(
         # 找到受影响日期的行号（从大到小排序，方便从后往前删）
         rows_to_delete = []
         for row_idx in range(2, ws.max_row + 1):
-            val = ws[f"{date_col_letter}{row_idx}"].value
-            if val is None:
-                continue
-            # datetime / 字符串兼容
-            s = val.strftime("%Y-%m-%d") if isinstance(val, datetime) else str(val).strip()
-            if s in affected_dates:
+            d = _parse_stat_date(ws[f"{date_col_letter}{row_idx}"].value)
+            if d is not None and d in affected_dates:
                 rows_to_delete.append(row_idx)
         rows_deleted = len(rows_to_delete)
 
@@ -659,11 +684,8 @@ def _flush_one_file(
                 data = list(ws.values)  # 含表头行
                 keep = []
                 for row in data[1:]:
-                    v = row[stat_date_col_idx - 1]
-                    if v is None:
-                        continue
-                    s = v.strftime("%Y-%m-%d") if isinstance(v, datetime) else str(v).strip()
-                    if s not in affected_dates:
+                    d = _parse_stat_date(row[stat_date_col_idx - 1])
+                    if d is not None and d not in affected_dates:
                         keep.append(row)
                 ws.delete_rows(2, ws.max_row - 1)  # 清空数据区（保留表头）
                 for row in keep:
@@ -839,6 +861,82 @@ def flush_shop(shop_id: str, shop_pin: str) -> dict:
 
 
 # ====================================================================
+#  从 DB 重建总表（2026-08-25 新增）
+# ====================================================================
+def rebuild_from_db(shop_id: str, shop_pin: str, granularity: Optional[str] = None) -> dict:
+    """从 DB 已有数据重建 3 个总表（不重新调 API）。
+
+    流程：读 DB → collect 暂存缓存 → flush_shop 写总表
+    复用现有 collect + flush_shop，不重复写 Excel 逻辑。
+
+    参数:
+        shop_id     店铺全名（如「FYA箱包旗舰店」）
+        shop_pin    店铺京东 pin（如 FYA8888）
+        granularity 粒度筛选（day/month；None=全部）
+
+    返回:
+        dict - flush_shop 的写入明细
+    """
+    import sqlite3
+    import pandas as pd
+    from db_utils import get_db_path, biz_key_to_table_name
+
+    db_path = get_db_path()
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"DB 不存在：{db_path}\n   → 请先跑业务入库（main.py / fill_missing.py）")
+
+    # 确保 collect 读到对店铺
+    if shop_pin:
+        os.environ["SHOP_PIN"] = shop_pin
+        os.environ["SHOP_ID"] = shop_id or shop_pin
+
+    conn = sqlite3.connect(db_path)
+    mappings = _load_mapping_from_xlsx()
+    reset_collected(shop_pin)  # 清空旧缓存，避免残留
+
+    collected = 0
+    skipped = []
+    try:
+        for m in mappings:
+            biz_key = m["biz_key"]
+            table = biz_key_to_table_name(biz_key)
+            try:
+                df = pd.read_sql_query(
+                    f"SELECT * FROM {table} WHERE shop_pin = ?",
+                    conn, params=(shop_pin,),
+                )
+            except Exception:
+                skipped.append(f"{biz_key}(无表)")
+                continue
+            if df.empty:
+                continue
+            # 剔除公共列（保留业务列 + stat_date）
+            for drop_col in ("id", "etl_time"):
+                if drop_col in df.columns:
+                    df = df.drop(columns=drop_col)
+            # 按 report_date(+granularity) 分组逐日 collect
+            has_gran = granularity and "granularity" in df.columns
+            group_cols = ["report_date"] + (["granularity"] if has_gran else [])
+            for key, grp in df.groupby(group_cols, dropna=False):
+                rd = key[0] if has_gran else key
+                gran = key[1] if has_gran else None
+                collect(biz_key, grp, rd, granularity=gran)
+                collected += 1
+    finally:
+        conn.close()
+
+    if collected == 0:
+        logging.warning(f"⚠️ [ExcelMaster] rebuild_from_db: 无数据（跳过 {len(skipped)} 业务：{skipped}）")
+        return {}
+
+    result = flush_shop(shop_id, shop_pin)
+    logging.info(
+        f"✅ [ExcelMaster] rebuild_from_db 完成：重建 {collected} 组业务-日期，跳过 {len(skipped)} 业务 {skipped}"
+    )
+    return result
+
+
+# ====================================================================
 #  CLI（调试用）
 # ====================================================================
 if __name__ == "__main__":
@@ -847,8 +945,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Excel 总表调试 CLI")
     parser.add_argument("--list-files", action="store_true", help="列出所有店铺的 3 个总表路径")
     parser.add_argument("--show-mapping", action="store_true", help="打印当前「Excel总表映射」sheet 内容")
-    parser.add_argument("--shop_pin", type=str, default=None, help="查指定店铺的总表路径")
+    parser.add_argument("--shop_pin", type=str, default=None, help="店铺 pin（FYA8888/miyo-周/ota8888）")
+    parser.add_argument("--shop_id", type=str, default=None, help="店铺全名（FYA箱包旗舰店等，用于日志）")
     parser.add_argument("--flush-test", action="store_true", help="测试 flush_shop（需先 collect 数据）")
+    parser.add_argument("--rebuild", action="store_true", help="从 DB 已有数据重建总表（需 --shop_pin）")
+    parser.add_argument("--granularity", type=str, default=None, choices=["day", "month"], help="重建粒度筛选（可选）")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -879,3 +980,13 @@ if __name__ == "__main__":
 
     elif args.flush_test:
         print("⚠️ --flush-test 需要先有 collect 数据，请在业务代码里调 collect() 后再触发")
+
+    elif args.rebuild:
+        # 2026-08-25 新增：从 DB 已有数据一键重建总表
+        if not args.shop_pin:
+            print("❌ --rebuild 必须配合 --shop_pin（如 FYA8888 / miyo-周 / ota8888）")
+            raise SystemExit(3)
+        shop_id = args.shop_id or args.shop_pin
+        print(f"🔄 从 DB 重建总表：shop_id={shop_id}, shop_pin={args.shop_pin}, granularity={args.granularity or '全部'}")
+        result = rebuild_from_db(shop_id, args.shop_pin, args.granularity)
+        print(f"\n✅ 重建完成：{result or '(无数据)'}")

@@ -303,18 +303,25 @@ def read_excel_bytes(content):
     raise ValueError(f"无法识别的Excel格式（magic={magic!r}）")
 
 
-def drop_total_rows(df):
+def drop_total_rows(df, skip: bool = False):
     """去除服务端默认加的「合计/总计/汇总」行（所有报表复用，全局生效）。
 
     ⚠️ 2026-08-10 用户决策：服务端导出的报表里配置的合计/总计/汇总行，整行剔除。
     检测规则：任一单元格的值（含表头和数据）含「合计」「总计」「汇总」任一关键词，
     整行 drop（inplace）。
 
+    ⚠️ 2026-08-25 新增 skip 参数：京准通/京麦业务每行已是订单/计划明细，
+    「推广单元/品牌名称」列里含「全店推广/品类汇总」等关键词会被误判，
+    京准通 4 类 + 京麦 2 类业务调用时传 skip=True 跳过剔除。
+
     入参:
-        df - pandas.DataFrame
+        df   - pandas.DataFrame
+        skip - True 跳过剔除（京准通/京麦业务调用时传）
     出参:
         处理后的DataFrame（原地修改并返回）
     """
+    if skip:
+        return df
     if df is None or df.empty:
         return df
     # 关键词集合（用户决策 2026-08-10）
@@ -336,11 +343,16 @@ def drop_total_rows(df):
     return df
 
 
-def safe_convert_numeric(df):
+def safe_convert_numeric(df, skip_drop_total: bool = True):
     """全表数值安全转换（所有报表复用，全局生效）。
 
     入参:
-        df - pandas.DataFrame（从Excel读取的表格数据）
+        df               - pandas.DataFrame（从Excel读取的表格数据）
+        skip_drop_total  - True 跳过 drop_total_rows（默认 True，2026-08-25 起）
+                           历史：2026-08-10 默认 False 全局生效，但实际所有业务 xlsx
+                           末尾都无「汇总/合计/总计」行，drop_total_rows 仅误剔真实数据
+                           （如京准通订单明细 695 行被误剔「全店推广/品类汇总」字眼的行）。
+                           如未来某业务真需要剔除，调用方显式传 skip_drop_total=False。
     出参:
         处理后的DataFrame（直接修改并返回），转换规则：
             0. 【强制文本黑名单】列名命中 TEXT_FORCE_COLUMNS（如"订单编号"）
@@ -353,9 +365,12 @@ def safe_convert_numeric(df):
         ⚠️ 调用前请先把日期列用 convert_date_format() 处理好，否则"20260729"这类
            8位纯数字日期会被误当成普通数字转换（商品流量来源流程已保证先转日期再转数值）。
         ⚠️ 2026-08-10：内部先调用 drop_total_rows() 剔除合计行（用户决策），全局生效。
+        ⚠️ 2026-08-25：京准通 4 类 + 京麦 2 类业务每行已是明细，「推广单元/品牌名称」
+           列里含「全店推广/品类汇总」等关键词会被 drop_total_rows 误剔，
+           京准通/京麦 handler 调用时传 skip_drop_total=True 跳过剔除。
     """
     # ⚠️ 2026-08-10 用户决策：先剔除合计/总计/汇总行（封装在内部，全局生效，避免调用方遗漏）
-    drop_total_rows(df)
+    drop_total_rows(df, skip=skip_drop_total)
     for col in df.columns:
         # ⚠️ 强制文本黑名单：命中列整列跳过数值转换，保留原始文本（订单编号等长ID）
         if _col_matches(col, TEXT_FORCE_COLUMNS):
@@ -1196,8 +1211,8 @@ class ProductFlowAPI(JDBaseRequest):
         short_name = display_key.replace("商品流量来源_", "")  # 去掉前缀，保留"搜索/推荐/购物车"
         filename = f"{short_name}流量_{date}.xlsx"
 
-        # 7. 后置处理保存：读Excel → 首列插入【日期】 → 数值安全转换 → 写回
-        return self._save_flow_excel(response, filename, date)
+        # 7. 后置处理保存：读Excel → 首列插入【日期】 → 数值安全转换 → 写回 → 入库
+        return self._save_flow_excel(response, filename, date, biz_key=biz_key)
 
     # ---------- 商品流量来源 区间逐日循环导出（2026-08-10 新增）----------
     def _download_sku_by_days(self, biz_key, display_key, start_date, end_date):
@@ -1323,7 +1338,7 @@ class ProductFlowAPI(JDBaseRequest):
 
         return df, date_column, date_value
 
-    def _save_flow_excel(self, response, filename, date):
+    def _save_flow_excel(self, response, filename, date, biz_key=None):
         """商品流量来源专用保存流程（单日，Excel后置处理，保持原有行为）。
 
         导出流程（需求文档要求 + 2026-08-07 公共规则1+2）：
@@ -1334,6 +1349,8 @@ class ProductFlowAPI(JDBaseRequest):
             response - requests响应（content为接口返回的xlsx二进制）
             filename - 保存文件名（如 搜索流量_2026-07-29.xlsx）
             date     - 本次查询日期（如 2026-07-29）
+            biz_key  - 业务key（如 商品流量来源_购物车）；非空则保存后自动入库
+                       （三级渠道类调用时不传，走其独立入库逻辑，避免重复）
         出参:
             保存后的Excel文件绝对路径
         """
@@ -1349,6 +1366,18 @@ class ProductFlowAPI(JDBaseRequest):
         self.logger.info(
             f"Excel已保存: {file_path}（已插入日期列+数值转换+单元格格式，{os.path.getsize(file_path)}字节）"
         )
+
+        # ③ 数据库入库（2026-08-25 项目24 补：run_recent_30d 直调 handler 时不走 _auto_save_db_from_xlsx 钩子）
+        #    搜索/推荐/购物车流量 handler 此前无入库 → xlsx 生成了但 DB/总表缺数据
+        #    正根修复：保存后自动调 save_to_db（内部已联动 excel_master.collect）
+        #    ⚠️ 仅单日路径（biz_key 由 download_sku 传入）；三级渠道不传 → 不重复入库
+        if biz_key:
+            try:
+                from db_utils import save_to_db
+                save_to_db(biz_key=biz_key, df=df, report_date=date)
+            except Exception as e:
+                self.logger.warning(f"⚠️ DB 入库失败（不影响 Excel）：{e}")
+
         return file_path
 
     # 业务级便捷方法（保持向后兼容，内部都走 download_sku）

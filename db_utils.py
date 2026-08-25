@@ -169,22 +169,41 @@ def biz_key_to_table_name(biz_key: str) -> str:
     return f"biz_{slug}"
 
 
+# 业务白名单（2026-08-25）：infer_primary_key 返回 None → ensure_table 不加 UNIQUE
+# 原因：这些业务每行已是「日期+计划+单元+SKU+地域」完整粒度，
+# 单主键推断会过度约束（每天每计划多行被 UNIQUE 拦掉 → 1000 倍数据丢失）。
+# 靠 save_to_db 的 upsert 语义（先 delete 同 shop_pin+stat_date 后 insert）保证幂等。
+_BIZ_NO_UNIQUE = {
+    "京准通快车自定义报表",       # 每天每计划多行（计划×单元×SKU×地域）
+    "京准通快车订单效果明细",     # 每天每计划/订单多行
+    "京准通全站营销单品计划",     # 每天每个商品计划多行
+    "京准通全站营销单品推广效果", # 每天每计划多行
+    "京麦订单明细_完整一键导出",  # 每订单含多商品（订单号+商品ID 复合，但简化不加 UNIQUE）
+    "京麦售后明细_完整一键导出",  # 每售后单含多商品
+}
+
+
 def infer_primary_key(df: pd.DataFrame, biz_key: str = "") -> Optional[Union[str, list]]:
     """自动推断业务主键列名。
 
     优先级：
-        1. config.xlsx 中「<业务短写> primary_key_columns」配置（复合主键，复数）
-        2. config.xlsx 中「<业务短写> primary_key_column」配置（单主键）
-        3. 列名包含关键词（ID / 编号 / 名称 / 关键词 / SKU）
-        4. 第一列文本字段
+        1. 业务白名单（_BIZ_NO_UNIQUE）→ 返回 None（不加 UNIQUE，靠 upsert 兜底）
+        2. config.xlsx 中「<业务短写> primary_key_columns」配置（复合主键，复数）
+        3. config.xlsx 中「<业务短写> primary_key_column」配置（单主键）
+        4. 列名包含关键词（ID / 编号 / 名称 / 关键词 / SKU）
+        5. 第一列文本字段
 
     ⚠️ 复合主键配置示例（一级来源,二级来源,三级来源）：「三级渠道 primary_key_columns = 一级来源,二级来源,三级来源」
 
     返回:
         str  - 单主键列名
         list - 复合主键列名列表
-        None - 推断失败
+        None - 推断失败 或 业务在白名单（不加 UNIQUE）
     """
+    # 0. 白名单：返回 None（让 ensure_table 跳过 UNIQUE）
+    if biz_key in _BIZ_NO_UNIQUE:
+        return None
+
     # 1. config 配置
     cfg = _read_config_xlsx()
     biz_short = biz_key.split("_")[-1] if "_" in biz_key else biz_key
@@ -255,6 +274,66 @@ def _safe_col_name(col: str) -> str:
     return f'"{col}"'
 
 
+# 非法列名字符 → 下划线（2026-08-25 M-33 修复）
+# 京东报表列名含 / % - 等业务字符（如「省/直辖市」「点击率(%)」「等级1-5」），
+# 直接入库会触发 _safe_col_name 白名单拒绝。此处仅替换非白名单字符，保留中英文/数字/括号。
+_ILLEGAL_COL_CHARS = re.compile(r'[^A-Za-z0-9_一-龥（）()\.·\s]')
+
+# SQLite 保留列（ensure_table/upsert_df 自动追加，列名大小写不敏感）
+# ⚠️ 京东报表裸「ID」列与自动主键 id 视为同名 → CREATE 报 duplicate column name: ID
+_SQLITE_RESERVED_COLS = {"id", "shop_pin", "stat_date", "report_date", "etl_time", "granularity"}
+
+
+def _sanitize_columns(df: pd.DataFrame, biz_key: str = "") -> pd.DataFrame:
+    """清洗 DataFrame 列名：非法字符替换为下划线。
+
+    设计原则：
+        - 复制 df（不改原对象），清洗列名后返回
+        - SQL 层 _safe_col_name 仍严格校验（清洗后必通过）
+        - 清洗后列名改变时打 WARNING（提示列名归一化）
+        - 若清洗后列名重复（如「A/B」「A-B」都变 A_B），后续列名加序号避免冲突
+
+    参数:
+        df      原始 DataFrame（业务后置后的）
+        biz_key 业务名（用于日志定位）
+
+    返回:
+        清洗列名后的 DataFrame（副本）
+    """
+    renamed = []
+    seen = {}
+    new_cols = []
+    for c in df.columns:
+        raw = str(c).strip()
+        if not raw:
+            base = "col_unnamed"
+        else:
+            base = _ILLEGAL_COL_CHARS.sub("_", raw)
+        # SQLite 列名大小写不敏感：京东裸「ID」列与自动主键 id 撞名 → 加后缀保留业务列
+        if base.lower() in _SQLITE_RESERVED_COLS:
+            base = base + "_"
+        # 处理重复列名（多文件合并时同名列，如「ID」「ID」）
+        # 方案：第二个及以后加序号后缀（ID → ID_2 → ID_3）
+        cnt = seen.get(base, 0)
+        seen[base] = cnt + 1
+        if cnt == 0:
+            clean = base
+        else:
+            clean = f"{base}_{cnt + 1}"
+        new_cols.append(clean)
+        if clean != raw:
+            renamed.append((raw, clean))
+    if renamed:
+        logging.warning(
+            f"⚠️ [M-33] {biz_key} 列名清洗/去重 {len(renamed)} 处：{[(a, b) for a, b in renamed[:5]]}"
+            + ("..." if len(renamed) > 5 else "")
+        )
+    # 直接按位置赋值列名（df.columns 可能重复，按位置最稳妥，返回副本）
+    df2 = df.copy()
+    df2.columns = new_cols
+    return df2
+
+
 def _validate_table_name(table_name: str) -> str:
     """校验表名是否符合规范（防 SQL 注入）。
 
@@ -299,7 +378,7 @@ def ensure_table(
     conn: sqlite3.Connection,
     table_name: str,
     df: pd.DataFrame,
-    pk_col: Union[str, list],
+    pk_col: Union[str, list, None],
 ) -> None:
     """动态建表 + 缺列补齐。
 
@@ -321,14 +400,17 @@ def ensure_table(
     # 安全校验：表名必须合规（防 SQL 注入，AGENTS.md 第40条兜底）
     table_name = _validate_table_name(table_name)
 
-    pk_cols = pk_col if isinstance(pk_col, list) else [pk_col]
+    # 主键可能为 None（业务白名单 _BIZ_NO_UNIQUE：每行已是完整粒度，靠 upsert 兜底）
+    pk_cols: list = []
+    if pk_col:
+        pk_cols = pk_col if isinstance(pk_col, list) else [pk_col]
+        # 校验所有主键列都在 df 中
+        for c in pk_cols:
+            if c not in df.columns:
+                raise ValueError(f"❌ 主键列 [{c}] 不在 df 列中：{list(df.columns)}")
 
-    # 校验所有主键列都在 df 中
-    for c in pk_cols:
-        if c not in df.columns:
-            raise ValueError(f"❌ 主键列 [{c}] 不在 df 列中：{list(df.columns)}")
-
-    df_cols = [c for c in df.columns if c != "id"]
+    # 排除自动主键 id（大小写不敏感，SQLite 认为 id/ID 同名；兜底 _sanitize_columns 已重命名）
+    df_cols = [c for c in df.columns if str(c).lower() != "id"]
 
     # 1. 查表是否存在
     cur = conn.execute(
@@ -351,8 +433,11 @@ def ensure_table(
         # H-03 修复：联合唯一键改为 (shop_pin, stat_date, pk_col1, pk_col2, ...)
         # 多店并发跑同一业务时，通过 shop_pin 隔离，绝不串库
         # MySQL 迁移时此约束可直接对应 UNIQUE KEY (shop_pin, stat_date)
-        unique_keys = ['"shop_pin"', '"stat_date"'] + [_safe_col_name(c) for c in pk_cols]
-        col_defs.append(f"UNIQUE({', '.join(unique_keys)})")
+        # ⚠️ 2026-08-25：pk_cols 为空时跳过 UNIQUE（业务白名单，每行已是完整粒度，
+        # 靠 upsert 语义 [先 delete 同 shop_pin+stat_date 后 insert] 保证幂等）
+        if pk_cols:
+            unique_keys = ['"shop_pin"', '"stat_date"'] + [_safe_col_name(c) for c in pk_cols]
+            col_defs.append(f"UNIQUE({', '.join(unique_keys)})")
 
         sql = f"CREATE TABLE IF NOT EXISTS {table_name} (\n  " + ",\n  ".join(col_defs) + "\n)"
         conn.execute(sql)
@@ -397,7 +482,7 @@ def upsert_df(
     table_name: str,
     df: pd.DataFrame,
     report_date: str,
-    pk_col: str,
+    pk_col: Optional[Union[str, list]],
     granularity: Optional[str] = None,
 ) -> int:
     """整 DataFrame upsert 到指定表。
@@ -408,13 +493,14 @@ def upsert_df(
         - 返回插入行数
 
     ⚠️ 同 report_date + granularity 的所有记录会被先清掉再插入（Upsert 语义 = 覆盖更新）。
+    ⚠️ 2026-08-25：pk_col 可为 None（业务白名单），ensure_table 跳过 UNIQUE，靠 delete+insert 兜底。
 
     参数:
         conn          sqlite3 连接
         table_name    业务表名
         df            数据（首列必须是主键列）
         report_date   业务日期 YYYY-MM-DD
-        pk_col        主键列名
+        pk_col        主键列名（str / list / None）
         granularity   粒度标识（day/month；None 表示业务本身无粒度区分，如三级渠道）
     返回:
         int - 实际插入的行数
@@ -599,15 +685,29 @@ def save_to_db(
         logging.warning(f"⚠️ df 为空，跳过 {biz_key}/{report_date}")
         return False
 
+    # 列名清洗（2026-08-25 M-33 修复）：京东真实列名可能含 / % - 等字符
+    # 如「省/直辖市」「点击率(%)」「商家备注等级（等级1-5...）」
+    # 这些字符不在 _SAFE_IDENT_PATTERN 白名单内，直接入库会抛 ValueError
+    # 方案：复制 df，把非法字符替换为下划线（防注入 + 兼容京东列名双满足）
+    # SQL 层 _safe_col_name 仍严格校验（清洗后必然通过）
+    df = _sanitize_columns(df, biz_key)
+
     # 主键推断
     pk_col = infer_primary_key(df, biz_key)
-    if not pk_col:
-        logging.error(f"❌ 无法推断主键列：{biz_key}，df.columns={list(df.columns)}")
-        return False
+    if pk_col is None:
+        if biz_key in _BIZ_NO_UNIQUE:
+            # 业务白名单：每行已是「日期+计划+单元+SKU+地域」完整粒度，
+            # 加 UNIQUE 会过度约束丢失数据；靠 upsert 语义保证幂等。
+            logging.info(f"  ℹ️ {biz_key} 主键推断返回 None（业务白名单），不加 UNIQUE，靠 upsert 兜底")
+            pk_cols = []
+        else:
+            # 非白名单业务确实推断失败（如 df 全是数值列） → 报错
+            logging.error(f"❌ 无法推断主键列：{biz_key}，df.columns={list(df.columns)}")
+            return False
+    else:
+        pk_cols = pk_col if isinstance(pk_col, list) else [pk_col]
 
-    pk_cols = pk_col if isinstance(pk_col, list) else [pk_col]
-
-    # 准备 df（确保所有主键列都非空）
+    # 准备 df（仅当有主键列时过滤空值）
     df_clean = df.copy()
     for c in pk_cols:
         if c in df_clean.columns:
