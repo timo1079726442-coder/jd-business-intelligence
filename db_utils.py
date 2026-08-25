@@ -230,19 +230,69 @@ def _infer_sqlite_type(series: pd.Series) -> str:
     return "TEXT"
 
 
+# 安全标识符正则（中英文+数字+下划线+中文括号+点号）
+# 兼容 SQLite 表名 `biz_xxx` 和列名（含中文，如「一级来源」「加购客户数（SPU）」「平均停留时长(秒)」）
+# 放宽规则（2026-08-21 项目23）：允许中文括号（）和英文括号()，全角空格，禁止 ; -- " ' 等 SQL 注入字符
+_SAFE_IDENT_PATTERN = re.compile(r'^[A-Za-z0-9_\u4e00-\u9fa5（）()\.·\s]+$')
+
+
 def _safe_col_name(col: str) -> str:
-    """安全的列名（防 SQL 关键字 + 特殊字符）。"""
-    # 中文/英文/数字都保留；保留关键字需加双引号
+    """安全的列名（防 SQL 关键字 + 特殊字符）。
+
+    规则：
+        1. 空值 → 返回固定占位列名 "col_unnamed"
+        2. 校验只含 中英文/数字/下划线，含其他字符（如 ; -- " '）抛 ValueError
+        3. SQLite 关键字（order/group/select 等）和普通列名统一用双引号包裹
+    """
     if not col:
-        return "col_unnamed"
-    # SQLite 关键字（精简版）
-    keywords = {
-        "order", "group", "select", "from", "where", "table", "index",
-        "primary", "key", "date", "datetime", "time", "user", "name",
-    }
-    if col.lower() in keywords:
-        return f'"{col}"'  # 加双引号转义
+        return '"col_unnamed"'
+    # 安全校验：拒绝注入字符（AGENTS.md 第40条 不允许手动拼接 SQL 字符串的兜底防护）
+    if not _SAFE_IDENT_PATTERN.match(str(col)):
+        raise ValueError(
+            f"❌ 列名含非法字符（仅允许中英文/数字/下划线）：{col!r}\n"
+            f"   → 这可能是 SQL 注入风险，请检查 df.columns 来源"
+        )
     return f'"{col}"'
+
+
+def _validate_table_name(table_name: str) -> str:
+    """校验表名是否符合规范（防 SQL 注入）。
+
+    规则：
+        - 必须匹配 `^biz_[a-z0-9_]+$`（小写英文+数字+下划线，biz_ 前缀）
+        - 不符合抛 ValueError
+        - 校验通过后原样返回（SQLite 表名不需要双引号）
+
+    AGENTS.md 第37条：表名规范 `biz_{业务英文短名}`；第40条：不允许手动拼接 SQL。
+    """
+    if not isinstance(table_name, str) or not re.match(r'^biz_[a-z0-9_]+$', table_name):
+        raise ValueError(
+            f"❌ 表名不合规（必须匹配 biz_[a-z0-9_]+）：{table_name!r}\n"
+            f"   → 表名应来自 biz_key_to_table_name() 的白名单 _BIZ_SLUG_OVERRIDE"
+        )
+    return table_name
+
+
+def _apply_sqlite_perf_pragmas(conn: sqlite3.Connection):
+    """开启 SQLite 写性能优化（2026-08-21 项目23 新增，针对京准通快车单日 4936 行大表）。
+
+    ⚠️ WAL 模式 + synchronous=NORMAL 适合"批量写、可容忍丢最后 1 秒数据"的场景：
+        - 我们的脚本是单进程跑业务，写完就 commit
+        - 磁盘断电丢 1 秒数据是可接受的（可以从京东重新拉）
+        - WAL 模式让读不阻塞写（虽然我们当前是单进程，但未来扩展友好）
+
+    适用业务：
+        - jzt_kuaiche（快车自定义报表，单日 4936 行）
+        - jzt_kuaiche_order_effect（快车订单效果，单日 ~2000 行）
+        - 其他行数 < 1000 的业务影响不大但开启无害
+    """
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")          # WAL 模式（不阻塞读）
+        conn.execute("PRAGMA synchronous = NORMAL")       # 折中：写性能 ↑，崩溃丢 < 1 秒
+        conn.execute("PRAGMA temp_store = MEMORY")        # 临时表放内存
+        conn.execute("PRAGMA cache_size = -64000")        # 64MB 缓存
+    except Exception as e:
+        logging.warning(f"⚠️ SQLite PRAGMA 优化失败（不影响功能）：{e}")
 
 
 def ensure_table(
@@ -254,14 +304,23 @@ def ensure_table(
     """动态建表 + 缺列补齐。
 
     行为：
-        - 如果表不存在：CREATE TABLE，含 id / report_date / etl_time / <df cols> / UNIQUE(report_date, pk_col(s))
+        - 如果表不存在：CREATE TABLE，含 id / shop_pin / stat_date / report_date / etl_time / <df cols> /
+          UNIQUE(shop_pin, stat_date, pk_col(s))
         - 如果表已存在：检查 df 列是否都存在，缺则 ALTER TABLE ADD COLUMN
+          同时检查 shop_pin / stat_date 列是否存在（H-03 修复），缺则补齐
+
+    ⚠️ H-03 多店隔离修复（2026-08-22）：所有表强制携带 shop_pin + stat_date，
+        联合唯一键 (shop_pin, stat_date, 主键列) 支持 MySQL 迁移时建立
+        UNIQUE KEY (shop_pin, stat_date)。
 
     ⚠️ 不删除列、不删除表（避免误操作丢数据）。
 
     参数:
         pk_col  - str (单主键) 或 list[str] (复合主键)
     """
+    # 安全校验：表名必须合规（防 SQL 注入，AGENTS.md 第40条兜底）
+    table_name = _validate_table_name(table_name)
+
     pk_cols = pk_col if isinstance(pk_col, list) else [pk_col]
 
     # 校验所有主键列都在 df 中
@@ -281,28 +340,44 @@ def ensure_table(
     if not table_exists:
         col_defs = [
             "id INTEGER PRIMARY KEY AUTOINCREMENT",
+            '"shop_pin" TEXT NOT NULL',     # H-03 新增：店铺主账号
+            '"stat_date" TEXT NOT NULL',     # H-03 新增：业务统计日期（与 report_date 等价，独立列方便 MySQL 索引）
             '"report_date" TEXT NOT NULL',
             '"etl_time" TEXT NOT NULL',
         ]
         for col in df_cols:
             col_defs.append(f"{_safe_col_name(col)} {_infer_sqlite_type(df[col])}")
 
-        # UNIQUE(report_date, pk_col1, pk_col2, ...)
-        unique_keys = ['"report_date"'] + [_safe_col_name(c) for c in pk_cols]
+        # H-03 修复：联合唯一键改为 (shop_pin, stat_date, pk_col1, pk_col2, ...)
+        # 多店并发跑同一业务时，通过 shop_pin 隔离，绝不串库
+        # MySQL 迁移时此约束可直接对应 UNIQUE KEY (shop_pin, stat_date)
+        unique_keys = ['"shop_pin"', '"stat_date"'] + [_safe_col_name(c) for c in pk_cols]
         col_defs.append(f"UNIQUE({', '.join(unique_keys)})")
 
         sql = f"CREATE TABLE IF NOT EXISTS {table_name} (\n  " + ",\n  ".join(col_defs) + "\n)"
         conn.execute(sql)
         conn.commit()
         logging.info(
-            f"✅ 创建表 {table_name}（{len(df_cols)} 列 + report_date + etl_time + "
-            f"UNIQUE(report_date, {','.join(pk_cols)})）"
+            f"✅ 创建表 {table_name}（{len(df_cols)} 列 + shop_pin + stat_date + report_date + etl_time + "
+            f"UNIQUE(shop_pin, stat_date, {','.join(pk_cols)})）"
         )
     else:
         # ALTER TABLE ADD COLUMN（缺啥补啥）
         cur = conn.execute(f"PRAGMA table_info({table_name})")
         existing_cols = {row[1] for row in cur.fetchall()}
         added = []
+        # H-03：确保 shop_pin / stat_date 列存在（旧表升级）
+        for must_col in ("shop_pin", "stat_date"):
+            if must_col not in existing_cols:
+                sql = f'ALTER TABLE {table_name} ADD COLUMN "{must_col}" TEXT NOT NULL DEFAULT ""'
+                try:
+                    conn.execute(sql)
+                    added.append(must_col)
+                except Exception as e:
+                    # SQLite 老版本不支持 NOT NULL DEFAULT，可降级为 TEXT
+                    logging.warning(f"⚠️ 加 {must_col} 列失败（{e}），降级为 TEXT")
+                    conn.execute(f'ALTER TABLE {table_name} ADD COLUMN "{must_col}" TEXT')
+                    added.append(must_col)
         for col in df_cols:
             if col not in existing_cols:
                 sql = f"ALTER TABLE {table_name} ADD COLUMN {_safe_col_name(col)} {_infer_sqlite_type(df[col])}"
@@ -344,11 +419,14 @@ def upsert_df(
     返回:
         int - 实际插入的行数
     """
+    # 安全校验：表名必须合规（防 SQL 注入，AGENTS.md 第40条兜底）
+    table_name = _validate_table_name(table_name)
+
     if df.empty:
         logging.warning(f"⚠️ df 为空，跳过 {table_name}/{report_date}/{granularity or '-'} 入库")
         return 0
 
-    # 1. 确保表存在
+    # 1. 确保表存在（ensure_table 内部也会校验 table_name）
     ensure_table(conn, table_name, df, pk_col)
 
     # 2. 如果传了 granularity 但表里没这列，ALTER TABLE ADD COLUMN（一次）
@@ -360,20 +438,34 @@ def upsert_df(
             conn.commit()
             logging.info(f"  └─ 给 {table_name} 加 granularity 列")
 
-    # 3. 删除同 report_date + granularity 的全部记录（全覆盖）
+    # 3. 删除同 shop_pin + stat_date（+ granularity）的全部记录（全覆盖，H-03 多店隔离）
+    #    H-03 修复：从环境变量 SHOP_PIN 读取当前店铺主账号
+    #    多店并发跑同一业务时，按 shop_pin 隔离，A 店 DELETE 不会影响 B 店数据
+    shop_pin = os.getenv("SHOP_PIN", "").strip()
+    if not shop_pin:
+        # 容错：从环境变量 SHOP_ID 推导（店铺短名兜底，但可能与京东 pin 不同）
+        shop_id = os.getenv("SHOP_ID", "")
+        shop_pin = shop_id.replace("箱包旗舰店", "") if shop_id else "UNKNOWN"
+        logging.warning(
+            f"⚠️ [H-03] SHOP_PIN 未设置，临时用 SHOP_ID 推导（{shop_pin}）。\n"
+            f"       建议 set SHOP_PIN=FYA8888 / miyo-周 / ota8888"
+        )
     if granularity:
         cur = conn.execute(
-            f"DELETE FROM {table_name} WHERE report_date = ? AND granularity = ?",
-            (report_date, granularity),
+            f"DELETE FROM {table_name} WHERE shop_pin = ? AND stat_date = ? AND granularity = ?",
+            (shop_pin, report_date, granularity),
         )
     else:
         cur = conn.execute(
-            f"DELETE FROM {table_name} WHERE report_date = ?",
-            (report_date,),
+            f"DELETE FROM {table_name} WHERE shop_pin = ? AND stat_date = ?",
+            (shop_pin, report_date),
         )
     deleted = cur.rowcount
     if deleted > 0:
-        logging.debug(f"  └─ 覆盖：删除 {table_name}/{report_date}/{granularity or '-'} 的 {deleted} 行")
+        logging.debug(
+            f"  └─ 覆盖：删除 {table_name}/shop_pin={shop_pin}/stat_date={report_date}"
+            f"/{granularity or '-'} 的 {deleted} 行"
+        )
 
     # 4. 构造插入数据
     etl_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -387,9 +479,9 @@ def upsert_df(
     cols = list(df_to_insert.columns)
     col_names_sql = ", ".join([_safe_col_name(c) for c in cols])
 
-    # 加 report_date / etl_time / (可选 granularity)
-    extra_cols = ['"report_date"', '"etl_time"']
-    extra_vals = [report_date, etl_time]
+    # H-03 修复：加 shop_pin / stat_date / report_date / etl_time / (可选 granularity)
+    extra_cols = ['"shop_pin"', '"stat_date"', '"report_date"', '"etl_time"']
+    extra_vals = [shop_pin, report_date, report_date, etl_time]
     if granularity:
         extra_cols.append('"granularity"')
         extra_vals.append(granularity)
@@ -405,7 +497,10 @@ def upsert_df(
     conn.executemany(sql, rows)
     conn.commit()
 
-    logging.info(f"✅ 入库 {table_name}/{report_date}/{granularity or '-'}：{len(rows)} 行（覆盖 {deleted} 行）")
+    logging.info(
+        f"✅ 入库 {table_name}/shop_pin={shop_pin}/stat_date={report_date}/{granularity or '-'}："
+        f"{len(rows)} 行（覆盖 {deleted} 行）"
+    )
     return len(rows)
 
 
@@ -417,21 +512,55 @@ def get_existing_dates(
     conn: sqlite3.Connection,
     table_name: str,
     granularity: Optional[str] = None,
+    shop_pin: Optional[str] = None,
 ) -> set:
     """返回该表已有 report_date 的集合。
 
-    granularity 提供时只查对应粒度的日期。
+    参数:
+        conn          sqlite3 连接
+        table_name    业务表名（biz_xxx）
+        granularity   粒度（day/month；None 表示业务本身无粒度区分）
+        shop_pin      店铺主账号（H-03 多店隔离）；None 表示不按店铺过滤（兼容旧调用方）
+
+    返回:
+        set - 该表在指定店铺+粒度下的 report_date 集合
+
+    ⚠️ H-03 多店隔离 + M-03 修复（2026-08-24 审计）：fill_missing 必须按 shop_pin 过滤
+        背景：原版跨店聚合后，MIYO 已有的日期会被认为 FYA 也有 → FYA 永远不会补录
+        修复：fill_missing.py 显式传入当前店铺的 shop_pin
     """
-    cur = conn.execute(
-        f"SELECT DISTINCT report_date FROM {table_name}"
-        + (" WHERE granularity = ?" if granularity else ""),
-        (granularity,) if granularity else (),
-    )
-    return {row[0] for row in cur.fetchall()}
+    # 安全校验：表名必须合规（防 SQL 注入，AGENTS.md 第40条兜底）
+    table_name = _validate_table_name(table_name)
+
+    # 构造 WHERE 条件（按优先级叠加）
+    where_clauses = []
+    params = []
+    if shop_pin:
+        where_clauses.append("shop_pin = ?")
+        params.append(shop_pin)
+    if granularity:
+        where_clauses.append("granularity = ?")
+        params.append(granularity)
+
+    sql = f"SELECT DISTINCT report_date FROM {table_name}"
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
+
+    try:
+        cur = conn.execute(sql, tuple(params))
+        return {row[0] for row in cur.fetchall()}
+    except sqlite3.OperationalError as e:
+        # 表不存在 → 返回空集合（与 fill_missing.py 行为一致）
+        # 背景：首次跑某业务时表还不存在，按"全缺失"处理是合理的
+        if "no such table" in str(e).lower():
+            return set()
+        raise
 
 
 def get_existing_count(conn: sqlite3.Connection, table_name: str) -> int:
     """返回该表的总行数（调试用）。"""
+    # 安全校验：表名必须合规（防 SQL 注入，AGENTS.md 第40条兜底）
+    table_name = _validate_table_name(table_name)
     cur = conn.execute(f"SELECT COUNT(*) FROM {table_name}")
     return cur.fetchone()[0]
 
@@ -450,9 +579,9 @@ def save_to_db(
 
     行为：
         - 自动判断是否启用 DB（is_db_enabled()）
-        - 自动建表（ensure_table）
+        - 自动建表（ensure_table，含 shop_pin / stat_date 字段）
         - 自动推断主键列（infer_primary_key）
-        - 自动 upsert（upsert_df）
+        - 自动 upsert（upsert_df，按 shop_pin + stat_date 维度覆盖，H-03 多店隔离）
 
     参数:
         biz_key       业务名（中文，如「商智关键词分析」）
@@ -494,14 +623,53 @@ def save_to_db(
     db_path = get_db_path()
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
+    # 项目24（2026-08-22 新增）：DB 入库成功后自动联动 Excel 总表缓存
+    # 业务类零侵入：save_to_db 内部自动调 excel_master.collect
+    # 这样所有调 save_to_db 的地方都自动同步到总表，不用改业务类
+    _excel_collect_hook = None
+    try:
+        import excel_master as _em
+        _excel_collect_hook = _em.collect
+    except ImportError:
+        pass  # excel_master 不存在时不阻塞 DB 入库
+
+    conn = None
     try:
         conn = sqlite3.connect(db_path, timeout=30)
+        # 开启 SQLite 写性能优化（2026-08-21 项目23）：WAL + NORMAL synchronous
+        _apply_sqlite_perf_pragmas(conn)
         n = upsert_df(conn, table_name, df_clean, report_date, pk_col, granularity)
-        conn.close()
+
+        # 项目24：DB 入库成功后联动 Excel 总表（df 用清理后的 df_clean）
+        if n > 0 and _excel_collect_hook is not None:
+            try:
+                _excel_collect_hook(
+                    biz_key=biz_key,
+                    df=df_clean,
+                    report_date=report_date,
+                    granularity=granularity,
+                )
+            except Exception as e:
+                # collect 失败不影响 DB 入库结果（Excel 只是快照）
+                logging.warning(
+                    f"⚠️ [ExcelMaster] collect 失败（不影响 DB 入库）：{biz_key}/{report_date}：{e}"
+                )
+
         return n > 0
     except sqlite3.Error as e:
         logging.error(f"❌ DB 入库失败 [{biz_key}/{report_date}]：{e}")
         return False
+    except Exception as e:
+        # H-08 / M-01 修复：非 sqlite3.Error 也要记录日志，避免吞报错
+        logging.error(f"❌ DB 入库异常 [{biz_key}/{report_date}]：{type(e).__name__}: {e}")
+        return False
+    finally:
+        # M-01 修复：所有路径都关闭连接，防止泄漏
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as e:
+                logging.warning(f"⚠️ conn.close() 失败：{e}")
 
 
 # ====================================================================

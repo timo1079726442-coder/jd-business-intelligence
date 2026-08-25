@@ -53,10 +53,27 @@ from db_utils import (
     biz_key_to_table_name,
     get_existing_dates,
 )
+# Phase 2.4（2026-08-20）：业务清单从 config.xlsx「业务清单」sheet 读取
+# 替代原硬编码 MVP_BIZ_KEYS（AGENTS.md 第3条禁止硬编码业务列表）
+from biz_config_loader import list_biz_keys
 
 
-# 与 daily_update.py 同步：MVP 2 个业务
-MVP_BIZ_KEYS = ["商智关键词分析", "店铺来源_三级渠道"]
+# 退出码（与 AGENTS.md 第47-51条约定对齐，与 daily_update.py 一致）
+EXIT_SUCCESS = 0       # 全部成功
+EXIT_BIZ_FAIL = 1      # 部分业务失败
+EXIT_AUTH_EXPIRED = 2  # 鉴权过期（Cookie / h5st，触发影刀重抓）
+EXIT_SYSTEM_ERROR = 3  # 系统错误
+
+
+def _is_auth_expired_exception(e: Exception) -> bool:
+    """判断异常是否是鉴权过期类（兼容 main.py 与 auth_loader.py 两套定义）
+
+    背景：main.py:68 自定义了 CookieExpiredError，auth_loader.py:110 也定义了一套。
+    两套类互不继承，except (auth_loader.CookieExpiredError, ...) 会漏掉 main.py 抛的。
+    按类名判断最稳健，跨模块兼容。
+    """
+    name = type(e).__name__
+    return name in ("CookieExpiredError", "H5stExpiredError", "AuthFileNotFound")
 
 
 def _gen_date_range(start_date: str, end_date: str):
@@ -86,9 +103,12 @@ def _find_missing_dates(biz_key: str, expected_dates: list, granularity=None):
         return expected_dates  # DB 不存在 → 全缺失
 
     table_name = biz_key_to_table_name(biz_key)
+    # M-03 修复（2026-08-24 审计）：按当前店铺 shop_pin 过滤已有日期
+    # 背景：跨店聚合后，MIYO 已有的日期会被认为 FYA 也有 → FYA 永远不会补录
+    shop_pin = os.getenv("SHOP_PIN", "").strip()
     conn = sqlite3.connect(db_path, timeout=30)
     try:
-        existing = get_existing_dates(conn, table_name, granularity)
+        existing = get_existing_dates(conn, table_name, granularity, shop_pin=shop_pin or None)
     except sqlite3.OperationalError as e:
         # 表不存在 → 全缺失
         logging.debug(f"表 {table_name} 不存在：{e}")
@@ -99,18 +119,22 @@ def _find_missing_dates(biz_key: str, expected_dates: list, granularity=None):
     return [d for d in expected_dates if d not in existing]
 
 
-def _fill_one_biz(biz_key: str, missing_dates: list, granularity=None, interval: int = 0, dry_run: bool = False):
-    """补录一个业务的缺失日期（每个日期单跑）。"""
+def _fill_one_biz(biz_key: str, missing_dates: list, granularity=None, interval: int = 0, dry_run: bool = False) -> int:
+    """补录一个业务的缺失日期，返回退出码（0=成功 / 1=业务失败 / 2=鉴权过期）。
+
+    鉴权过期时立即 break 后续日期（避免无意义重复触发风控）。
+    """
     import main
 
     if not missing_dates:
         print(f"   ✅ {biz_key} 无缺失")
-        return True
+        return EXIT_SUCCESS
 
     print(f"\n   📥 {biz_key} 缺失 {len(missing_dates)} 天：{missing_dates}")
 
     success = 0
     failed = 0
+    auth_expired = False  # 鉴权过期标志（用于优先返回 2）
     for i, d in enumerate(missing_dates, 1):
         print(f"   [{i}/{len(missing_dates)}] 补录 {d} ...", end=" ")
         try:
@@ -125,6 +149,11 @@ def _fill_one_biz(biz_key: str, missing_dates: list, granularity=None, interval:
                 print("✅")
                 success += 1
         except Exception as e:
+            # 鉴权过期优先识别（按类名匹配，兼容 main.py 与 auth_loader.py 两套定义）
+            if _is_auth_expired_exception(e):
+                print(f"🔄 [鉴权过期] {e}")
+                auth_expired = True
+                break  # 鉴权过期 → 后续日期不再尝试，避免重复触发风控
             print(f"❌ {e}")
             failed += 1
 
@@ -133,7 +162,12 @@ def _fill_one_biz(biz_key: str, missing_dates: list, granularity=None, interval:
             time.sleep(interval)
 
     print(f"   📊 {biz_key}：成功 {success} / 失败 {failed} / 总 {len(missing_dates)}")
-    return failed == 0
+    # 退出码优先级：鉴权过期(2) > 业务失败(1) > 成功(0)
+    if auth_expired:
+        return EXIT_AUTH_EXPIRED
+    if failed > 0:
+        return EXIT_BIZ_FAIL
+    return EXIT_SUCCESS
 
 
 def main():
@@ -141,8 +175,8 @@ def main():
     parser.add_argument(
         "--biz_keys",
         type=str,
-        default=",".join(MVP_BIZ_KEYS),
-        help=f"业务key列表（逗号分隔），默认 MVP 2 个",
+        default=",".join(list_biz_keys()),
+        help=f"业务key列表（逗号分隔），默认全部启用业务",
     )
     parser.add_argument(
         "--start_date",
@@ -224,20 +258,46 @@ def main():
     # 补录
     success_count = 0
     failed_count = 0
+    auth_expired_count = 0  # 鉴权过期计数（独立于业务失败）
     for biz_key in biz_keys:
-        ok = _fill_one_biz(biz_key, missing_map[biz_key], args.granularity, args.interval, args.dry_run)
-        if ok:
+        code = _fill_one_biz(biz_key, missing_map[biz_key], args.granularity, args.interval, args.dry_run)
+        if code == EXIT_SUCCESS:
             success_count += 1
+        elif code == EXIT_AUTH_EXPIRED:
+            auth_expired_count += 1
         else:
             failed_count += 1
 
     # 总结
     print()
     print("=" * 70)
-    print(f"📊 补录总结：业务成功 {success_count} / 失败 {failed_count} / 总 {len(biz_keys)}")
+    print(f"📊 补录总结：业务成功 {success_count} / 失败 {failed_count} / 鉴权过期 {auth_expired_count} / 总 {len(biz_keys)}")
     print("=" * 70)
 
-    return 0 if failed_count == 0 else 1
+    # 退出码优先级：鉴权过期(2) > 业务失败(1) > 全部成功(0)
+    # AGENTS.md 第49条：鉴权过期触发影刀重抓，必须优先返回 2
+    if auth_expired_count > 0:
+        _try_flush_excel_master_safe()  # 项目24（2026-08-22）
+        return EXIT_AUTH_EXPIRED
+    if failed_count > 0:
+        _try_flush_excel_master_safe()  # 项目24（2026-08-22）
+        return EXIT_BIZ_FAIL
+
+    # 全部成功路径
+    _try_flush_excel_master_safe()
+    return EXIT_SUCCESS
+
+
+def _try_flush_excel_master_safe() -> None:
+    """fill_missing.py 收尾的兜底 flush（同 daily_update）。"""
+    try:
+        import excel_master as _em
+        from runtime_config import get_shop_id, get_shop_pin
+        shop_id = get_shop_id()
+        shop_pin = get_shop_pin()
+        _em.flush_shop(shop_id, shop_pin)
+    except Exception as e:
+        print(f"⚠️ [ExcelMaster] fill_missing.flush_shop 失败（不影响 DB）：{type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":

@@ -750,8 +750,14 @@ class AuthLoader:
                         finally:
                             try:
                                 os.remove(tmp_path)
-                            except OSError:
-                                pass
+                            except OSError as e:
+                                # M-22 修复（2026-08-24 审计）：临时文件清理失败加 DEBUG 日志
+                                # 背景：Windows 上文件被占用/权限不够时 os.remove 经常失败，
+                                #       静默吞掉导致孤儿 .tmp 文件累积，磁盘满/磁盘IO受影响
+                                self.logger.debug(
+                                    f"⚠️ 临时文件清理失败（可能文件被占用）：{tmp_path} - "
+                                    f"{type(e).__name__}: {e}"
+                                )
                         h5st_value = cdp_result["h5st"]
                         captured_at_cdp = cdp_result["captured_at"]
                         self.logger.info(
@@ -772,12 +778,15 @@ class AuthLoader:
                 if check_expire:
                     captured_at = data.get("captured_at", 0)
                     if captured_at > 0:
-                        age = time.time() - captured_at
+                        # H-25 修复（2026-08-24 测试发现）：captured_at 可能是毫秒(13位)或秒(10位)
+                        # auth_writer.py 写入 13 位毫秒时间戳；旧代码按秒算 → age 恒负 → 过期检查永不触发
+                        captured_at_s = captured_at / 1000 if captured_at > 1e12 else captured_at
+                        age = time.time() - captured_at_s
                         if age > H5ST_EXPIRE_SECONDS:
                             self._try_rpa_refresh(reason=f"h5st 过期 {age:.0f}秒 > {H5ST_EXPIRE_SECONDS}秒")
                             raise H5stExpiredError(
                                 f"❌ {json_path} 的 h5st 已过期 {age/60:.1f} 分钟 > 30 分钟\n"
-                                f"   captured_at: {datetime.fromtimestamp(captured_at/1000).isoformat() if captured_at > 1e12 else datetime.fromtimestamp(captured_at).isoformat()}\n"
+                                f"   captured_at: {datetime.fromtimestamp(captured_at_s).isoformat()}\n"
                                 f"   → 请 RPA 重新抓取（影刀任务：{DEFAULT_RPA_TASK}）"
                             )
                 self._set_cache(cache_key, h5st_value)

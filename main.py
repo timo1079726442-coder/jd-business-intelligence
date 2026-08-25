@@ -689,9 +689,17 @@ class JDBaseRequest:
         return cookie_str
 
     def refresh_cookie(self, cookie_str=None):
+        # M-23 修复（2026-08-24 审计）：写盘加 try/except，IO 错误（磁盘满/权限不够/目录不存在）
+        # 抛 RuntimeError 带上下文，避免 dispatcher 只看到裸 OSError
         if cookie_str:
-            with open(self.cookie_path, "w", encoding="utf-8") as f:
-                f.write(cookie_str)
+            try:
+                with open(self.cookie_path, "w", encoding="utf-8") as f:
+                    f.write(cookie_str)
+            except OSError as e:
+                raise RuntimeError(
+                    f"❌ Cookie 写入失败：{self.cookie_path} - {type(e).__name__}: {e}\n"
+                    f"   → 检查磁盘空间 / 文件权限 / 目录是否存在"
+                ) from e
             self.cookie_str = cookie_str
         else:
             self.cookie_str = self._read_cookie()
@@ -2739,6 +2747,44 @@ class LossProductAPI(JDBaseRequest):
 
 # 京准通快车自定义报表 payload 模板（最小字段版）
 # ⚠️ 业务参数大部分固定，仅时间字段动态替换；完整模板放代码外延后迭代再引入
+# M-07 修复（2026-08-24 审计）：checkSum 从 config.xlsx「京准通快车/检查码」读取
+#   缺失时 fallback 到 1114112 并打印 WARN（与 _get_kuaiche_checksum() 配合）
+
+
+def _get_kuaiche_checksum() -> int:
+    """读取京准通快车自定义报表的 checkSum（2026-08-24 M-07 新增）。
+
+    数据源: config.xlsx「全局配置」sheet → 项目名「京准通快车」→ 变量名「检查码」
+    缺失兜底: 1114112（用户决策 2026-08-07，与抓包实证一致）
+    """
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook("config/config.xlsx", read_only=True, data_only=True)
+        if "全局配置" not in wb.sheetnames:
+            wb.close()
+            raise RuntimeError("config.xlsx 缺少「全局配置」sheet")
+        ws = wb["全局配置"]
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row and len(row) >= 3 and str(row[0] or "").strip() == "京准通快车" and str(row[1] or "").strip() == "检查码":
+                value = str(row[2] or "").strip()
+                wb.close()
+                if value:
+                    return int(value)
+                break
+        wb.close()
+    except (RuntimeError, ValueError):
+        raise
+    except Exception as e:
+        # 文件不存在或解析失败 → 走兜底
+        print(f"[WARN] [M-07] checkSum 配置读取失败：{type(e).__name__}: {e}")
+    # 兜底：1114112（用户决策 2026-08-07）
+    print(
+        "[WARN] [M-07] config.xlsx「京准通快车/检查码」未配置，使用兜底值 1114112\n"
+        "       京东若更新此值请在 config.xlsx 补登：京准通快车 | 检查码 | <新值>"
+    )
+    return 1114112
+
+
 JZT_KUAICHE_PAYLOAD_TEMPLATE = {
     # 完整 payload 模板（2026-08-07 抓包实证，含 6 大模块 + 元模板）
     # ⚠️ 注意：若接口报参数错误，可能：
@@ -2773,7 +2819,9 @@ JZT_KUAICHE_PAYLOAD_TEMPLATE = {
          ]},
     ],
     # ⚠️ checkSum 用户决策 2026-08-07：现阶段硬编码 1114112；后续若接口报错可能是页面 JS 动态计算
-    "checkSum": 1114112,
+    # M-07 修复（2026-08-24 审计）：此值在 _build_payload 内通过 _get_kuaiche_checksum() 覆盖，
+    #   优先读 config.xlsx「京准通快车/检查码」，缺省 fallback 1114112 + WARN
+    "checkSum": None,  # 占位，运行时由 _build_payload 注入
     "customDimension": [
         {"checked": False, "desc": "基础维度", "hidden": False, "key": "basicDimension",
          "options": [
@@ -3032,6 +3080,8 @@ class JZTKuaicheAPI:
         from datetime import datetime, timezone, timedelta
 
         payload = copy.deepcopy(JZT_KUAICHE_PAYLOAD_TEMPLATE)
+        # M-07 修复（2026-08-24 审计）：checkSum 动态注入（从 config.xlsx 读取 + 兜底 + WARN）
+        payload["checkSum"] = _get_kuaiche_checksum()
 
         # 1. 日期字符串 → 毫秒时间戳（北京时区 00:00:00）
         # 抓包示例：1786161600000 = 2026-08-08 16:00:00 UTC = 2026-08-09 00:00:00 +08:00

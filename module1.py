@@ -46,6 +46,17 @@ EXIT_AUTH_EXPIRED = 2   # 鉴权过期（Cookie/h5st）
 EXIT_SYSTEM_ERROR = 3   # 系统错误
 
 
+def _is_auth_expired_exception(e: Exception) -> bool:
+    """判断异常是否是鉴权过期类（兼容 main.py 与 auth_loader.py 两套定义）
+
+    背景：main.py 自定义 CookieExpiredError，auth_loader.py 也定义了一套。
+    两套类互不继承，except (auth_loader.CookieExpiredError, ...) 会漏掉 main.py 抛的。
+    按类名判断最稳健，跨模块兼容。
+    """
+    name = type(e).__name__
+    return name in ("CookieExpiredError", "H5stExpiredError", "AuthFileNotFound")
+
+
 def parse_module_args(argv=None):
     """解析命令行参数
 
@@ -248,17 +259,19 @@ def main(argv=None):
                 return EXIT_BIZ_FAIL
 
     # 7. 鉴权过期（影刀必须重抓鉴权）
-    except (CookieExpiredError, H5stExpiredError) as e:
-        print(f"[AUTH_EXPIRED] {e}")
-        return EXIT_AUTH_EXPIRED
-
-    # 8. 业务失败（不重抓）
-    except (ValueError, RuntimeError) as e:
-        print(f"[FAIL] 业务失败: {e}")
-        return EXIT_BIZ_FAIL
-
-    # 9. 系统错误（兜底）
+    # M-04 修复（2026-08-24 审计）：用 _is_auth_expired_exception(e) 按类名判断
+    # 背景：main.py 自定义 CookieExpiredError 与 auth_loader.py 的同名类互不继承
+    #       原 except (CookieExpiredError, H5stExpiredError) 会漏掉 main.py 抛的
+    #       导致影刀拿到 EXIT_SYSTEM_ERROR(3) 而非 EXIT_AUTH_EXPIRED(2)
     except Exception as e:
+        if _is_auth_expired_exception(e):
+            print(f"[AUTH_EXPIRED] {e}")
+            return EXIT_AUTH_EXPIRED
+        # 业务失败（不重抓）
+        if isinstance(e, (ValueError, RuntimeError)):
+            print(f"[FAIL] 业务失败: {e}")
+            return EXIT_BIZ_FAIL
+        # 系统错误（兜底）
         print(f"[SYSTEM_ERROR] 未预期异常: {e}")
         traceback.print_exc()
         return EXIT_SYSTEM_ERROR
