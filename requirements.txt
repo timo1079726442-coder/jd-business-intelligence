@@ -1,0 +1,9 @@
+# 京东数据导出-2 核心依赖（2026-08-27 codex 迁移生成）
+# 安装：pip install -r requirements.txt
+pandas==3.0.5
+numpy==2.5.1
+openpyxl==3.1.5
+requests==2.34.2
+xlrd==2.0.2
+xlsxwriter==3.2.9
+msoffcrypto-tool==6.0.0

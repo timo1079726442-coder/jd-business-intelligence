@@ -1339,46 +1339,32 @@ class ProductFlowAPI(JDBaseRequest):
         return df, date_column, date_value
 
     def _save_flow_excel(self, response, filename, date, biz_key=None):
-        """商品流量来源专用保存流程（单日，Excel后置处理，保持原有行为）。
+        """商品流量来源专用保存流程（单日，2026-08-26 项目27：不再落盘单表 xlsx）。
 
-        导出流程（需求文档要求 + 2026-08-07 公共规则1+2）：
+        导出流程：
             ① 复用 _read_flow_df()：读Excel → 日期列处理 → 数值安全转换
-            ② 写入Excel并设置日期列单元格格式（打开文件不弹格式警告）
+            ② 直接入库（df → save_to_db → DB + 总表）
 
         入参:
             response - requests响应（content为接口返回的xlsx二进制）
-            filename - 保存文件名（如 搜索流量_2026-07-29.xlsx）
+            filename - 业务文件名（仅日志用）
             date     - 本次查询日期（如 2026-07-29）
-            biz_key  - 业务key（如 商品流量来源_购物车）；非空则保存后自动入库
-                       （三级渠道类调用时不传，走其独立入库逻辑，避免重复）
+            biz_key  - 业务key（如 商品流量来源_购物车）；非空则入库
         出参:
-            保存后的Excel文件绝对路径
+            pd.DataFrame - 处理后的 DataFrame（业务类不落盘单表）
         """
-        # ① 复用公共读取步骤（读二进制流 → 日期列处理 → 数值转换）
+        # ① 复用公共读取步骤
         df, date_column, date_value = self._read_flow_df(response, date)
 
-        # ② 写入Excel → 按列名规则设置单元格格式（日期列/订单编号@/SKU·SPU数值0位小数）
-        # 输出目录规则（AGENTS.md Excel规则4）：output/{业务模块}/{date}/{filename}
-        file_path = build_business_output_path(self.output_dir, filename, date)
-        df.to_excel(file_path, index=False, engine="openpyxl")
-        apply_column_formats(file_path, df, date_column=date_column, date_value=date_value)
-
-        self.logger.info(
-            f"Excel已保存: {file_path}（已插入日期列+数值转换+单元格格式，{os.path.getsize(file_path)}字节）"
-        )
-
-        # ③ 数据库入库（2026-08-25 项目24 补：run_recent_30d 直调 handler 时不走 _auto_save_db_from_xlsx 钩子）
-        #    搜索/推荐/购物车流量 handler 此前无入库 → xlsx 生成了但 DB/总表缺数据
-        #    正根修复：保存后自动调 save_to_db（内部已联动 excel_master.collect）
-        #    ⚠️ 仅单日路径（biz_key 由 download_sku 传入）；三级渠道不传 → 不重复入库
+        # ② 数据库入库（项目27：去掉 df.to_excel 和 apply_column_formats 落盘步骤）
         if biz_key:
             try:
                 from db_utils import save_to_db
                 save_to_db(biz_key=biz_key, df=df, report_date=date)
             except Exception as e:
-                self.logger.warning(f"⚠️ DB 入库失败（不影响 Excel）：{e}")
+                self.logger.warning(f"⚠️ DB 入库失败：{e}")
 
-        return file_path
+        return df
 
     # 业务级便捷方法（保持向后兼容，内部都走 download_sku）
     def download_search_sku(self, date=None, start_date=None, end_date=None):
@@ -1671,26 +1657,8 @@ class OfflineChannelAPI(JDBaseRequest):
         filename = f"店铺来源_三级渠道_{date}.xlsx"
 
         # 8. 后置处理：复用基类 _save_flow_excel（与商品流量来源同样的 Excel 处理流程）
-        target_path = self._save_flow_excel(response, filename, date)
-
-        # 9. 数据库入库（2026-08-14 新增项目21：DB 集成 MVP）
-        #    ⚠️ 重新读 xlsx 拿 DataFrame 入库；Excel 保存失败 DB 也不跑；DB 失败仅警告
-        try:
-            import io
-            import pandas as pd
-            df_db = pd.read_excel(target_path, dtype=str, na_filter=False)
-
-            from db_utils import save_to_db
-            save_to_db(
-                biz_key="店铺来源_三级渠道",
-                df=df_db,
-                report_date=date,
-                granularity=None,
-            )
-        except Exception as e:
-            self.logger.warning(f"⚠️ DB 入库失败（不影响 Excel）：{e}")
-
-        return target_path
+        #    项目27（2026-08-26）：不落盘单表，直接入库 + 省掉冗余反读 xlsx 段
+        return self._save_flow_excel(response, filename, date, biz_key="店铺来源_三级渠道")
 
     # ---------- 阶段 4 新增：风控 / 空响应辅助方法（业务内自实现）----------
 
@@ -1780,7 +1748,7 @@ class OfflineChannelAPI(JDBaseRequest):
             )
             raise RuntimeError("响应体不是 Excel 文件（magic bytes 校验失败）")
 
-    def _save_flow_excel(self, response, filename, date):
+    def _save_flow_excel(self, response, filename, date, biz_key=None):
         """Excel 后置处理（自实现，基类无此方法）。
 
         ⚠️ 重要：基类 JDBaseRequest 没有 _save_flow_excel（ProductFlowAPI 才有），
@@ -1790,7 +1758,7 @@ class OfflineChannelAPI(JDBaseRequest):
             ① 读 Excel 二进制流 → DataFrame（dtype=str 防长数字精度丢失）
             ② 通用日期转换（convert_date_format）→ 插入首列【日期】
             ③ safe_convert_numeric 全表数值安全转换
-            ④ 写入 Excel + apply_column_formats 设置单元格格式
+            ④ 项目27（2026-08-26）：不落盘单表，直接入库（biz_key 传入时）
         """
         import io
         import warnings
@@ -1799,27 +1767,24 @@ class OfflineChannelAPI(JDBaseRequest):
         # 抑制openpyxl读取原始xlsx时的无害警告
         warnings.filterwarnings("ignore", message="Workbook contains no default style")
 
-        # ① 读取二进制流 → DataFrame（dtype=str 防长数字精度丢失，na_filter=False 保留空字符串）
+        # ① 读取二进制流 → DataFrame
         df = pd.read_excel(io.BytesIO(response.content), dtype=str, na_filter=False)
 
-        # ②③ 日期列统一处理（公共规则1+2，2026-08-07）：
-        #    报表自带【日期】/【时间】列 → 禁止重复插入日期列，仅做格式标准化；
-        #    报表无日期/时间列 → 首列插入【日期】列，值=本次查询日期。
+        # ②③ 日期列统一处理（公共规则1+2，2026-08-07）
         date_column, date_value = prepare_date_columns(df, date)
 
         # ④ 全表数值安全转换
         df = safe_convert_numeric(df)
 
-        # ⑤ 写入Excel + 单元格格式
-        # 输出目录规则（AGENTS.md Excel规则4）：output/{业务模块}/{date}/{filename}
-        file_path = build_business_output_path(self.output_dir, filename, date)
-        df.to_excel(file_path, index=False, engine="openpyxl")
-        apply_column_formats(file_path, df, date_column=date_column, date_value=date_value)
+        # ⑤ 项目27（2026-08-26）：不落盘单表，直接入库
+        if biz_key:
+            try:
+                from db_utils import save_to_db
+                save_to_db(biz_key=biz_key, df=df, report_date=date)
+            except Exception as e:
+                self.logger.warning(f"⚠️ DB 入库失败：{e}")
 
-        self.logger.info(
-            f"Excel已保存: {file_path}（已插入日期列+数值转换+单元格格式，{os.path.getsize(file_path)}字节）"
-        )
-        return file_path
+        return df
 
 
 # ============================================================
@@ -2343,10 +2308,10 @@ class ProductDetailAPI(JDBaseRequest):
         target_path = os.path.join(business_output_dir, original_filename)
 
         # 复用 _save_detail_excel 但指定具体路径
-        return self._save_detail_excel_to_path(response, target_path, date)
+        return self._save_detail_excel_to_path(response, target_path, date, biz_key="商品明细导出")
 
 
-    def _save_detail_excel_to_path(self, response, target_path, date):
+    def _save_detail_excel_to_path(self, response, target_path, date, biz_key=None):
         """商品明细 Excel 后置处理（指定具体路径版本）。
 
         业务定位：与 _save_detail_excel 类似，但允许调用方指定完整路径（不限制在 output_dir）
@@ -2355,7 +2320,7 @@ class ProductDetailAPI(JDBaseRequest):
             ① 读 Excel 二进制流 → DataFrame
             ② 通用日期转换 → 插入首列【日期】
             ③ safe_convert_numeric 全表数值安全转换
-            ④ 写入 Excel（指定路径）+ apply_column_formats
+            ④ 项目27（2026-08-26）：不落盘单表，直接入库（biz_key 传入时）
         """
         import io
         import warnings
@@ -2367,22 +2332,21 @@ class ProductDetailAPI(JDBaseRequest):
         # ① 读取二进制流 → DataFrame
         df = pd.read_excel(io.BytesIO(response.content), dtype=str, na_filter=False)
 
-        # ②③ 日期列统一处理（公共规则1+2，2026-08-07）：
-        #    报表自带【日期】/【时间】列 → 禁止重复插入日期列，仅做格式标准化；
-        #    报表无日期/时间列 → 首列插入【日期】列，值=本次查询日期。
+        # ②③ 日期列统一处理
         date_column, date_value = prepare_date_columns(df, date)
 
         # ④ 全表数值安全转换
         df = safe_convert_numeric(df)
 
-        # ⑤ 写入Excel（指定完整路径，含业务子目录）
-        df.to_excel(target_path, index=False, engine="openpyxl")
-        apply_column_formats(target_path, df, date_column=date_column, date_value=date_value)
+        # ⑤ 项目27：直接入库（不落盘单表）
+        if biz_key:
+            try:
+                from db_utils import save_to_db
+                save_to_db(biz_key=biz_key, df=df, report_date=date)
+            except Exception as e:
+                self.logger.warning(f"⚠️ DB 入库失败：{e}")
 
-        self.logger.info(
-            f"Excel已保存: {target_path}（已插入日期列+数值转换+单元格格式，{os.path.getsize(target_path)}字节）"
-        )
-        return target_path
+        return df
 
 
 # ============================================================
@@ -2600,14 +2564,14 @@ class LossProductAPI(JDBaseRequest):
 
     # ---------- Excel 后置处理（xls 读取 → 转存 xlsx）----------
 
-    def _save_excel_to_path(self, response, target_path, date):
+    def _save_excel_to_path(self, response, target_path, date, biz_key=None):
         """Excel 后置处理（项目6 版：read_excel_bytes 自动识别 xlsx/xls）。
 
         流程：
             ① read_excel_bytes() 读取（xlsx 用 openpyxl / xls 用 xlrd）
             ② prepare_date_columns() 日期列智能处理（公共规则1+2）
             ③ safe_convert_numeric() 数值安全转换（公共规则3）
-            ④ 写入 .xlsx + apply_column_formats() 设置单元格格式
+            ④ 项目27（2026-08-26）：不落盘单表，直接入库（biz_key 传入时）
         """
         import warnings
 
@@ -2623,14 +2587,15 @@ class LossProductAPI(JDBaseRequest):
         # ④ 全表数值安全转换（公共规则3）
         df = safe_convert_numeric(df)
 
-        # ⑤ 写入 .xlsx（转存格式，统一用 openpyxl 引擎）+ 单元格格式
-        df.to_excel(target_path, index=False, engine="openpyxl")
-        apply_column_formats(target_path, df, date_column=date_column, date_value=date_value)
+        # ⑤ 项目27：直接入库（不落盘单表）
+        if biz_key:
+            try:
+                from db_utils import save_to_db
+                save_to_db(biz_key=biz_key, df=df, report_date=date)
+            except Exception as e:
+                self.logger.warning(f"⚠️ DB 入库失败：{e}")
 
-        self.logger.info(
-            f"Excel已保存: {target_path}（xls→xlsx转存+日期列+数值转换+单元格格式，{os.path.getsize(target_path)}字节）"
-        )
-        return target_path
+        return df
 
     # ---------- 主下载方法 ----------
 
@@ -2765,7 +2730,7 @@ class LossProductAPI(JDBaseRequest):
         target_path = os.path.join(business_output_dir, original_filename)
 
         # 8. Excel 后置处理（xls 读取 → 转存 xlsx）
-        return self._save_excel_to_path(response, target_path, date)
+        return self._save_excel_to_path(response, target_path, date, biz_key="商品流失分析")
 
 
 # ============================================================
@@ -6775,17 +6740,14 @@ class KeywordAnalysisAPI(JDBaseRequest):
         save_filename = f"商智关键词分析_{clean_date}_{granularity}.xlsx"
         target_path = os.path.join(date_subdir, save_filename)
 
-        # 5. 写 xlsx + 单元格格式
-        df.to_excel(target_path, index=False, engine="openpyxl")
-        apply_column_formats(target_path, df, date_column=date_column, date_value=date_value)
+        # 5. 项目27（2026-08-26）：不落盘单表 xlsx，直接入库
+        #    原 df.to_excel + apply_column_formats 已删除（总表由 excel_master.flush_shop 统一写入并格式化）
 
         self.logger.info(
-            f"✅ 文件已保存：{target_path}\n"
-            f"   （{os.path.getsize(target_path)}字节，{len(df)}行 × {len(df.columns)}列，{granularity}粒度）"
+            f"✅ 文件处理完成（{len(df)}行 × {len(df.columns)}列，{granularity}粒度）"
         )
 
-        # 6. 数据库入库（2026-08-14 新增项目21：DB 集成 MVP）
-        #    ⚠️ Excel 保存失败也不影响 DB 入库；DB 入库失败仅警告不报错（不影响 Excel）
+        # 6. 数据库入库
         #    granularity 入参：day/month（关键词分析专用，其他业务 None）
         try:
             from db_utils import save_to_db
@@ -6796,9 +6758,9 @@ class KeywordAnalysisAPI(JDBaseRequest):
                 granularity=granularity,
             )
         except Exception as e:
-            self.logger.warning(f"⚠️ DB 入库失败（不影响 Excel）：{e}")
+            self.logger.warning(f"⚠️ DB 入库失败：{e}")
 
-        return target_path
+        return df
 
 
 # ⚠️ 项目13 KeywordAnalysisAPI 类前向引用回填（解决注册表在前、类在后）

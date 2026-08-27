@@ -293,18 +293,15 @@ def collect(biz_key: str, df, report_date: str, granularity: Optional[str] = Non
 
         # 4. 加 stat_date 列（如果 df 里还没有）
         df_to_store = df.copy()
-        stat_date_alias = mapping["stat_date_alias"]
-        if stat_date_alias not in df_to_store.columns:
-            df_to_store[stat_date_alias] = report_date
+        # ⚠️ 2026-08-27 用户反馈：总表不应加 stat_date/shop_pin/report_date 等元数据列。
+        #    删除逻辑改用 mapping.stat_date_alias（业务日期列名）查找。
+        #    collect 不再加 stat_date 别名列。
 
         # 5. 表头规范化：去除空白 + 把 dtype 列名（int64 等）报错
         df_to_store.columns = [
             str(c).strip() if c is not None else f"col_{i}"
             for i, c in enumerate(df_to_store.columns)
         ]
-
-        # 6. 时间格式归一化（AGENTS.md「日期统一 yyyy/m/d」+ 时分秒保留）
-        df_to_store = _normalize_time_columns(df_to_store)
 
         # 7. 入缓存
         if shop_pin not in _CACHE:
@@ -658,15 +655,20 @@ def _flush_one_file(
 
         # 1) 读现有 sheet 的所有数据（找 stat_date 列在第几列）
         #    因为 sheet 可能已有大量历史数据，必须先扫一遍
-        #    简单实现：遍历第 2 行到 max_row，记录 stat_date 匹配的行号
+        #    简单实现：遍历第 2 行到 max_row，记录日期匹配的行号
+        # ⚠️ 2026-08-27：用户反馈总表不加 stat_date 列，删除逻辑改用 mapping.stat_date_alias（业务日期列）
         header_cells = [c.value for c in ws[1]]
-        if "stat_date" not in header_cells:
-            logging.warning(
-                f"⚠️ [ExcelMaster] sheet「{sheet_name}」表头缺 stat_date 列，跳过本 sheet\n"
-                f"   → 建议手动重建或人工加 stat_date 列"
-            )
-            continue
-        stat_date_col_idx = header_cells.index("stat_date") + 1  # 1-based
+        stat_date_alias = mapping.get("stat_date_alias", "stat_date")
+        if stat_date_alias not in header_cells:
+            # 兼容老总表：仍有 stat_date 列则用它；都没有才跳过
+            if "stat_date" not in header_cells:
+                logging.warning(
+                    f"⚠️ [ExcelMaster] sheet「{sheet_name}」表头缺 {stat_date_alias} 列，跳过本 sheet\n"
+                    f"   → 建议手动重建或人工加日期列"
+                )
+                continue
+            stat_date_alias = "stat_date"
+        stat_date_col_idx = header_cells.index(stat_date_alias) + 1  # 1-based
         date_col_letter = openpyxl.utils.get_column_letter(stat_date_col_idx)
 
         # 找到受影响日期的行号（从大到小排序，方便从后往前删）
@@ -701,25 +703,32 @@ def _flush_one_file(
         # 2) 追加新数据
         #    列顺序：按 column_order（如果 df 列不全则警告但继续）
         df_to_write = merged_df.copy()
-        if "stat_date" not in df_to_write.columns:
-            logging.error(f"❌ [ExcelMaster] sheet「{sheet_name}」df 缺 stat_date 列，跳过")
-            continue
-        # 保证 stat_date 在第一列；column_order='*' → 全列保留 df 所有业务列
+        # ⚠️ 2026-08-27 用户反馈：总表不加 stat_date / shop_pin / report_date / etl_time / granularity
+        #    这些是入库元数据列，不是业务数据。flush 写总表时自动排除。
+        _METADATA_COLS = {"stat_date", "shop_pin", "report_date", "etl_time", "granularity"}
         if column_order == ["*"]:
-            cols_in_order = ["stat_date"] + [c for c in df_to_write.columns if c != "stat_date"]
+            cols_in_order = [c for c in df_to_write.columns if c not in _METADATA_COLS]
         else:
-            cols_in_order = ["stat_date"] + [c for c in column_order if c != "stat_date" and c in df_to_write.columns]
+            cols_in_order = [c for c in column_order if c in df_to_write.columns and c not in _METADATA_COLS]
         df_to_write = df_to_write[cols_in_order]
 
-        # 转 datetime 让 Excel 显示为日期
-        df_to_write["stat_date"] = pd.to_datetime(df_to_write["stat_date"], errors="coerce")
-        # 把 None/NaT 转为字符串（避免 Excel 写 1970-01-01）
-        # AGENTS.md 规则：日期统一目标格式 yyyy/m/d
-        df_to_write["stat_date"] = df_to_write["stat_date"].apply(
-            lambda x: f"{x.year}/{x.month}/{x.day}" if pd.notna(x) else ""
-        )
+        # 7a. 写总表前先删除已有的「元数据列 + 空列」（兼容历史遗留表头）
+        #    用户反馈：之前 rebuild 写入的 sheet 头部带 shop_pin/report_date 等元数据列。
+        #    现在新逻辑不再写这些列，但保留它们会让用户困惑 → 一次性清理。
+        try:
+            header_cells = [c.value for c in ws[1]]
+            cols_to_delete = []
+            for i, h in enumerate(header_cells):
+                if h in _METADATA_COLS:
+                    cols_to_delete.append(i + 1)  # 1-based
+            # 顺带清空列（如列全空且 > 业务列数，openpyxl 列删除索引要降序避免位移错位）
+            for ci in sorted(cols_to_delete, reverse=True):
+                ws.delete_cols(ci, 1)
+                logging.info(f"    🧹 [ExcelMaster] 清理总表元数据列：列 {ci}（{header_cells[ci-1]}）")
+        except Exception as e:
+            logging.debug(f"    清理元数据列跳过：{e}")
 
-        # 写入（append_rows）
+        # 8. 写入（append_rows）
         # 2026-08-24 修复：订单号等长数字列强制文本（AGENTS.md「订单编号列强制文本」），
         #   防止总表里 16 位订单号被 Excel 转科学计数/精度丢失
         text_force_cols = {c for c in cols_in_order if _col_matches(c, _MASTER_TEXT_FORCE)}
