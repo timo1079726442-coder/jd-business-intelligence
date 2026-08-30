@@ -1,0 +1,53 @@
+{
+  "rule_version": "legacy_miyo_v1",
+  "status": "validation_only",
+  "scope": "MIYO",
+  "note": "仅记录旧 Excel 与统一规则的历史差异，不覆盖生产 Derived 结果。",
+  "exceptions": [
+    {
+      "field": "order_split_amount",
+      "excel_column": "CA",
+      "excel_row": 3035,
+      "order_no": "3387201004685880",
+      "excel_value": 0.5,
+      "recalculated_value": 1.0,
+      "classification": "LEGACY_EXCEPTION"
+    },
+    {
+      "field": "order_split_amount",
+      "excel_column": "CA",
+      "excel_row": 3036,
+      "order_no": "3387201004685883",
+      "excel_value": 0.5,
+      "recalculated_value": 1.0,
+      "classification": "LEGACY_EXCEPTION"
+    },
+    {
+      "field": "order_count_flag",
+      "excel_column": "CB",
+      "excel_row": 3036,
+      "order_no": "3387201004685883",
+      "excel_value": 0,
+      "recalculated_value": 1,
+      "classification": "LEGACY_EXCEPTION"
+    },
+    {
+      "field": "order_count_flag",
+      "excel_column": "CB",
+      "excel_row": 3116,
+      "order_no": "3387209016483151",
+      "excel_value": 0,
+      "recalculated_value": 1,
+      "classification": "LEGACY_EXCEPTION"
+    },
+    {
+      "field": "order_count_flag",
+      "excel_column": "CB",
+      "excel_row": 3719,
+      "order_no": "3387296010314002",
+      "excel_value": 0,
+      "recalculated_value": 1,
+      "classification": "LEGACY_EXCEPTION"
+    }
+  ]
+}

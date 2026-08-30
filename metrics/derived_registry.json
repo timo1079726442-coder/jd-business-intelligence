@@ -1,0 +1,61 @@
+{
+  "version": "derived-registry-1.0.0",
+  "fields": [
+    {
+      "field_key": "order_refund_aggregated_amount",
+      "field_name": "订单号汇总退款金额",
+      "definition": "按 shop_pin + 订单号汇总售后 退款金额",
+      "formula_or_rule": "SUM(after_sale.refund_amount) GROUP BY shop_pin, order_no",
+      "dependencies": ["std_biz_jm_after_sale_full.退款金额", "std_biz_jm_after_sale_full.订单号"],
+      "partition_key": ["shop_pin", "order_no"],
+      "ordering_key": null,
+      "grain": "order_line",
+      "time_semantics": "order row payment_confirmed_at; after-sale event time is not used for attribution",
+      "metric_version": "legacy_miyo_v1",
+      "implementation": "mysql_view",
+      "status": "active_miyo_validated"
+    },
+    {
+      "field_key": "order_split_amount",
+      "field_name": "订单号拆分金额",
+      "definition": "订单行京东价按同订单非零京东价比例拆分商家应收",
+      "formula_or_rule": "ROUND(merchant_receivable * price / SUM(price) OVER (shop_pin, order_no), 2)",
+      "dependencies": ["std_biz_jm_order_full.商家应收", "std_biz_jm_order_full.京东价", "std_biz_jm_order_full.订单号"],
+      "partition_key": ["shop_pin", "order_no"],
+      "ordering_key": null,
+      "grain": "order_line",
+      "time_semantics": "付款确认时间",
+      "metric_version": "legacy_miyo_v1",
+      "implementation": "mysql_view_and_python_regression",
+      "status": "active_miyo_validated_with_legacy_exceptions"
+    },
+    {
+      "field_key": "order_count_flag",
+      "field_name": "订单数",
+      "definition": "满足状态、付款确认、销售订单且为稳定排序首行时标记 1",
+      "formula_or_rule": "price != 0 AND status IN (...) AND payment_confirmed_at != '' AND order_type='销售订单' AND row_number=1",
+      "dependencies": ["订单状态", "付款确认时间", "订单类型", "京东价", "订单号"],
+      "partition_key": ["shop_pin", "order_no"],
+      "ordering_key": ["source_id", "payment_confirmed_at", "order_no", "product_id", "sku_id"],
+      "grain": "order_line",
+      "time_semantics": "付款确认时间",
+      "metric_version": "legacy_miyo_v1",
+      "implementation": "mysql_view_and_python_regression",
+      "status": "active_miyo_validated_with_legacy_exceptions"
+    },
+    {
+      "field_key": "shipment_status_normalized",
+      "field_name": "出库状态",
+      "definition": "按订单状态、付款确认及首条售后出库状态推导",
+      "formula_or_rule": "unshipped status -> 未出库; shipped status + no after-sale application -> 已出库; else first after-sale shipment status",
+      "dependencies": ["订单状态", "付款确认时间", "std_biz_jm_after_sale_full.售后申请时间", "std_biz_jm_after_sale_full.出库状态"],
+      "partition_key": ["shop_pin", "order_no"],
+      "ordering_key": ["after_sale.id"],
+      "grain": "order_line",
+      "time_semantics": "付款确认时间",
+      "metric_version": "legacy_miyo_v1",
+      "implementation": "mysql_view_and_python_regression",
+      "status": "active_miyo_validated"
+    }
+  ]
+}

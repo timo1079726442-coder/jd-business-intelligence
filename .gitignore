@@ -12,6 +12,8 @@ config/jzt_cookie.txt
 config/新建文本文档.txt
 # 京麦订单导出 IMAP 配置（含 QQ 邮箱授权码，2026-08-11 项目14 阶段5）
 config/imap_config.ini
+# MySQL 本地连接配置（含密码，禁止入仓）
+config/mysql.local.ini
 # 京麦订单导出独立 Cookie（与商智不互通，项目14 阶段5）
 config/jm_cookie.txt
 # 2026-08-12 多店铺支持（项目17 启动）：所有店铺子目录里的鉴权文件全部不入仓
@@ -56,6 +58,11 @@ browser_data/
 # 输出和日志
 output/
 logs/
+*.log
+runtime/
+
+# 项目专属 Python 虚拟环境（本机生成，不入仓）
+.venv/
 
 # 项目21 数据目录（2026-08-14 新增）：SQLite DB 运行时动态生成，不入仓
 data/
@@ -75,6 +82,9 @@ __pycache__/
 
 # 测试和临时文件
 test_*.py
+# tests/ 下是正式回归测试，允许入仓
+!tests/test_*.py
+/75
 # 2026-08-09 补充：下划线开头的临时测试脚本不入仓
 _test_*.py
 check_*.py
@@ -92,6 +102,8 @@ create_*.py
 test_*.html
 *.html
 !docs/*.html
+# dashboard/ 下是正式看板页面，允许入仓
+!dashboard/*.html
 
 # 抓包JS文件（太大且敏感）
 *.js

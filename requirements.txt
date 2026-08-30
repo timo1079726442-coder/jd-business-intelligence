@@ -7,3 +7,4 @@ requests==2.34.2
 xlrd==2.0.2
 xlsxwriter==3.2.9
 msoffcrypto-tool==6.0.0
+mysql-connector-python==9.4.0

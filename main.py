@@ -70,6 +70,14 @@ def SHOP_NAME() -> str:
     return runtime_config.get_shop_name_display()
 
 
+def _mask_secret(value: str) -> str:
+    """只显示密钥首尾少量字符，避免密码进入控制台或日志。"""
+    if not value:
+        return "***"
+    value = str(value)
+    return f"{value[:2]}***{value[-2:]}" if len(value) > 4 else "***"
+
+
 # H-26 修复（2026-08-25 用户决策）：默认走 JSON 鉴权（AuthLoader），txt 仅作备选
 # 背景：AUTH_LOADER 默认 "0" 导致 daily_update/fill_missing 直接调 main 时走 .txt 报错
 # 决策：默认 "1"（JSON 优先），AuthLoader 内部找不到 JSON 自动兜底 .txt
@@ -8007,7 +8015,7 @@ class JingMaiOrderExportAPI:
                         if password:
                             # mail.logout() 移到下方 finally 统一处理（H-18 修复）
                             print(
-                                f"✅ [京麦订单] IMAP 拿到密码：{password!r}（taskId={task_id}，"
+                                f"✅ [京麦订单] IMAP 拿到密码（已脱敏）：{_mask_secret(password)}（taskId={task_id}，"
                                 f"第 {attempt} 次轮询命中）"
                             )
                             return password
@@ -8115,7 +8123,7 @@ class JingMaiOrderExportAPI:
                 print(
                     f"📂 [京麦订单] 第 5 步：解压 zip\n"
                     f"   源: {zip_path}\n"
-                    f"   密码: {password!r}\n"
+                    f"   密码: {_mask_secret(password)}（已脱敏）\n"
                     f"   目标条目: {target_name}"
                 )
 
@@ -8129,7 +8137,7 @@ class JingMaiOrderExportAPI:
             raise RuntimeError(
                 f"❌ zip 解压失败（密码错误？）：{e}\n"
                 f"   zip: {zip_path}\n"
-                f"   密码: {password!r}"
+                f"   密码: {_mask_secret(password)}（已脱敏）"
             ) from e
 
         # 2. 二次解密：msoffcrypto-tool 专门解 Microsoft Office 加密文件（.xls/.xlsx/.docx）
@@ -8153,7 +8161,7 @@ class JingMaiOrderExportAPI:
             raise RuntimeError(
                 f"❌ OLE2 二次解密失败：{e}\n"
                 f"   可能原因：① 密码错误 ② 内部 xls 是空表（无真实订单数据）\n"
-                f"   尝试：用 unzip -P '{password}' '{zip_path}' 命令行验证"
+                    f"   尝试：用 unzip -P '<密码已脱敏>' '{zip_path}' 命令行验证"
             ) from e
 
         # 3. 读解密后的文件（magic bytes 决定格式）
@@ -8296,7 +8304,7 @@ class JingMaiOrderExportAPI:
         if sms_password:
             password = sms_password
             password_source = "manual"
-            print(f"🔑 [京麦订单] 第 5 步：使用人工传入密码 {password!r}")
+            print(f"🔑 [京麦订单] 第 5 步：使用人工传入密码（已脱敏） {_mask_secret(password)}")
         else:
             # 走 IMAP 监听
             try:
@@ -8343,7 +8351,8 @@ class JingMaiOrderExportAPI:
             "smsReceiver": sms_receiver,
             "zip_path": zip_path,
             "xlsx_path": xlsx_path,
-            "password": password,
+            # 不在返回值中携带明文密码，避免被上层日志/序列化意外泄漏。
+            "password": None,
             "password_source": password_source,  # 标记密码来源（manual / imap）
             "remainingTimes": full_ret.get("remainingTimes"),
             "pwd_raw_message": full_ret.get("pwd_raw_message"),
@@ -10338,4 +10347,3 @@ def _try_flush_excel_master_safe() -> None:
 
 if __name__ == "__main__":
     main()
-

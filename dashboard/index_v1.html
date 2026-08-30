@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>京东全店数据看板</title>
+  <style>
+    :root{font-family:"Microsoft YaHei",Arial,sans-serif;color:#243247;background:#f4f6fa}
+    *{box-sizing:border-box}body{margin:0}.layout{display:flex;min-height:100vh}
+    aside{width:230px;background:#fff;border-right:1px solid #e5eaf0;padding:22px 14px}.brand{font-size:20px;font-weight:700;color:#173b63;padding:10px 14px 26px}.nav{padding:13px 14px;border-radius:8px;color:#526174;margin-bottom:6px}.active{background:#eaf2fb;color:#1761a9;font-weight:700;border-left:3px solid #1761a9}.disabled{color:#b8c0ca}
+    main{flex:1;padding:26px 34px;max-width:1400px}.toolbar,.panel,.card{background:#fff;border:1px solid #e8edf3;border-radius:10px}.toolbar{display:flex;align-items:center;gap:12px;padding:16px 18px}.toolbar select,.toolbar input{padding:8px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:14px}.toolbar button{padding:8px 18px;border:0;border-radius:6px;background:#1761a9;color:#fff;cursor:pointer}.muted{color:#8491a2;font-size:13px}.title{margin:24px 0 16px}.title h2{margin:0 0 6px;font-size:24px}.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}.card{padding:17px}.label{color:#718096;font-size:14px}.value{font-size:27px;font-weight:700;color:#173b63;margin-top:9px}.compare{font-size:12px;margin-top:7px;color:#718096}.up{color:#15803d}.down{color:#dc2626}.pending{color:#a16207}.panel{margin-top:20px;padding:20px}.panel h3{margin:0 0 16px;font-size:17px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px;border-bottom:1px solid #eef1f5;font-size:14px}th{color:#66758a;background:#f8fafc}.empty{text-align:center;color:#98a5b5;padding:28px}@media(max-width:900px){aside{width:180px}main{padding:18px}.cards{grid-template-columns:repeat(2,1fr)}}
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside><div class="brand">京东经营数据</div><div class="nav active">全店数据看板</div><div class="nav disabled">单品数据看板</div><div class="nav disabled">推广数据看板</div><div class="nav disabled">订单与售后</div><div class="nav disabled">流量与关键词</div><div class="nav disabled">数据质量</div></aside>
+    <main>
+      <div class="toolbar"><span>店铺</span><select id="shop"><option>MIYO</option><option>OTA</option><option>FYA</option></select><span>复盘期</span><input id="start" type="date"><span>至</span><input id="end" type="date"><button id="query">查询</button><span id="status" class="muted"></span></div>
+      <div class="title"><h2>全店数据看板</h2><div id="subtitle" class="muted"></div></div>
+      <div class="cards" id="cards"></div>
+      <div class="panel"><h3>每日经营趋势</h3><table><thead><tr><th>日期</th><th>数据记录数</th></tr></thead><tbody id="daily"></tbody></table></div>
+    </main>
+  </div>
+  <script>
+    const $=id=>document.getElementById(id);
+    const defs=[['gmv','成交金额'],['refund_amount','退款金额'],['net_gmv','净成交额'],['order_count','总订单数'],['refund_order_count','退货订单数'],['ad_cost','推广花费'],['refund_rate','退款率'],['return_rate','退货率'],['roi','投产比'],['estimated_profit','利润预估']];
+    function fmt(k,v){if(v==null)return '-';if(k.includes('rate')||k==='roi')return k==='roi'?Number(v).toFixed(2):(Number(v)*100).toFixed(2)+'%';return Number(v).toLocaleString(undefined,{maximumFractionDigits:2})}
+    async function load(){const st=$('status');st.textContent='正在读取…';const q=new URLSearchParams({shop:$('shop').value,start:$('start').value,end:$('end').value});try{const r=await fetch('/api/summary?'+q);const d=await r.json();if(!r.ok||!d.metrics)throw Error(d.error?.message||'返回结构无效');$('subtitle').textContent=`${d.shop.shop_key}｜复盘期 ${d.period.start} 至 ${d.period.end}｜对比期 ${d.comparison_period.start} 至 ${d.comparison_period.end}`;$('cards').innerHTML=defs.map(([k,n])=>{const m=d.metrics[k]||{};const c=m.change;const cls=m.status==='pending_confirmation'?'pending':(c>=0?'up':'down');return `<div class="card"><div class="label">${n}</div><div class="value">${fmt(k,m.value)}</div><div class="compare ${cls}">环比 ${c==null?'-':(c*100).toFixed(2)+'%'}${m.status==='pending_confirmation'?' · 待确认':''}</div></div>`}).join('');$('daily').innerHTML=(d.daily||[]).map(x=>`<tr><td>${x.date}</td><td>${Number(x.record_count).toLocaleString()}</td></tr>`).join('')||'<tr><td colspan="2" class="empty">该日期范围暂无数据</td></tr>';st.textContent=`已连接 MySQL · ${d.meta.metric_version}`}catch(e){st.textContent='读取失败：'+e.message}}
+    $('query').onclick=load;$('start').value='2026-08-20';$('end').value='2026-08-26';load();
+  </script>
+</body>
+</html>

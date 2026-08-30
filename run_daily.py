@@ -52,6 +52,33 @@ logging.basicConfig(
 )
 log = logging.getLogger("run_daily")
 
+
+def _configure_utf8_stdio() -> None:
+    """Windows 控制台使用 UTF-8，避免 emoji/中文日志触发 GBK 编码异常。"""
+    for stream in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+def _configure_file_logging() -> None:
+    """为调度器增加按日 UTF-8 文件日志，保留已有控制台 handler。"""
+    log_dir = os.path.join(PROJECT_ROOT, "logs")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, f"jd_api_{datetime.now():%Y%m%d}.log")
+        root_logger = logging.getLogger()
+        if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == os.path.abspath(path)
+                   for h in root_logger.handlers):
+            handler = logging.FileHandler(path, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            root_logger.addHandler(handler)
+    except OSError as exc:
+        log.warning("无法创建文件日志，继续使用控制台日志：%s", exc)
+
 # 退出码约定（与 fill_missing.py 一致）
 EXIT_SUCCESS = 0
 EXIT_BIZ_FAIL = 1
@@ -86,7 +113,7 @@ def _expected_dates(start: str, end: str) -> List[str]:
 def _find_missing_dates(biz_key: str, expected_dates: List[str], shop_pin: str) -> List[str]:
     """查 DB 已有日期 vs 期望日期，返回缺失列表（仅单日策略用）"""
     import sqlite3
-    from db_utils import get_db_path, biz_key_to_table_name
+    from db_utils import get_db_path, biz_key_to_table_name, get_empty_dates
 
     db_path = get_db_path()
     if not os.path.exists(db_path):
@@ -113,12 +140,14 @@ def _find_missing_dates(biz_key: str, expected_dates: List[str], shop_pin: str) 
 def _get_existing_dates(biz_key: str, shop_pin: str) -> set:
     """查 DB 该业务该店已有 report_date 集合（增量缺日扫描用）"""
     import sqlite3
-    from db_utils import get_db_path, biz_key_to_table_name
+    from pathlib import Path
+    from db_utils import get_db_path, biz_key_to_table_name, get_empty_dates
     db_path = get_db_path()
     if not os.path.exists(db_path):
         return set()
     table = biz_key_to_table_name(biz_key)
-    conn = sqlite3.connect(db_path)
+    # 缺口扫描只需要读取；用 SQLite 只读 URI，确保 dry-run 不会获得写锁或创建文件。
+    conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
     try:
         try:
             rows = conn.execute(
@@ -129,7 +158,9 @@ def _get_existing_dates(biz_key: str, shop_pin: str) -> set:
             if "no such table" in str(e).lower():
                 return set()
             raise
-        return {r[0] for r in rows}
+        existing = {r[0] for r in rows}
+        existing.update(get_empty_dates(biz_key, shop_pin))
+        return existing
     finally:
         conn.close()
 
@@ -167,7 +198,10 @@ def _scan_missing_dates(biz_key: str, cfg, shop_pin: str) -> List[str]:
 
     # 首次无数据 → 用配置起止（京准通/商智首次会整段拉）
     s = datetime.strptime(cfg.start_date, "%Y-%m-%d").date() if cfg.start_date else yesterday
-    e = datetime.strptime(cfg.end_date, "%Y-%m-%d").date() if cfg.end_date else yesterday
+    configured_end = datetime.strptime(cfg.end_date, "%Y-%m-%d").date() if cfg.end_date else yesterday
+    e = min(configured_end, yesterday)
+    if s > e:
+        return []
     out = []
     cur = s
     while cur <= e:
@@ -192,7 +226,38 @@ def _get_jm_h5st(biz_key: str) -> str:
         return ""
 
 
-def _backfill_xlsx_file(biz_key: str, xlsx_path: str, shop_id: str) -> bool:
+def _effective_strategy(cfg) -> str:
+    """按当前业务规则决定策略：仅京麦订单/售后覆盖近30天，其余业务按缺失日补齐。"""
+    if cfg.module == "京麦" and ("订单明细" in cfg.biz_key or "售后明细" in cfg.biz_key):
+        return "近30天"
+    if cfg.biz_key == "商智关键词分析":
+        return "月度"
+    try:
+        from biz_config_loader import get_biz_feature
+        if get_biz_feature(cfg.biz_key).get("supports_range"):
+            return "区间"
+    except Exception:
+        pass
+    return "月度" if getattr(cfg, "strategy", "单日") == "月度" else "单日"
+
+
+def _date_ranges(dates: List[str]) -> List[Tuple[str, str]]:
+    """将连续缺失日期合并为最小区间列表。"""
+    if not dates:
+        return []
+    parsed = sorted(datetime.strptime(d, "%Y-%m-%d").date() for d in dates)
+    ranges = []
+    start = prev = parsed[0]
+    for cur in parsed[1:]:
+        if cur != prev + timedelta(days=1):
+            ranges.append((start.isoformat(), prev.isoformat()))
+            start = cur
+        prev = cur
+    ranges.append((start.isoformat(), prev.isoformat()))
+    return ranges
+
+
+def _backfill_xlsx_file(biz_key: str, xlsx_path: str, shop_id: str, fallback_date: str = None) -> bool:
     """对单个 xlsx 文件按文件内日期列拆分入库（京准通/京麦，复用 backfill 逻辑）。
 
     背景（2026-08-26）：京麦订单/售后 handler 返回 dict（含 xlsx_path），
@@ -203,6 +268,14 @@ def _backfill_xlsx_file(biz_key: str, xlsx_path: str, shop_id: str) -> bool:
     返回:
         True 已入库 / False 未处理（biz_key 不在京准通/京麦映射）
     """
+    if fallback_date:
+        try:
+            if datetime.strptime(fallback_date, "%Y-%m-%d").date() >= datetime.now().date():
+                log.error("    ❌ 兜底业务日期不能是今天或未来：%s", fallback_date)
+                return False
+        except ValueError:
+            log.error("    ❌ 兜底业务日期格式非法：%s", fallback_date)
+            return False
     if not os.path.exists(xlsx_path):
         log.warning(f"  ⚠️ xlsx 不存在：{xlsx_path}")
         return False
@@ -236,18 +309,27 @@ def _backfill_xlsx_file(biz_key: str, xlsx_path: str, shop_id: str) -> bool:
         return False
     if df is None or df.empty:
         log.info(f"    ⚠️ xlsx 为空，跳过拆分入库：{os.path.basename(xlsx_path)}")
+        if fallback_date:
+            from db_utils import mark_empty_date
+            mark_empty_date(biz_key, fallback_date, shop_pin=os.getenv("SHOP_PIN") or shop_id)
         return False
 
     # 按日期列拆分入库
     if date_col not in df.columns:
-        log.warning(f"    ⚠️ 无 {date_col} 列，按文件名日期单次入库")
-        save_to_db(biz_key=biz_key, df=df, report_date=datetime.now().strftime("%Y-%m-%d"))
+        if not fallback_date:
+            log.error("    ❌ 无 %s 列且没有可靠的业务日期，拒绝归档以避免污染历史数据", date_col)
+            return False
+        log.warning(f"    ⚠️ 无 {date_col} 列，使用调用方提供的业务日期 {fallback_date}")
+        save_to_db(biz_key=biz_key, df=df, report_date=fallback_date)
         return True
 
     s = pd.to_datetime(df[date_col], errors="coerce")
     valid = s.notna()
     if valid.sum() == 0:
-        save_to_db(biz_key=biz_key, df=df, report_date=datetime.now().strftime("%Y-%m-%d"))
+        if not fallback_date:
+            log.error("    ❌ 日期列无法解析且没有可靠的业务日期，拒绝归档")
+            return False
+        save_to_db(biz_key=biz_key, df=df, report_date=fallback_date)
         return True
 
     n = 0
@@ -260,7 +342,7 @@ def _backfill_xlsx_file(biz_key: str, xlsx_path: str, shop_id: str) -> bool:
     return True
 
 
-def _extract_and_backfill(cfg, result, shop_id: str) -> None:
+def _extract_and_backfill(cfg, result, shop_id: str, fallback_date: str = None) -> None:
     """从 handler 返回值提取 xlsx 路径并拆分入库。
 
     handler 返回类型（2026-08-26 混合模式 A）：
@@ -274,9 +356,17 @@ def _extract_and_backfill(cfg, result, shop_id: str) -> None:
     elif isinstance(result, dict) and result.get("xlsx_path"):
         xlsx_path = result["xlsx_path"]
     if xlsx_path:
-        _backfill_xlsx_file(cfg.biz_key, xlsx_path, shop_id)
+        _backfill_xlsx_file(cfg.biz_key, xlsx_path, shop_id, fallback_date=fallback_date)
     else:
         log.info(f"    ✅ {cfg.biz_key} → df returned (save_to_db 内已自动入库)")
+        if fallback_date:
+            try:
+                import pandas as pd
+                if isinstance(result, pd.DataFrame) and result.empty:
+                    from db_utils import mark_empty_date
+                    mark_empty_date(cfg.biz_key, fallback_date, shop_pin=os.getenv("SHOP_PIN") or shop_id)
+            except Exception as e:
+                log.warning("记录空报表状态失败：%s", e)
 
 
 def _run_single_config(cfg, shop_id: str, shop_pin: str, dry_run: bool = False) -> bool:
@@ -285,6 +375,21 @@ def _run_single_config(cfg, shop_id: str, shop_pin: str, dry_run: bool = False) 
     返回:
         True = 成功, False = 失败（鉴权过期立即抛 SystemExit(2)）
     """
+    # dry-run 只展示计划，不读取数据库、鉴权或执行真实业务。
+    strategy = _effective_strategy(cfg)
+    if dry_run:
+        if strategy == "单日":
+            yesterday = (datetime.now().date() - timedelta(days=1)).isoformat()
+            log.info(f"  [DRY-RUN] [{cfg.module}/{cfg.report_name}] 按缺失日期补齐至 {yesterday}（实际运行时读取 DB）")
+            return True
+        if strategy == "区间":
+            log.info(f"  [DRY-RUN] [{cfg.module}/{cfg.report_name}] 支持区间，运行时将连续缺失日期合并请求")
+            return True
+        else:
+            s, e = cfg.resolve_dates()
+        log.info(f"  [DRY-RUN] [{cfg.module}/{cfg.report_name}] 计划范围 {s} ~ {e}")
+        return True
+
     import main
 
     handler = main.get_business_handler(cfg.biz_key)
@@ -299,7 +404,7 @@ def _run_single_config(cfg, shop_id: str, shop_pin: str, dry_run: bool = False) 
         return False
 
     # 策略分流
-    if cfg.strategy == "单日":
+    if strategy == "单日":
         # 1. 扫描缺失日期（2026-08-26 增量模式：最新日期+1 ~ 今天-1）
         missing = _scan_missing_dates(cfg.biz_key, cfg, shop_pin)
         if not missing:
@@ -309,13 +414,10 @@ def _run_single_config(cfg, shop_id: str, shop_pin: str, dry_run: bool = False) 
         # 2. 逐日补录
         for d in missing:
             log.info(f"    ↳ 补录 {d}")
-            if dry_run:
-                log.info(f"    [DRY-RUN] 跳过实际调用")
-                continue
             try:
                 extra = {'h5st': jm_h5st} if cfg.module=='京麦' else {}; result = handler(date=d, **extra)
                 # 混合模式：handler 可能返回 df（商智）、xlsx 路径（京准通）、dict(xlsx_path)（京麦）
-                _extract_and_backfill(cfg, result, shop_id)
+                _extract_and_backfill(cfg, result, shop_id, fallback_date=d)
             except SystemExit as e:
                 if e.code == 2:
                     log.error(f"  🔐 [{cfg.module}/{cfg.report_name}] 鉴权过期")
@@ -329,15 +431,20 @@ def _run_single_config(cfg, shop_id: str, shop_pin: str, dry_run: bool = False) 
                 return False
         return True
 
-    elif cfg.strategy in ("近3天", "近7天", "近30天", "30天"):
-        s, e = cfg.resolve_dates()
-        log.info(f"  🔄 [{cfg.module}/{cfg.report_name}] {cfg.strategy}覆盖 {s} ~ {e}")
-        if dry_run:
-            log.info(f"    [DRY-RUN] 跳过实际调用")
-            return True
+    elif strategy in ("近3天", "近7天", "近30天", "30天", "区间"):
+        if strategy == "区间":
+            ranges = _date_ranges(_scan_missing_dates(cfg.biz_key, cfg, shop_pin))
+            if not ranges:
+                log.info(f"  ✅ [{cfg.module}/{cfg.report_name}] 无缺失日期（已最新），跳过")
+                return True
+        else:
+            ranges = [cfg.resolve_dates()]
         try:
-            extra = {'h5st': jm_h5st} if cfg.module=='京麦' else {}; result = handler(start_date=s, end_date=e, **extra)
-            _extract_and_backfill(cfg, result, shop_id)
+            extra = {'h5st': jm_h5st} if cfg.module=='京麦' else {}
+            for s, e in ranges:
+                log.info(f"  🔄 [{cfg.module}/{cfg.report_name}] 区间覆盖 {s} ~ {e}")
+                result = handler(start_date=s, end_date=e, **extra)
+                _extract_and_backfill(cfg, result, shop_id, fallback_date=e)
             return True
         except SystemExit as ex:
             if ex.code == 2:
@@ -351,14 +458,17 @@ def _run_single_config(cfg, shop_id: str, shop_pin: str, dry_run: bool = False) 
             log.error(f"  ❌ [{cfg.module}/{cfg.report_name}] 失败：{type(ex).__name__}: {ex}")
             return False
 
-    elif cfg.strategy == "月度":
-        log.info(f"  🔄 [{cfg.module}/{cfg.report_name}] 月度覆盖 {cfg.start_date} ~ {cfg.end_date}")
-        if dry_run:
-            log.info(f"    [DRY-RUN] 跳过实际调用")
+    elif strategy == "月度":
+        ranges = _date_ranges(_scan_missing_dates(cfg.biz_key, cfg, shop_pin))
+        if not ranges:
+            log.info(f"  ✅ [{cfg.module}/{cfg.report_name}] 无缺失日期（已最新），跳过")
             return True
         try:
-            extra = {'h5st': jm_h5st} if cfg.module=='京麦' else {}; result = handler(start_date=cfg.start_date, end_date=cfg.end_date, **extra)
-            _extract_and_backfill(cfg, result, shop_id)
+            extra = {'h5st': jm_h5st} if cfg.module=='京麦' else {}
+            for s, e in ranges:
+                log.info(f"  🔄 [{cfg.module}/{cfg.report_name}] 区间覆盖 {s} ~ {e}")
+                result = handler(start_date=s, end_date=e, **extra)
+                _extract_and_backfill(cfg, result, shop_id, fallback_date=e)
             return True
         except SystemExit as ex:
             if ex.code == 2:
@@ -403,7 +513,7 @@ def run_shop(shop_id: str, configs: list, dry_run: bool = False) -> Tuple[int, i
         except SystemExit as e:
             if e.code == EXIT_AUTH_EXPIRED:
                 log.error(f"⛔ 鉴权过期中断，停止 [{shop_id}]")
-                return ok, fail
+                raise
             raise
 
     # 收尾：增量写总表（2026-08-26 用户需求：不再全量 rebuild，只写本次 collect 的数据）
@@ -421,6 +531,8 @@ def run_shop(shop_id: str, configs: list, dry_run: bool = False) -> Tuple[int, i
 
 
 def main():
+    _configure_utf8_stdio()
+    _configure_file_logging()
     ap = argparse.ArgumentParser(description="每日调度器（读 config.xlsx 驱动）")
     ap.add_argument("--shop", help="指定单店（默认遍历店铺清单）")
     ap.add_argument("--dry-run", action="store_true", help="只读配置 + 打印计划，不真跑")
@@ -453,15 +565,17 @@ def main():
         except Exception as e:
             log.error(f"❌ 读店铺清单失败：{e}")
             sys.exit(EXIT_SYSTEM_ERROR)
-        shops = [(s, os.getenv("SHOP_PIN", "").strip()) for s in shop_ids]
+        # 多店时禁止复用全局 SHOP_PIN；run_shop 会按当前 SHOP_ID 从配置解析。
+        shops = [(s, "") for s in shop_ids]
 
     # 店间冷却（复用 rpa_run）
     shop_interval = 60
-    try:
-        from rpa_run import _read_shop_interval_seconds
-        shop_interval = _read_shop_interval_seconds(None)
-    except Exception:
-        pass
+    if not args.dry_run:
+        try:
+            from rpa_run import _read_shop_interval_seconds
+            shop_interval = _read_shop_interval_seconds(None)
+        except Exception:
+            pass
 
     grand_ok = 0
     grand_fail = 0
@@ -471,7 +585,10 @@ def main():
             if not args.dry_run:
                 time.sleep(shop_interval)
         os.environ["SHOP_ID"] = shop_id
-        os.environ["SHOP_PIN"] = shop_pin
+        if args.shop:
+            os.environ["SHOP_PIN"] = shop_pin
+        else:
+            os.environ.pop("SHOP_PIN", None)
         ok, fail = run_shop(shop_id, configs, dry_run=args.dry_run)
         grand_ok += ok
         grand_fail += fail

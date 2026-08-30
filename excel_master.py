@@ -616,6 +616,18 @@ def _flush_one_file(
         # 把 stat_date 列重命名为统一列名（后续 sheet 操作统一按 stat_date 找）
         if stat_date_alias != "stat_date" and stat_date_alias in merged_df.columns:
             merged_df = merged_df.rename(columns={stat_date_alias: "stat_date"})
+        # DB 入库后的业务数据通常不带总表日期列，日期保存在 collect 记录元数据中。
+        # 统一补出 stat_date，避免增量 flush 因缺列失败。
+        if "stat_date" not in merged_df.columns:
+            dates = []
+            for record in records:
+                dates.extend([record.get("report_date", "")] * len(record["df"]))
+            if len(dates) == len(merged_df):
+                merged_df["stat_date"] = dates
+            else:
+                logging.error("⚠️ [ExcelMaster] sheet「%s」无法对齐业务日期，跳过", sheet_name)
+                results[sheet_name] = {"rows_added": 0, "rows_deleted": 0, "skipped": True}
+                continue
 
         # 受影响日期（用于删除旧行）
         # ⚠️ 2026-08-25 修复：总表 stat_date 存 YYYY/M/D，与 DB 的 YYYY-MM-DD 不一致，
@@ -711,6 +723,8 @@ def _flush_one_file(
         else:
             cols_in_order = [c for c in column_order if c in df_to_write.columns and c not in _METADATA_COLS]
         df_to_write = df_to_write[cols_in_order]
+        # 统一总表中的日期/时间字段为可读的 YYYY/M/D（含时间则保留时分秒）。
+        df_to_write = _normalize_time_columns(df_to_write)
 
         # 7a. 写总表前先删除已有的「元数据列 + 空列」（兼容历史遗留表头）
         #    用户反馈：之前 rebuild 写入的 sheet 头部带 shop_pin/report_date 等元数据列。

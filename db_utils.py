@@ -643,6 +643,50 @@ def get_existing_dates(
         raise
 
 
+def mark_empty_date(biz_key: str, report_date: str, shop_pin: Optional[str] = None) -> None:
+    """记录已成功请求但无业务行的日期，避免空报表被重复拉取。"""
+    pin = (shop_pin or os.getenv("SHOP_PIN", "").strip() or os.getenv("SHOP_ID", "UNKNOWN")).strip()
+    db_path = get_db_path()
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS biz_empty_dates ("
+            "biz_key TEXT NOT NULL, shop_pin TEXT NOT NULL, report_date TEXT NOT NULL, "
+            "etl_time TEXT NOT NULL, PRIMARY KEY (biz_key, shop_pin, report_date))"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO biz_empty_dates "
+            "(biz_key, shop_pin, report_date, etl_time) VALUES (?, ?, ?, ?)",
+            (biz_key, pin, report_date, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_empty_dates(biz_key: str, shop_pin: Optional[str] = None) -> set:
+    """返回指定业务/店铺已确认为空的日期集合。"""
+    db_path = get_db_path()
+    if not os.path.exists(db_path):
+        return set()
+    pin = (shop_pin or os.getenv("SHOP_PIN", "").strip() or os.getenv("SHOP_ID", "UNKNOWN")).strip()
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT report_date FROM biz_empty_dates WHERE biz_key=? AND shop_pin=?",
+                (biz_key, pin),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e).lower():
+                return set()
+            raise
+        return {r[0] for r in rows}
+    finally:
+        conn.close()
+
+
 def get_existing_count(conn: sqlite3.Connection, table_name: str) -> int:
     """返回该表的总行数（调试用）。"""
     # 安全校验：表名必须合规（防 SQL 注入，AGENTS.md 第40条兜底）
